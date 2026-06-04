@@ -1,0 +1,452 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../apps/api/src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  ADMIN
+  ROP
+}
+
+enum AmoConnectionStatus {
+  ACTIVE
+  INACTIVE
+  ERROR
+  SYNCING
+}
+
+enum SyncJobType {
+  FULL
+  INCREMENTAL
+  WEBHOOK
+}
+
+enum SyncJobStatus {
+  QUEUED
+  RUNNING
+  SUCCESS
+  ERROR
+}
+
+enum CrmEntityType {
+  LEAD
+  CONTACT
+  COMPANY
+  TASK
+  NOTE
+  EVENT
+}
+
+enum ReportSourceType {
+  EVENT
+  CURRENT
+}
+
+enum ConversionDenominator {
+  PREVIOUS
+  FIRST
+}
+
+enum ProbabilityMode {
+  MANUAL
+  AUTO
+  HYBRID
+}
+
+enum ExportJobStatus {
+  QUEUED
+  RUNNING
+  SUCCESS
+  ERROR
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  role         UserRole @default(ROP)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  dashboardLayouts DashboardLayout[]
+  reportTemplates  ReportTemplate[]
+  auditLogs        AuditLog[]
+}
+
+model AmoConnection {
+  id                  String              @id @default(uuid())
+  subdomain           String
+  accountId           String?
+  accountName         String?
+  credentials         String
+  webhookSecret       String              @unique
+  status              AmoConnectionStatus @default(INACTIVE)
+  syncIntervalMinutes Int                 @default(15)
+  lastFullSyncAt      DateTime?
+  lastIncrementalSyncAt DateTime?
+  lastError           String?
+  config              Json                @default("{}")
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
+
+  syncJobs      SyncJob[]
+  webhookEvents WebhookEvent[]
+}
+
+model SyncJob {
+  id           String        @id @default(uuid())
+  connectionId String
+  type         SyncJobType
+  status       SyncJobStatus @default(QUEUED)
+  startedAt    DateTime?
+  finishedAt   DateTime?
+  cursor        Json         @default("{}")
+  stats         Json         @default("{}")
+  error         String?
+  createdAt     DateTime     @default(now())
+
+  connection AmoConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@index([connectionId, createdAt])
+  @@index([status, createdAt])
+}
+
+model WebhookEvent {
+  id           String   @id @default(uuid())
+  connectionId String
+  entity       String
+  action       String
+  externalId   String?
+  payload      Json     @default("{}")
+  receivedAt   DateTime @default(now())
+  processedAt  DateTime?
+  status       String   @default("received")
+  error        String?
+
+  connection AmoConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@index([connectionId, receivedAt])
+  @@index([entity, action])
+}
+
+model CrmGroup {
+  id         String   @id @default(uuid())
+  externalId String  @unique
+  name       String
+  isVisible  Boolean @default(true)
+  raw        Json    @default("{}")
+
+  users CrmUser[]
+}
+
+model CrmUser {
+  id         String   @id @default(uuid())
+  externalId String  @unique
+  groupId    String?
+  name       String
+  email      String?
+  isActive   Boolean @default(true)
+  isVisible  Boolean @default(true)
+  raw        Json    @default("{}")
+
+  group CrmGroup? @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  deals Deal[]    @relation("ResponsibleDeals")
+  tasks Task[]
+
+  @@index([groupId])
+}
+
+model Pipeline {
+  id                 String  @id @default(uuid())
+  externalId         String  @unique
+  name               String
+  isArchived         Boolean @default(false)
+  isShippingPipeline Boolean @default(false)
+  raw                Json    @default("{}")
+
+  stages PipelineStage[]
+  deals  Deal[]
+  lossReasons LossReason[]
+}
+
+model PipelineStage {
+  id          String  @id @default(uuid())
+  pipelineId  String
+  externalId  String
+  name        String
+  position    Int
+  color       String?
+  isWon       Boolean @default(false)
+  isLost      Boolean @default(false)
+  isVisible   Boolean @default(true)
+  raw         Json    @default("{}")
+
+  pipeline Pipeline @relation(fields: [pipelineId], references: [id], onDelete: Cascade)
+  deals    Deal[]
+  historyFrom DealStageHistory[] @relation("FromStage")
+  historyTo   DealStageHistory[] @relation("ToStage")
+  probabilities StageProbability[]
+
+  @@unique([pipelineId, externalId])
+  @@index([pipelineId, position])
+}
+
+model CustomFieldDefinition {
+  id         String        @id @default(uuid())
+  externalId String
+  entityType CrmEntityType
+  code       String?
+  name       String
+  type       String
+  enums      Json          @default("[]")
+  isVisible  Boolean       @default(true)
+  raw        Json          @default("{}")
+
+  @@unique([entityType, externalId])
+}
+
+model Contact {
+  id         String   @id @default(uuid())
+  externalId String  @unique
+  name       String
+  phone      String?
+  email      String?
+  customFields Json  @default("{}")
+  raw        Json     @default("{}")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  deals Deal[]
+}
+
+model CrmCompany {
+  id         String   @id @default(uuid())
+  externalId String  @unique
+  name       String
+  customFields Json  @default("{}")
+  raw        Json     @default("{}")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+model LossReason {
+  id         String @id @default(uuid())
+  pipelineId String
+  externalId String
+  name       String
+  raw        Json   @default("{}")
+
+  pipeline Pipeline @relation(fields: [pipelineId], references: [id], onDelete: Cascade)
+  deals    Deal[]
+
+  @@unique([pipelineId, externalId])
+}
+
+model Deal {
+  id              String   @id @default(uuid())
+  externalId      String   @unique
+  pipelineId      String
+  stageId         String
+  responsibleId   String?
+  contactId       String?
+  lossReasonId    String?
+  title           String
+  amount          Decimal  @default(0)
+  currency        String   @default("RUB")
+  source          String?
+  tags            String[] @default([])
+  customFields    Json     @default("{}")
+  raw             Json     @default("{}")
+  closedAt        DateTime?
+  expectedCloseAt DateTime?
+  createdAt       DateTime
+  updatedAt       DateTime
+  deletedAt       DateTime?
+
+  pipeline    Pipeline      @relation(fields: [pipelineId], references: [id], onDelete: Restrict)
+  stage       PipelineStage @relation(fields: [stageId], references: [id], onDelete: Restrict)
+  responsible CrmUser?      @relation("ResponsibleDeals", fields: [responsibleId], references: [id], onDelete: SetNull)
+  contact     Contact?      @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  lossReason  LossReason?   @relation(fields: [lossReasonId], references: [id], onDelete: SetNull)
+  stageHistory DealStageHistory[]
+  tasks        Task[]
+  notes        Note[]
+  events       CrmEvent[]
+  products     DealProduct[]
+
+  @@index([pipelineId, stageId])
+  @@index([responsibleId])
+  @@index([closedAt])
+  @@index([updatedAt])
+}
+
+model DealStageHistory {
+  id          String   @id @default(uuid())
+  dealId      String
+  fromStageId String?
+  toStageId   String
+  movedAt     DateTime
+  movedById   String?
+  source      String   @default("sync")
+  raw         Json     @default("{}")
+
+  deal      Deal           @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  fromStage PipelineStage? @relation("FromStage", fields: [fromStageId], references: [id], onDelete: SetNull)
+  toStage   PipelineStage  @relation("ToStage", fields: [toStageId], references: [id], onDelete: Restrict)
+
+  @@index([dealId, movedAt])
+  @@index([toStageId, movedAt])
+}
+
+model DealResponsibleHistory {
+  id             String   @id @default(uuid())
+  dealId         String
+  fromUserId     String?
+  toUserId       String?
+  changedAt      DateTime
+  source         String   @default("sync")
+  raw            Json     @default("{}")
+
+  @@index([dealId, changedAt])
+}
+
+model Task {
+  id            String   @id @default(uuid())
+  externalId    String   @unique
+  dealId        String?
+  responsibleId String?
+  title         String
+  typeId        Int?
+  typeName      String?
+  dueAt         DateTime?
+  completedAt   DateTime?
+  isCompleted   Boolean  @default(false)
+  raw           Json     @default("{}")
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  deal        Deal?    @relation(fields: [dealId], references: [id], onDelete: SetNull)
+  responsible CrmUser? @relation(fields: [responsibleId], references: [id], onDelete: SetNull)
+}
+
+model Note {
+  id         String   @id @default(uuid())
+  externalId String  @unique
+  dealId     String?
+  type       String
+  text       String?
+  createdAt  DateTime
+  raw        Json     @default("{}")
+
+  deal Deal? @relation(fields: [dealId], references: [id], onDelete: SetNull)
+}
+
+model CrmEvent {
+  id         String   @id @default(uuid())
+  externalId String  @unique
+  dealId     String?
+  type       String
+  valueBefore Json?
+  valueAfter  Json?
+  createdAt  DateTime
+  raw        Json     @default("{}")
+
+  deal Deal? @relation(fields: [dealId], references: [id], onDelete: SetNull)
+
+  @@index([type, createdAt])
+}
+
+model DealProduct {
+  id        String   @id @default(uuid())
+  dealId    String
+  externalId String?
+  name      String
+  sku       String?
+  quantity  Decimal  @default(1)
+  price     Decimal  @default(0)
+  raw       Json     @default("{}")
+
+  deal Deal @relation(fields: [dealId], references: [id], onDelete: Cascade)
+
+  @@index([dealId])
+}
+
+model ReportTemplate {
+  id          String           @id @default(uuid())
+  userId      String?
+  name        String
+  sourceType  ReportSourceType
+  config      Json             @default("{}")
+  position    Int              @default(0)
+  isShared    Boolean          @default(false)
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+}
+
+model DashboardLayout {
+  id        String   @id @default(uuid())
+  userId    String
+  name      String
+  config    Json     @default("{}")
+  isDefault Boolean  @default(false)
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model ForecastSettings {
+  id                     String          @id @default(uuid())
+  closingStageId         String?
+  shippingPipelineId     String?
+  shippingSuccessStageId String?
+  probabilityMode        ProbabilityMode @default(HYBRID)
+  minSampleSize          Int             @default(3)
+  updatedAt              DateTime        @updatedAt
+}
+
+model StageProbability {
+  id             String   @id @default(uuid())
+  stageId        String
+  manualPercent  Decimal?
+  autoPercent    Decimal?
+  sampleSize     Int      @default(0)
+  confidence     Decimal  @default(0)
+  updatedAt      DateTime @updatedAt
+
+  stage PipelineStage @relation(fields: [stageId], references: [id], onDelete: Cascade)
+
+  @@unique([stageId])
+}
+
+model ExportJob {
+  id        String          @id @default(uuid())
+  status    ExportJobStatus @default(QUEUED)
+  reportConfig Json         @default("{}")
+  filePath  String?
+  error     String?
+  createdAt DateTime        @default(now())
+  finishedAt DateTime?
+}
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  userId    String?
+  action    String
+  entity    String
+  entityId  String?
+  metadata  Json     @default("{}")
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+}

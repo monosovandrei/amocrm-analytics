@@ -1,0 +1,12 @@
+node_modules
+apps/api/dist
+apps/web/.next
+apps/api/src/generated/prisma
+.env
+.env.*
+!.env.example
+*.log
+*.tsbuildinfo
+.git
+.gitignore
+README.local.md

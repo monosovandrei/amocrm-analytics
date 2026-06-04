@@ -1,0 +1,44 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-amocrm}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-amocrm_analytics}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - amocrm_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+    env_file:
+      - ../.env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-amocrm}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-amocrm_analytics}?schema=public
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "4000:4000"
+
+  web:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.web
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:4000/api/v1}
+    depends_on:
+      - api
+    ports:
+      - "3000:3000"
+
+volumes:
+  amocrm_postgres:
