@@ -5,6 +5,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AmoClient } from './amo-client';
 import { AmoService } from './amo.service';
 import { AmoSyncMaps } from './amo.types';
+import { AuditService } from '../audit/audit.service';
 
 @Injectable()
 export class AmoSyncService {
@@ -13,12 +14,20 @@ export class AmoSyncService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly amo: AmoService,
+    private readonly audit: AuditService,
   ) {}
 
-  async trigger(type: SyncJobType) {
+  async trigger(type: SyncJobType, actorUserId?: string) {
     const connection = await this.amo.getActiveConnectionOrFail();
     const job = await this.prisma.syncJob.create({
       data: { connectionId: connection.id, type, status: 'QUEUED' },
+    });
+    await this.audit.record({
+      userId: actorUserId,
+      action: 'amo.sync.trigger',
+      entity: 'SyncJob',
+      entityId: job.id,
+      metadata: { type, connectionId: connection.id },
     });
 
     this.run(job.id).catch((error) => {

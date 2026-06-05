@@ -5,8 +5,10 @@ import { AmoSchedulerService } from './amo-scheduler.service';
 import { AmoSyncService } from './amo-sync.service';
 import { AmoService } from './amo.service';
 import { AmoWebhookController } from './amo-webhook.controller';
+import { AuditModule } from '../audit/audit.module';
 
 @Module({
+  imports: [AuditModule],
   controllers: [AmoController, AmoWebhookController],
   providers: [AmoClientFactory, AmoService, AmoSyncService, AmoSchedulerService],
   exports: [AmoService, AmoSyncService],

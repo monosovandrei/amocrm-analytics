@@ -1,27 +1,37 @@
 # amoCRM Analytics
 
-Мини-проект для аналитики amoCRM в контуре одной компании. Проект забирает данные из amoCRM, сохраняет их в PostgreSQL и позволяет РОПу собирать отчёты через конструктор контрактов данных: количество сделок, переходы по этапам, условия по CRM-полям, суммы/средние по полям, конверсии между показателями, среднее время в этапах и прогноз по воронке.
+Сервис управленческой отчетности поверх amoCRM. amoCRM остается рабочей системой менеджеров, сервис забирает данные по API, сохраняет отдельную копию в PostgreSQL и строит отчеты для РОПа.
 
-Проект выделен из PulseBoard и намеренно не содержит billing, телефонию, мессенджеры, AI scoring, multi-tenant и no-CRM режим.
+Проект не является AI-агентом и не управляет продажами автоматически. На этапе пилота интеграция должна работать только в режиме чтения amoCRM.
+
+## Что делает сервис
+
+- Подключает amoCRM через OAuth 2.0.
+- Синхронизирует сделки, контакты, компании, пользователей, группы, этапы, задачи, события и примечания.
+- Хранит данные в PostgreSQL внутри контура компании.
+- Строит отчеты по сделкам, суммам, этапам, конверсиям и времени нахождения на этапах.
+- Формирует прогноз выручки по воронке.
+- Дает рабочий стол с виджетами.
+- Экспортирует отчеты в Excel.
+
+## Ограничения пилота
+
+- Только внутренний сервер или закрытый VPN-доступ.
+- PostgreSQL не должен быть доступен из интернета.
+- amoCRM подключается с минимально нужными правами и только на чтение.
+- Сервис не подключается к 1С и не влияет на существующую интеграцию amoCRM/1С.
+- Публичная публикация веб-интерфейса без дополнительного аудита запрещена.
+- Реальные `.env`, токены, пароли и клиентские данные нельзя коммитить в Git.
 
 ## Состав
 
-- `apps/api` — NestJS API, amoCRM OAuth, sync, webhooks, отчёты, forecast, Excel export.
-- `apps/web` — Next.js интерфейс: подключение amoCRM, конструктор отчётов, рабочий стол РОПа, настройки.
-- `prisma/schema.prisma` — PostgreSQL-модель данных.
-- `docker/` — Dockerfile и compose для локального/серверного запуска.
-- `docs/IT_REVIEW.md` — краткая справка для ИТ/СБ по доступам, данным и интеграции.
-
-## Основные возможности
-
-- Подключение amoCRM через OAuth 2.0.
-- Полная первичная синхронизация и последующая incremental-синхронизация.
-- Приём amoCRM webhooks по URL с секретом.
-- Роли `ADMIN` и `ROP`.
-- Конструктор отчётов по текущему состоянию сделок и событиям переходов.
-- Настраиваемый рабочий стол РОПа с закреплёнными виджетами.
-- Forecast: закрывающий этап, отгрузочная воронка, плечо отгрузки, weighted pipeline.
-- Экспорт отчётов в Excel.
+- `apps/api` - NestJS API, auth, amoCRM OAuth/sync/webhooks, reports, forecast, Excel export.
+- `apps/web` - Next.js интерфейс.
+- `prisma/schema.prisma` - модель PostgreSQL.
+- `prisma/migrations` - миграции базы данных.
+- `docker/` - Docker-сборка API, Web и PostgreSQL.
+- `docs/IT_REVIEW.md` - справка для ИТ/ИБ.
+- `docs/TZ.md` - техническое задание.
 
 ## Требования
 
@@ -29,32 +39,9 @@
 - npm `>=10`
 - PostgreSQL `16`
 - Доступ сервера к amoCRM API по HTTPS
-- Внешний HTTPS URL для webhook amoCRM
+- HTTPS URL для webhook amoCRM, если используются webhooks
 
-## Зависимости
-
-Основные backend-зависимости:
-
-- NestJS 11
-- Prisma 5
-- PostgreSQL
-- Passport/JWT
-- bcryptjs
-- helmet
-- class-validator/class-transformer
-- exceljs
-
-Основные frontend-зависимости:
-
-- Next.js 16
-- React 18
-- Tailwind CSS
-- lucide-react
-- recharts
-
-Полный воспроизводимый список версий зафиксирован в `package-lock.json`.
-
-## Настройки
+## Переменные окружения
 
 Скопировать пример:
 
@@ -62,19 +49,18 @@
 cp .env.example .env
 ```
 
-Заполнить значения в `.env`. В репозиторий нельзя коммитить реальные токены, пароли, OAuth secret, JWT secret и ключ шифрования.
+Заполнить обязательные значения:
 
-Ключевые переменные:
-
-- `DATABASE_URL` — строка подключения к PostgreSQL.
-- `JWT_SECRET` — секрет подписи JWT, минимум 32 байта случайных данных.
-- `CREDENTIALS_ENCRYPTION_KEY` — ключ шифрования OAuth-токенов amoCRM. Рекомендуется 64 hex-символа.
-- `AMOCRM_CLIENT_ID` — ID private integration amoCRM.
-- `AMOCRM_CLIENT_SECRET` — secret private integration amoCRM.
-- `AMOCRM_REDIRECT_URI` — redirect URI, зарегистрированный в amoCRM.
-- `WEBHOOK_BASE_URL` — внешний API URL без хвостового slash, например `https://analytics.example.ru/api/v1`.
-- `WEB_ORIGIN` — разрешённый origin фронтенда для CORS.
-- `NEXT_PUBLIC_API_URL` — публичный URL API для web-приложения.
+- `DATABASE_URL` - строка подключения к PostgreSQL.
+- `JWT_SECRET` - секрет JWT, минимум 32 байта случайных данных.
+- `CREDENTIALS_ENCRYPTION_KEY` - ключ AES-256-GCM для OAuth-токенов amoCRM, рекомендуется 64 hex-символа.
+- `AMOCRM_CLIENT_ID` - ID private integration amoCRM.
+- `AMOCRM_CLIENT_SECRET` - secret private integration amoCRM.
+- `AMOCRM_REDIRECT_URI` - redirect URI из настроек amoCRM.
+- `WEBHOOK_BASE_URL` - внешний API URL без завершающего slash, например `https://analytics.example.ru/api/v1`.
+- `WEB_ORIGIN` - разрешенный origin фронтенда для CORS.
+- `NEXT_PUBLIC_API_URL` - публичный URL API для web-приложения.
+- `SEED_ADMIN_EMAIL` и `SEED_ADMIN_PASSWORD` - начальный администратор для `npm run db:seed`.
 
 ## Локальный запуск
 
@@ -101,101 +87,67 @@ npm run dev:web
 - API: `http://localhost:4000/api/v1`
 - Healthcheck: `http://localhost:4000/api/v1/health`
 
-Тестовый пользователь создаётся через `npm run db:seed`. Значения задаются переменными `SEED_ADMIN_EMAIL` и `SEED_ADMIN_PASSWORD`.
-
-## Docker запуск
+## Docker-запуск
 
 ```bash
 cp .env.example .env
 docker compose -f docker/docker-compose.yml up -d --build
 ```
 
-Перед запуском в серверном контуре заменить все `CHANGE_ME_*` значения в `.env`.
-В `.env` `DATABASE_URL` может оставаться локальным (`localhost`) для запуска без Docker; `docker-compose.yml` переопределяет его внутри API-контейнера на host `postgres`.
+API-контейнер перед стартом выполняет:
 
-## Подключение amoCRM
+```bash
+prisma migrate deploy --schema prisma/schema.prisma
+```
 
-1. В amoCRM создать private integration.
-2. Указать redirect URI из `AMOCRM_REDIRECT_URI`.
-3. Выдать интеграции права на чтение сущностей, перечисленных ниже.
-4. Заполнить `AMOCRM_CLIENT_ID` и `AMOCRM_CLIENT_SECRET`.
-5. Запустить приложение и открыть раздел `amoCRM`.
-6. Ввести домен аккаунта amoCRM.
-7. Пройти OAuth авторизацию.
-8. Скопировать webhook URL из интерфейса подключения и зарегистрировать его в amoCRM.
-9. Запустить первичную синхронизацию.
+PostgreSQL в `docker/docker-compose.yml` публикуется только на `127.0.0.1:${POSTGRES_PORT:-5433}`. Для промышленного контура рекомендуется managed PostgreSQL или отдельный внутренний database-сервер без внешней публикации порта.
 
-Поддерживаются домены `*.amocrm.ru` и `*.amocrm.com`.
+## Безопасность
 
-## Нужные права amoCRM
+- `.env` исключен из Git.
+- JWT secret обязателен, fallback-секрета в коде нет.
+- OAuth-токены amoCRM шифруются через AES-256-GCM перед записью в БД.
+- API включает Helmet, CORS allowlist и ValidationPipe с whitelist.
+- Login ограничен rate limit: 5 попыток в минуту на endpoint.
+- Админские действия защищены `JwtAuthGuard` + `RolesGuard`.
+- Админские и auth-события пишутся в `AuditLog`.
+- Webhook amoCRM защищен URL-secret и проверкой subdomain аккаунта.
 
-Минимально нужны права чтения:
+## Audit log
 
-- аккаунт;
-- пользователи и группы;
-- воронки, этапы, причины отказа;
-- сделки/leads;
-- контакты;
-- компании;
-- задачи;
-- примечания;
-- события;
-- кастомные поля сделок, контактов и компаний.
+В `AuditLog` пишутся:
 
-Если amoCRM требует детализированные scopes, интеграции нужны scopes на чтение соответствующих сущностей и доступ к webhook-событиям по сделкам.
+- успешные и неуспешные попытки входа;
+- создание пользователей администратором;
+- подключение/обновление amoCRM;
+- ручной запуск синхронизации;
+- изменение forecast-настроек;
+- изменение вероятностей этапов;
+- изменение видимости менеджеров и групп.
 
-## Где хранятся данные
-
-Все постоянные данные хранятся в PostgreSQL:
-
-- `AmoConnection` — подключение amoCRM, subdomain, account id/name, webhook secret, зашифрованные OAuth tokens.
-- `CrmUser`, `CrmGroup` — менеджеры и группы amoCRM, включая флаги видимости в сервисе.
-- `Pipeline`, `PipelineStage`, `LossReason` — воронки, этапы и причины отказа.
-- `CustomFieldDefinition` — metadata CRM-полей и enum-значений.
-- `Deal`, `Contact`, `CrmCompany` — сделки, контакты, компании и их CRM-поля.
-- `DealStageHistory`, `DealResponsibleHistory` — история переходов по этапам и ответственным.
-- `Task`, `Note`, `CrmEvent`, `DealProduct` — задачи, примечания, события, товары.
-- `ReportTemplate` — сохранённые настройки отчётов.
-- `DashboardLayout` — расположение виджетов рабочего стола.
-- `ForecastSettings`, `StageProbability` — настройки и вероятности forecast.
-- `WebhookEvent`, `SyncJob`, `AuditLog` — технические события синхронизации и аудит.
-
-OAuth-токены amoCRM хранятся только в зашифрованном виде через AES-256-GCM. Ключ шифрования берётся из `CREDENTIALS_ENCRYPTION_KEY` и не должен храниться в Git.
-
-## Проверка перед передачей
+## Проверка перед передачей ИТ/ИБ
 
 ```bash
 npm test
 npm run typecheck
 npm run build
+npm audit --omit=dev
 ```
 
-Дополнительно:
+Дополнительно проверить:
 
-```bash
-npm audit
-```
+- в Git нет `.env`, токенов, паролей и реальных клиентских данных;
+- PostgreSQL не доступен снаружи;
+- amoCRM integration имеет минимально нужные read-only права;
+- сервис запускается во внутреннем контуре;
+- 1С не подключена к сервису;
+- публичный доступ к Web/API закрыт до отдельного security-аудита.
 
-На момент подготовки проекта `npm audit --omit=dev` показывает 4 moderate, 0 high, 0 critical. Детали и рекомендации: `docs/IT_REVIEW.md`.
+## Тесты
 
-## Автотесты
+`npm test` запускает Jest-регрессию backend. Покрыты:
 
-`npm test` запускает Jest-регрессию backend-расчётов конструктора отчётов. Покрыты сценарии:
-
-- количество сделок за период;
-- переходы в этапы с фильтром `откуда -> куда`;
+- расчет отчетов;
 - исключение sync-артефактов `fromStageId === toStageId`;
-- текущее состояние сделки в этапе;
-- условия по CRM-полям;
-- сумма и среднее по выбранному полю;
-- конверсия между показателями;
-- среднее время нахождения в этапе.
-
-## Безопасность
-
-- Реальные `.env` файлы исключены из Git.
-- JWT secret обязателен, fallback-секрета в коде нет.
-- OAuth credentials amoCRM шифруются перед записью в БД.
-- Webhook amoCRM защищён URL-secret и проверкой subdomain аккаунта.
-- API включает Helmet, CORS allowlist и validation pipe с `whitelist`.
-- Проект рассчитан на размещение внутри инфраструктуры одной компании.
+- role guard для admin routes;
+- audit log для входа и создания пользователей.

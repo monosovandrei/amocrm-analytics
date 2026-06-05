@@ -1,7 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { ScheduleModule } from '@nestjs/schedule';
-import { ThrottlerModule } from '@nestjs/throttler';
+import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { APP_GUARD } from '@nestjs/core';
 import { PrismaModule } from './prisma/prisma.module';
 import { AuthModule } from './auth/auth.module';
@@ -9,7 +9,7 @@ import { AmoModule } from './amo/amo.module';
 import { ReportsModule } from './reports/reports.module';
 import { SettingsModule } from './settings/settings.module';
 import { HealthModule } from './health/health.module';
-import { RolesGuard } from './auth/guards/roles.guard';
+import { AuditModule } from './audit/audit.module';
 
 @Module({
   imports: [
@@ -22,11 +22,12 @@ import { RolesGuard } from './auth/guards/roles.guard';
     ReportsModule,
     SettingsModule,
     HealthModule,
+    AuditModule,
   ],
   providers: [
     {
       provide: APP_GUARD,
-      useClass: RolesGuard,
+      useClass: ThrottlerGuard,
     },
   ],
 })

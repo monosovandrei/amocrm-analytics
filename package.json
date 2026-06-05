@@ -13,14 +13,15 @@
     "test": "npm test --workspace=@amocrm-analytics/api -- --runInBand",
     "db:generate": "prisma generate --schema prisma/schema.prisma",
     "db:migrate": "prisma migrate dev --schema prisma/schema.prisma",
+    "db:deploy": "prisma migrate deploy --schema prisma/schema.prisma",
     "db:studio": "prisma studio --schema prisma/schema.prisma",
     "db:seed": "node prisma/seed.js"
   },
   "dependencies": {
-    "@prisma/client": "^5.22.0"
+    "@prisma/client": "^5.22.0",
+    "prisma": "^5.22.0"
   },
   "devDependencies": {
-    "prisma": "^5.22.0",
     "typescript": "^5.5.0"
   },
   "engines": {

@@ -1,6 +1,7 @@
 import * as bcrypt from 'bcryptjs';
 import { ConflictException, Injectable, UnauthorizedException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
+import { AuditService } from '../audit/audit.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { LoginDto } from './dto/login.dto';
 import { CreateUserDto } from './dto/create-user.dto';
@@ -10,20 +11,42 @@ export class AuthService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly jwt: JwtService,
+    private readonly audit: AuditService,
   ) {}
 
-  async login(dto: LoginDto) {
-    const user = await this.prisma.user.findUnique({ where: { email: dto.email.toLowerCase() } });
+  async login(dto: LoginDto, ip?: string) {
+    const email = dto.email.toLowerCase();
+    const user = await this.prisma.user.findUnique({ where: { email } });
     if (!user || !user.isActive) {
+      await this.audit.record({
+        action: 'auth.login.failed',
+        entity: 'User',
+        metadata: { email, ip, reason: 'not_found_or_inactive' },
+      });
       throw new UnauthorizedException('Неверный email или пароль');
     }
 
     const ok = await bcrypt.compare(dto.password, user.passwordHash);
     if (!ok) {
+      await this.audit.record({
+        userId: user.id,
+        action: 'auth.login.failed',
+        entity: 'User',
+        entityId: user.id,
+        metadata: { email, ip, reason: 'bad_password' },
+      });
       throw new UnauthorizedException('Неверный email или пароль');
     }
 
     const accessToken = await this.jwt.signAsync({ sub: user.id, role: user.role });
+    await this.audit.record({
+      userId: user.id,
+      action: 'auth.login.success',
+      entity: 'User',
+      entityId: user.id,
+      metadata: { email, ip },
+    });
+
     return {
       accessToken,
       user: {
@@ -42,7 +65,7 @@ export class AuthService {
     });
   }
 
-  async createUser(dto: CreateUserDto) {
+  async createUser(dto: CreateUserDto, actorUserId?: string) {
     const email = dto.email.toLowerCase();
     const existing = await this.prisma.user.findUnique({ where: { email } });
     if (existing) {
@@ -58,6 +81,15 @@ export class AuthService {
       },
       select: { id: true, email: true, name: true, role: true, isActive: true },
     });
+
+    await this.audit.record({
+      userId: actorUserId,
+      action: 'admin.user.create',
+      entity: 'User',
+      entityId: user.id,
+      metadata: { email: user.email, role: user.role },
+    });
+
     return user;
   }
 

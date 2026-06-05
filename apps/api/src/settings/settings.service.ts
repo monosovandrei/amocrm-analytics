@@ -4,10 +4,14 @@ import { PrismaService } from '../prisma/prisma.service';
 import { UpdateForecastSettingsDto } from './dto/update-forecast-settings.dto';
 import { UpdateStageProbabilityDto } from './dto/update-stage-probability.dto';
 import { UpdateVisibilityDto } from './dto/update-visibility.dto';
+import { AuditService } from '../audit/audit.service';
 
 @Injectable()
 export class SettingsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly audit: AuditService,
+  ) {}
 
   async getOptions() {
     const [pipelines, managers, groups, customFields] = await Promise.all([
@@ -32,9 +36,9 @@ export class SettingsService {
     return { settings, probabilities };
   }
 
-  async updateForecastSettings(dto: UpdateForecastSettingsDto) {
+  async updateForecastSettings(dto: UpdateForecastSettingsDto, actorUserId?: string) {
     const settings = await this.ensureForecastSettings();
-    return this.prisma.forecastSettings.update({
+    const updated = await this.prisma.forecastSettings.update({
       where: { id: settings.id },
       data: {
         closingStageId: dto.closingStageId ?? settings.closingStageId,
@@ -44,10 +48,18 @@ export class SettingsService {
         minSampleSize: dto.minSampleSize ?? settings.minSampleSize,
       },
     });
+    await this.audit.record({
+      userId: actorUserId,
+      action: 'settings.forecast.update',
+      entity: 'ForecastSettings',
+      entityId: updated.id,
+      metadata: { ...dto },
+    });
+    return updated;
   }
 
-  async updateStageProbability(dto: UpdateStageProbabilityDto) {
-    return this.prisma.stageProbability.upsert({
+  async updateStageProbability(dto: UpdateStageProbabilityDto, actorUserId?: string) {
+    const probability = await this.prisma.stageProbability.upsert({
       where: { stageId: dto.stageId },
       create: {
         stageId: dto.stageId,
@@ -57,9 +69,17 @@ export class SettingsService {
         manualPercent: dto.manualPercent ?? null,
       },
     });
+    await this.audit.record({
+      userId: actorUserId,
+      action: 'settings.stage_probability.update',
+      entity: 'StageProbability',
+      entityId: probability.id,
+      metadata: { ...dto },
+    });
+    return probability;
   }
 
-  async updateVisibility(dto: UpdateVisibilityDto) {
+  async updateVisibility(dto: UpdateVisibilityDto, actorUserId?: string) {
     await this.prisma.$transaction([
       ...dto.managers.map((item) =>
         this.prisma.crmUser.update({ where: { id: item.id }, data: { isVisible: item.isVisible } }),
@@ -68,6 +88,15 @@ export class SettingsService {
         this.prisma.crmGroup.update({ where: { id: item.id }, data: { isVisible: item.isVisible } }),
       ),
     ]);
+    await this.audit.record({
+      userId: actorUserId,
+      action: 'settings.visibility.update',
+      entity: 'CrmVisibility',
+      metadata: {
+        managers: dto.managers.length,
+        groups: dto.groups.length,
+      },
+    });
     return this.getOptions();
   }
 

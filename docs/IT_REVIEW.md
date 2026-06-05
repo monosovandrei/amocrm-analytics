@@ -1,20 +1,23 @@
-# Справка для ИТ и СБ
+# Справка для ИТ и ИБ
 
 ## Назначение
 
-`amoCRM Analytics` — внутренний сервис аналитики продаж для одной компании. Сервис подключается к amoCRM, синхронизирует CRM-данные в PostgreSQL и строит отчёты/дашборды для РОПа.
+`amoCRM Analytics` - внутренний сервис отчетности продаж для одной компании. Сервис подключается к amoCRM, синхронизирует CRM-данные в PostgreSQL и строит отчеты/дашборды для РОПа.
+
+Сервис не использует LLM, AI-агентов, OpenAI, Anthropic, LangChain и аналогичные внешние AI-сервисы. Данные не отправляются во внешний AI-контур.
 
 ## Контур размещения
 
-- Размещение: собственные серверы компании.
-- Публичный доступ нужен только к web-интерфейсу и API endpoint webhook amoCRM.
-- Хранилище: PostgreSQL 16.
-- Внешние сетевые обращения backend: HTTPS к amoCRM API и OAuth endpoints.
-- Frontend обращается только к API сервиса из `NEXT_PUBLIC_API_URL`.
+- Рекомендуемое размещение: внутренний сервер компании или закрытый VPN-контур.
+- Публичный доступ к Web/API допустим только после отдельного security-аудита.
+- PostgreSQL не должен быть доступен из интернета.
+- В `docker/docker-compose.yml` PostgreSQL публикуется только на `127.0.0.1`.
+- Backend выполняет исходящие HTTPS-запросы к amoCRM API и OAuth endpoints.
+- Frontend обращается только к собственному API из `NEXT_PUBLIC_API_URL`.
 
-## Требуемые секреты
+## Секреты
 
-Хранятся в `.env` на сервере, в Git не передаются:
+Хранятся в `.env` на сервере и не передаются в Git:
 
 - `DATABASE_URL`
 - `POSTGRES_PASSWORD`
@@ -28,7 +31,7 @@
 
 ## amoCRM доступы
 
-Нужны права чтения:
+Для пилота рекомендуется режим только чтения. Минимально нужны права чтения:
 
 - аккаунт;
 - пользователи и группы;
@@ -39,74 +42,83 @@
 - задачи;
 - примечания;
 - события;
-- кастомные поля сделок, контактов и компаний.
+- custom fields сделок, контактов и компаний.
 
-Webhook нужен для событий по сделкам и связанным сущностям, чтобы поддерживать near real-time обновление отчётов.
+Сервис не должен получать права записи в amoCRM на первом пилоте. Сервис не подключается к 1С и не влияет на существующую интеграцию amoCRM/1С.
 
-## Где сохраняются данные
+## Данные в PostgreSQL
 
-Все данные сохраняются в PostgreSQL. Основные таблицы:
+Сервис создает отдельную копию части данных amoCRM. Основные таблицы:
 
-- `AmoConnection` — подключение amoCRM, subdomain, account id/name, webhook secret, OAuth tokens в зашифрованном виде.
-- `CrmUser`, `CrmGroup` — пользователи и группы amoCRM, плюс флаги видимости в сервисе.
-- `Pipeline`, `PipelineStage`, `LossReason` — структура воронок.
-- `CustomFieldDefinition` — metadata CRM-полей.
-- `Deal`, `Contact`, `CrmCompany` — CRM-сущности и их custom fields.
-- `DealStageHistory`, `DealResponsibleHistory` — история изменений для конверсий и SLA-аналитики.
-- `Task`, `Note`, `CrmEvent`, `DealProduct` — дополнительные CRM-данные для отчётов.
-- `ReportTemplate` — сохранённые контракты отчётов.
-- `DashboardLayout` — расположение виджетов рабочего стола РОПа.
-- `ForecastSettings`, `StageProbability` — настройки прогноза.
-- `WebhookEvent`, `SyncJob`, `AuditLog` — технический журнал.
+- `AmoConnection` - подключение amoCRM, subdomain, account id/name, webhook secret, OAuth tokens в зашифрованном виде.
+- `CrmUser`, `CrmGroup` - пользователи и группы amoCRM.
+- `Pipeline`, `PipelineStage`, `LossReason` - структура воронок.
+- `CustomFieldDefinition` - metadata CRM-полей.
+- `Deal`, `Contact`, `CrmCompany` - сделки, контакты, компании и custom fields.
+- `DealStageHistory`, `DealResponsibleHistory` - история изменений для конверсий и SLA-аналитики.
+- `Task`, `Note`, `CrmEvent`, `DealProduct` - дополнительные CRM-данные для отчетов.
+- `ReportTemplate`, `DashboardLayout` - пользовательские настройки отчетов и рабочего стола.
+- `ForecastSettings`, `StageProbability` - настройки прогноза.
+- `WebhookEvent`, `SyncJob`, `AuditLog` - технические события, синхронизация и аудит.
 
 ## Защита данных
 
-- OAuth tokens amoCRM шифруются AES-256-GCM перед записью в БД.
+- OAuth-токены amoCRM шифруются AES-256-GCM перед записью в БД.
 - `CREDENTIALS_ENCRYPTION_KEY` не хранится в БД и не должен попадать в Git.
 - JWT secret обязателен через `ConfigService.getOrThrow`.
-- Webhook URL содержит случайный secret: `/api/v1/webhooks/amocrm/{secret}`.
-- Webhook дополнительно проверяет subdomain аккаунта amoCRM.
 - API включает Helmet, CORS allowlist и DTO validation с запретом неизвестных полей.
-- `.env`, build artifacts, logs и `node_modules` исключены из Git/Docker context.
+- Webhook amoCRM защищен URL-secret: `/api/v1/webhooks/amocrm/{secret}`.
+- Webhook дополнительно проверяет subdomain аккаунта amoCRM.
+- `.env`, build artifacts, logs и `node_modules` исключены из Git.
 
-## Регрессионная защита расчётов
+## Исправления после первичной проверки
 
-Команда:
+- Исправлен порядок guard-ов на admin routes: `JwtAuthGuard` выполняется перед `RolesGuard`.
+- Включена защита от перебора пароля: endpoint `POST /api/v1/auth/login` ограничен 5 попытками в минуту.
+- Добавлены миграции Prisma: `prisma/migrations/0001_init/migration.sql`.
+- API-контейнер применяет миграции при старте через `prisma migrate deploy`.
+- PostgreSQL в Docker больше не публикуется наружу хоста, только `127.0.0.1`.
+- Реализована запись `AuditLog` для auth/admin/amo/settings действий.
+- Добавлены regression tests для `RolesGuard` и audit-сценариев auth.
+- README заменен на читаемую инструкцию запуска, эксплуатации и проверки.
+
+## Audit log
+
+В `AuditLog` фиксируются:
+
+- успешный вход;
+- неуспешный вход;
+- создание пользователя администратором;
+- подключение/обновление amoCRM;
+- ручной запуск синхронизации;
+- изменение forecast-настроек;
+- изменение вероятностей этапов;
+- изменение видимости менеджеров и групп.
+
+Audit log не должен содержать пароли, OAuth-токены или значения секретов.
+
+## Проверки
+
+Команды:
 
 ```bash
 npm test
+npm run typecheck
+npm run build
+npm audit --omit=dev
 ```
 
-Проверяет backend-логику конструктора отчётов через `ReportsService` и in-memory Prisma mock. Покрытые сценарии:
+Дополнительные проверки перед пилотом:
 
-- сделки, созданные в периоде;
-- переходы по этапам `откуда -> куда`;
-- исключение sync-артефактов `fromStageId === toStageId`;
-- текущее состояние в этапе;
-- условия по CRM-полям;
-- сумма и среднее по выбранному CRM-полю;
-- конверсия между двумя показателями;
-- среднее время нахождения сделки в этапе;
-- фильтрация по менеджеру.
+- убедиться, что `.env` не отслеживается Git;
+- убедиться, что в репозитории нет токенов, паролей и реальных клиентских данных;
+- проверить, что PostgreSQL недоступен из внешней сети;
+- проверить, что amoCRM integration выдана только на чтение;
+- запускать сервис только во внутреннем контуре.
 
-Это закрывает основной регрессионный риск: случайная поломка расчётов конструктора при будущих доработках.
+## Остаточные ограничения
 
-## Остаточный npm audit
-
-После обновления зависимостей и удаления `xlsx`:
-
-- `npm audit --omit=dev` показывает 4 moderate, 0 high, 0 critical.
-- Источники:
-  - `next -> postcss` advisory. npm предлагает `next@9.3.3`, что является некорректным downgrade для проекта на App Router.
-  - `exceljs -> uuid` advisory. Проект использует `exceljs` только для генерации `.xlsx` из внутренних данных, не для парсинга загруженных пользователем файлов.
-
-Рекомендация: принять как остаточный риск для внутреннего контура либо заменить Excel export на CSV/серверный writer без внешней библиотеки, если СБ требует нулевой audit.
-
-## Production рекомендации
-
-- Запускать только за HTTPS reverse proxy.
-- Ограничить доступ к API и web по корпоративным сетям/VPN, если возможно.
-- Не использовать demo/seed пароль в production.
-- Ротировать `JWT_SECRET` и `CREDENTIALS_ENCRYPTION_KEY` только по процедуре, учитывая, что смена ключа шифрования потребует переподключения amoCRM или миграции credentials.
-- Делать регулярный backup PostgreSQL.
-- Логи webhook/sync не должны выгружаться во внешние системы без маскирования payload.
+- Это прототип для ограниченного пилота, не промышленная SaaS-поставка.
+- Перед внешней публикацией Web/API нужен отдельный security-аудит.
+- Для промышленного запуска нужны централизованные backup/restore, мониторинг, управление доступами и регламент ротации секретов.
+- `npm audit --omit=dev` показывает 4 moderate уязвимости в транзитивных зависимостях `next -> postcss` и `exceljs -> uuid`. Автоматический `npm audit fix --force` предлагает breaking downgrade (`next@9.3.3`, `exceljs@3.4.0`), поэтому до безопасного upstream-релиза риск принимается только для закрытого внутреннего контура. Для промышленного запуска нужно повторно проверить обновления `next` и `exceljs` или заменить Excel export на безопасный CSV/server-side writer.

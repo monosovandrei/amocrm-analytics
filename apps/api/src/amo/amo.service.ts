@@ -6,6 +6,7 @@ import { encryptJson, decryptJson } from '../common/crypto.util';
 import { PrismaService } from '../prisma/prisma.service';
 import { AmoClient, AmoClientFactory } from './amo-client';
 import { AmoCredentials, AmoWebhookItem } from './amo.types';
+import { AuditService } from '../audit/audit.service';
 
 @Injectable()
 export class AmoService {
@@ -13,6 +14,7 @@ export class AmoService {
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
     private readonly clients: AmoClientFactory,
+    private readonly audit: AuditService,
   ) {}
 
   buildOAuthUrl(subdomainInput: string) {
@@ -28,7 +30,7 @@ export class AmoService {
     return { url: url.toString(), state, domain };
   }
 
-  async exchangeOAuthCode(subdomainInput: string, code: string, redirectUri: string) {
+  async exchangeOAuthCode(subdomainInput: string, code: string, redirectUri: string, actorUserId?: string) {
     if (!redirectUri) {
       throw new BadRequestException('redirectUri обязателен');
     }
@@ -87,6 +89,14 @@ export class AmoService {
     const connection = existing
       ? await this.prisma.amoConnection.update({ where: { id: existing.id }, data })
       : await this.prisma.amoConnection.create({ data });
+
+    await this.audit.record({
+      userId: actorUserId,
+      action: existing ? 'amo.connection.update' : 'amo.connection.create',
+      entity: 'AmoConnection',
+      entityId: connection.id,
+      metadata: { subdomain: domain, accountId: connection.accountId },
+    });
 
     return this.toPublicConnection(connection);
   }

@@ -24,4 +24,4 @@ COPY --from=build /app/apps/api/src/generated ./apps/api/src/generated
 COPY --from=build /app/prisma ./prisma
 COPY package.json ./
 COPY apps/api/package.json ./apps/api/package.json
-CMD ["node", "apps/api/dist/main.js"]
+CMD ["sh", "-c", "npx prisma migrate deploy --schema prisma/schema.prisma && node apps/api/dist/main.js"]
