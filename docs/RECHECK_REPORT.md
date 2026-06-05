@@ -36,7 +36,7 @@ npm run build
 - tests: 5 Jest suites / 11 tests passed
 - typecheck: API и Web без TypeScript errors
 - build: API и Web собираются успешно
-- Docker compose config: published ports только `127.0.0.1`; Web target `3000`; Vite API URL передается build arg.
+- Docker compose config и clean smoke: published ports только `127.0.0.1`; `docker compose build api` успешен; `docker compose up -d` на новой PostgreSQL volume применяет миграции; API health возвращает `200`; Web возвращает `200`.
 
 ## Production-условия запуска
 
