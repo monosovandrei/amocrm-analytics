@@ -26,7 +26,7 @@
 ## Состав
 
 - `apps/api` - NestJS API, auth, amoCRM OAuth/sync/webhooks, reports, forecast, Excel export.
-- `apps/web` - Next.js интерфейс.
+- `apps/web` - Vite React интерфейс.
 - `prisma/schema.prisma` - модель PostgreSQL.
 - `prisma/migrations` - миграции базы данных.
 - `docker/` - Docker-сборка API, Web и PostgreSQL.
@@ -59,7 +59,7 @@ cp .env.example .env
 - `AMOCRM_REDIRECT_URI` - redirect URI из настроек amoCRM.
 - `WEBHOOK_BASE_URL` - внешний API URL без завершающего slash, например `https://analytics.example.ru/api/v1`.
 - `WEB_ORIGIN` - разрешенный origin фронтенда для CORS.
-- `NEXT_PUBLIC_API_URL` - публичный URL API для web-приложения.
+- `VITE_API_URL` - публичный URL API для web-приложения.
 - `SEED_ADMIN_EMAIL` и `SEED_ADMIN_PASSWORD` - начальный администратор для `npm run db:seed`.
 
 ## Локальный запуск

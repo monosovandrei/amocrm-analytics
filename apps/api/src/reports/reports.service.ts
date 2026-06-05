@@ -1,4 +1,4 @@
-import ExcelJS from 'exceljs';
+﻿import JSZip from 'jszip';
 import { Injectable } from '@nestjs/common';
 import { ReportSourceType, UserRole } from '../generated/prisma';
 import { endOfMonth, median, startOfMonth } from '../common/date.util';
@@ -12,6 +12,9 @@ import {
   ReportConfig,
   ReportFilters,
 } from './report-types';
+
+type XlsxValue = string | number | boolean | null | undefined;
+type XlsxSheet = { name: string; rows: XlsxValue[][] };
 
 @Injectable()
 export class ReportsService {
@@ -58,51 +61,42 @@ export class ReportsService {
 
   async exportExcel(dto: ReportQueryDto, user: { id: string; role: UserRole }) {
     const report = await this.compute(dto, user);
-    const workbook = new ExcelJS.Workbook();
-    workbook.creator = 'amoCRM Analytics';
-    workbook.created = new Date();
-
-    const summaryRows = [
-      ['Отчет', dto.name],
-      ['Источник', dto.sourceType],
-      ['Сформирован', new Date().toISOString()],
-      ['Фильтры', JSON.stringify(dto.filters)],
+    const sheets: XlsxSheet[] = [
+      {
+        name: 'Параметры',
+        rows: [
+          ['Отчет', dto.name],
+          ['Источник', dto.sourceType],
+          ['Сформирован', new Date().toISOString()],
+          ['Фильтры', JSON.stringify(dto.filters)],
+        ],
+      },
     ];
-    const summarySheet = workbook.addWorksheet('Параметры');
-    summaryRows.forEach((row) => summarySheet.addRow(row));
-    summarySheet.columns = [{ width: 18 }, { width: 80 }];
 
     if (Array.isArray((report as any).steps)) {
-      this.addJsonWorksheet(workbook, 'Конверсии', (report as any).steps);
+      sheets.push(this.jsonSheet('Конверсии', (report as any).steps));
     }
     if (Array.isArray((report as any).rows)) {
-      this.addJsonWorksheet(workbook, 'Данные', (report as any).rows);
+      sheets.push(this.jsonSheet('Данные', (report as any).rows));
     }
     if (Array.isArray((report as any).tableRows)) {
-      this.addJsonWorksheet(workbook, 'Data contract', (report as any).tableRows);
+      sheets.push(this.jsonSheet('Data contract', (report as any).tableRows));
     }
     if ((report as any).forecast) {
-      this.addJsonWorksheet(workbook, 'Прогноз', [(report as any).forecast]);
+      sheets.push(this.jsonSheet('Прогноз', [(report as any).forecast]));
     }
 
-    const buffer = await workbook.xlsx.writeBuffer();
-    return Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+    return this.buildXlsx(sheets);
   }
 
-  private addJsonWorksheet(workbook: ExcelJS.Workbook, name: string, rows: Array<Record<string, any>>) {
-    const sheet = workbook.addWorksheet(name);
-    if (rows.length === 0) return;
+  private jsonSheet(name: string, rows: Array<Record<string, any>>): XlsxSheet {
+    if (rows.length === 0) return { name, rows: [] };
 
     const columns = Array.from(new Set(rows.flatMap((row) => Object.keys(row))));
-    sheet.columns = columns.map((key) => ({ header: key, key, width: Math.min(Math.max(key.length + 4, 14), 42) }));
-    for (const row of rows) {
-      sheet.addRow(
-        Object.fromEntries(
-          columns.map((key) => [key, this.excelCellValue(row[key])]),
-        ),
-      );
-    }
-    sheet.getRow(1).font = { bold: true };
+    return {
+      name,
+      rows: [columns, ...rows.map((row) => columns.map((key) => this.excelCellValue(row[key])))],
+    };
   }
 
   private excelCellValue(value: unknown) {
@@ -112,6 +106,91 @@ export class ReportsService {
     return JSON.stringify(value);
   }
 
+  private async buildXlsx(sheets: XlsxSheet[]) {
+    const zip = new JSZip();
+    zip.file('[Content_Types].xml', this.contentTypesXml(sheets.length));
+    zip.folder('_rels')!.file('.rels', this.rootRelsXml());
+    zip.folder('xl')!.file('workbook.xml', this.workbookXml(sheets));
+    zip.folder('xl')!.folder('_rels')!.file('workbook.xml.rels', this.workbookRelsXml(sheets.length));
+    const worksheets = zip.folder('xl')!.folder('worksheets')!;
+    sheets.forEach((sheet, index) => worksheets.file(`sheet${index + 1}.xml`, this.worksheetXml(sheet.rows)));
+    return zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+  }
+
+  private contentTypesXml(sheetCount: number) {
+    const sheets = Array.from({ length: sheetCount }, (_, index) =>
+      `<Override PartName="/xl/worksheets/sheet${index + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`,
+    ).join('');
+    return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+${sheets}
+</Types>`;
+  }
+
+  private rootRelsXml() {
+    return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>`;
+  }
+
+  private workbookXml(sheets: XlsxSheet[]) {
+    const sheetItems = sheets
+      .map((sheet, index) => `<sheet name="${this.xmlAttr(sheet.name)}" sheetId="${index + 1}" r:id="rId${index + 1}"/>`)
+      .join('');
+    return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<sheets>${sheetItems}</sheets>
+</workbook>`;
+  }
+
+  private workbookRelsXml(sheetCount: number) {
+    const rels = Array.from({ length: sheetCount }, (_, index) =>
+      `<Relationship Id="rId${index + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${index + 1}.xml"/>`,
+    ).join('');
+    return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${rels}</Relationships>`;
+  }
+
+  private worksheetXml(rows: XlsxValue[][]) {
+    const rowXml = rows
+      .map((row, rowIndex) => {
+        const cells = row
+          .map((value, colIndex) => this.cellXml(value, `${this.columnName(colIndex + 1)}${rowIndex + 1}`))
+          .join('');
+        return `<row r="${rowIndex + 1}">${cells}</row>`;
+      })
+      .join('');
+    return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${rowXml}</sheetData></worksheet>`;
+  }
+
+  private cellXml(value: XlsxValue, ref: string) {
+    if (typeof value === 'number' && Number.isFinite(value)) return `<c r="${ref}"><v>${value}</v></c>`;
+    return `<c r="${ref}" t="inlineStr"><is><t>${this.xmlText(String(value ?? ''))}</t></is></c>`;
+  }
+
+  private columnName(index: number) {
+    let name = '';
+    let current = index;
+    while (current > 0) {
+      const remainder = (current - 1) % 26;
+      name = String.fromCharCode(65 + remainder) + name;
+      current = Math.floor((current - 1) / 26);
+    }
+    return name;
+  }
+
+  private xmlText(value: string) {
+    return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  private xmlAttr(value: string) {
+    return this.xmlText(value).replace(/"/g, '&quot;');
+  }
   private async computeDataContract(filters: ReportFilters, contract: DataContractConfig, role: UserRole) {
     const groupBy = contract.groupBy ?? 'manager';
     const groups = new Map<string, { id: string; name: string }>();
@@ -119,7 +198,7 @@ export class ReportsService {
       string,
       Map<string, { count: number; values: number[]; dealIds: Set<string>; value: number | null; unit: string }>
     >();
-    groups.set('all', { id: 'all', name: 'Отдел' });
+    groups.set('all', { id: 'all', name: 'РћС‚РґРµР»' });
 
     for (const metric of contract.metrics ?? []) {
       const byGroup = new Map<string, { count: number; values: number[]; dealIds: Set<string>; value: number | null; unit: string }>();
@@ -134,7 +213,7 @@ export class ReportsService {
 
       for (const deal of deals) {
         const groupId = groupBy === 'manager' ? deal.responsibleId ?? 'unassigned' : 'all';
-        const groupName = groupBy === 'manager' ? deal.responsible?.name ?? 'Без менеджера' : 'Отдел';
+        const groupName = groupBy === 'manager' ? deal.responsible?.name ?? 'Р‘РµР· РјРµРЅРµРґР¶РµСЂР°' : 'РћС‚РґРµР»';
         groups.set(groupId, { id: groupId, name: groupName });
         this.addDealToContractBucket(byGroup.get('all')!, deal, metric);
         if (groupId !== 'all') {
@@ -357,7 +436,7 @@ export class ReportsService {
         if (endAt <= entry.movedAt) continue;
         const days = (endAt.getTime() - entry.movedAt.getTime()) / 86_400_000;
         const groupId = entry.deal.responsibleId ?? 'unassigned';
-        const groupName = entry.deal.responsible?.name ?? 'Без менеджера';
+        const groupName = entry.deal.responsible?.name ?? 'Р‘РµР· РјРµРЅРµРґР¶РµСЂР°';
         groups.set(groupId, { id: groupId, name: groupName });
         byGroupValues.get('all')!.push(days);
         if (!byGroupValues.has(groupId)) byGroupValues.set(groupId, []);
@@ -385,17 +464,17 @@ export class ReportsService {
 
   private flattenContractRows(rows: any[], contract: DataContractConfig) {
     return rows.map((row) => {
-      const flat: Record<string, unknown> = { Срез: row.groupName };
+      const flat: Record<string, unknown> = { РЎСЂРµР·: row.groupName };
       for (const metric of contract.metrics ?? []) {
         const value = row.metrics?.[metric.id];
         flat[metric.label] = value?.value ?? null;
-        flat[`${metric.label}: сделок`] = value?.dealCount ?? 0;
+        flat[`${metric.label}: СЃРґРµР»РѕРє`] = value?.dealCount ?? 0;
       }
       for (const conversion of contract.conversions ?? []) {
         flat[`${conversion.label}: %`] = row.conversions?.[conversion.id]?.conversion ?? null;
       }
       for (const duration of contract.durations ?? []) {
-        flat[`${duration.label}: дней`] = row.durations?.[duration.id]?.avgDays ?? null;
+        flat[`${duration.label}: РґРЅРµР№`] = row.durations?.[duration.id]?.avgDays ?? null;
       }
       return flat;
     });

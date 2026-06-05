@@ -13,7 +13,7 @@
 - PostgreSQL не должен быть доступен из интернета.
 - В `docker/docker-compose.yml` PostgreSQL публикуется только на `127.0.0.1`.
 - Backend выполняет исходящие HTTPS-запросы к amoCRM API и OAuth endpoints.
-- Frontend обращается только к собственному API из `NEXT_PUBLIC_API_URL`.
+- Frontend обращается только к собственному API из `VITE_API_URL`.
 
 ## Секреты
 
@@ -121,4 +121,4 @@ npm audit --omit=dev
 - Это прототип для ограниченного пилота, не промышленная SaaS-поставка.
 - Перед внешней публикацией Web/API нужен отдельный security-аудит.
 - Для промышленного запуска нужны централизованные backup/restore, мониторинг, управление доступами и регламент ротации секретов.
-- `npm audit --omit=dev` показывает 4 moderate уязвимости в транзитивных зависимостях `next -> postcss` и `exceljs -> uuid`. Автоматический `npm audit fix --force` предлагает breaking downgrade (`next@9.3.3`, `exceljs@3.4.0`), поэтому до безопасного upstream-релиза риск принимается только для закрытого внутреннего контура. Для промышленного запуска нужно повторно проверить обновления `next` и `exceljs` или заменить Excel export на безопасный CSV/server-side writer.
+- `npm audit --omit=dev` должен показывать `found 0 vulnerabilities`.

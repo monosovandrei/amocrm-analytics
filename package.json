@@ -19,6 +19,7 @@
   },
   "dependencies": {
     "@prisma/client": "^5.22.0",
+    "jszip": "^3.10.1",
     "prisma": "^5.22.0"
   },
   "devDependencies": {
