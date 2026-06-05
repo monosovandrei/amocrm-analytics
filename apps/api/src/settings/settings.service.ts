@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+﻿import { Injectable } from '@nestjs/common';
 import { Prisma } from '../generated/prisma';
 import { PrismaService } from '../prisma/prisma.service';
 import { UpdateForecastSettingsDto } from './dto/update-forecast-settings.dto';
@@ -108,12 +108,19 @@ export class SettingsService {
   async saveDashboardLayout(userId: string, config: Record<string, unknown>) {
     const existing = await this.prisma.dashboardLayout.findFirst({ where: { userId, isDefault: true } });
     if (existing) {
-      return this.prisma.dashboardLayout.update({
+      const layout = await this.prisma.dashboardLayout.update({
         where: { id: existing.id },
         data: { config: config as Prisma.InputJsonValue },
       });
+      await this.audit.record({
+        userId,
+        action: 'settings.dashboard_layout.update',
+        entity: 'DashboardLayout',
+        entityId: layout.id,
+      });
+      return layout;
     }
-    return this.prisma.dashboardLayout.create({
+    const layout = await this.prisma.dashboardLayout.create({
       data: {
         userId,
         name: 'Рабочий стол РОПа',
@@ -121,8 +128,14 @@ export class SettingsService {
         config: config as Prisma.InputJsonValue,
       },
     });
+    await this.audit.record({
+      userId,
+      action: 'settings.dashboard_layout.create',
+      entity: 'DashboardLayout',
+      entityId: layout.id,
+    });
+    return layout;
   }
-
   private async ensureForecastSettings() {
     const existing = await this.prisma.forecastSettings.findFirst();
     if (existing) return existing;

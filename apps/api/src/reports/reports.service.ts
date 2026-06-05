@@ -2,6 +2,7 @@
 import { Injectable } from '@nestjs/common';
 import { ReportSourceType, UserRole } from '../generated/prisma';
 import { endOfMonth, median, startOfMonth } from '../common/date.util';
+import { AuditService } from '../audit/audit.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { ReportQueryDto, SaveReportTemplateDto } from './dto/report-query.dto';
 import {
@@ -18,7 +19,10 @@ type XlsxSheet = { name: string; rows: XlsxValue[][] };
 
 @Injectable()
 export class ReportsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly audit: AuditService,
+  ) {}
 
   async compute(dto: ReportQueryDto, user: { id: string; role: UserRole }) {
     const filters = dto.filters as ReportFilters;
@@ -49,13 +53,35 @@ export class ReportsService {
       position: Number(dto.config?.order ?? 0),
     };
     if (dto.id) {
-      return this.prisma.reportTemplate.update({ where: { id: dto.id }, data });
+      const template = await this.prisma.reportTemplate.update({ where: { id: dto.id }, data });
+      await this.audit.record({
+        userId,
+        action: 'reports.template.update',
+        entity: 'ReportTemplate',
+        entityId: template.id,
+        metadata: { name: template.name, sourceType: template.sourceType },
+      });
+      return template;
     }
-    return this.prisma.reportTemplate.create({ data });
+    const template = await this.prisma.reportTemplate.create({ data });
+    await this.audit.record({
+      userId,
+      action: 'reports.template.create',
+      entity: 'ReportTemplate',
+      entityId: template.id,
+      metadata: { name: template.name, sourceType: template.sourceType },
+    });
+    return template;
   }
 
-  async deleteTemplate(id: string) {
+  async deleteTemplate(id: string, userId?: string) {
     await this.prisma.reportTemplate.delete({ where: { id } });
+    await this.audit.record({
+      userId,
+      action: 'reports.template.delete',
+      entity: 'ReportTemplate',
+      entityId: id,
+    });
     return { ok: true };
   }
 

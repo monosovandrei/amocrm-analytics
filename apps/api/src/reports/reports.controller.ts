@@ -25,8 +25,8 @@ export class ReportsController {
   }
 
   @Delete('templates/:id')
-  deleteTemplate(@Param('id') id: string) {
-    return this.reports.deleteTemplate(id);
+  deleteTemplate(@Param('id') id: string, @Request() req: any) {
+    return this.reports.deleteTemplate(id, req.user.id);
   }
 
   @Post('export.xlsx')

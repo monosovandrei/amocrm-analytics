@@ -10,6 +10,13 @@ type AuditInput = {
   metadata?: Record<string, unknown>;
 };
 
+type AuditListQuery = {
+  limit?: number;
+  action?: string;
+  entity?: string;
+  userId?: string;
+};
+
 @Injectable()
 export class AuditService {
   private readonly logger = new Logger(AuditService.name);
@@ -30,5 +37,23 @@ export class AuditService {
     } catch (error: any) {
       this.logger.warn(`Audit log write failed: ${error.message}`);
     }
+  }
+
+  async list(query: AuditListQuery) {
+    const take = Math.min(Math.max(Number(query.limit ?? 100) || 100, 1), 500);
+    return this.prisma.auditLog.findMany({
+      where: {
+        action: query.action,
+        entity: query.entity,
+        userId: query.userId,
+      },
+      orderBy: { createdAt: 'desc' },
+      take,
+      include: {
+        user: {
+          select: { id: true, email: true, name: true, role: true },
+        },
+      },
+    });
   }
 }

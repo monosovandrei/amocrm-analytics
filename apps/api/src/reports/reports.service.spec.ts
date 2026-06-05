@@ -93,9 +93,11 @@ const history = [
 
 describe('ReportsService data contract', () => {
   let service: ReportsService;
+  let audit: { record: jest.Mock };
 
   beforeEach(() => {
-    service = new ReportsService(createPrismaMock() as any);
+    audit = { record: jest.fn().mockResolvedValue(undefined) };
+    service = new ReportsService(createPrismaMock() as any, audit as any);
   });
 
   it('computes count, stage transitions, field conditions, sums, conversion and durations in one contract', async () => {
@@ -226,10 +228,66 @@ describe('ReportsService data contract', () => {
     expect(managerRow.metrics.currentKp.value).toBe(2);
     expect(managerRow.metrics.sourceAd.value).toBe(1);
   });
+
+  it('writes audit entries when report templates are changed', async () => {
+    const saved = await service.saveTemplate(
+      {
+        name: 'Pipeline report',
+        sourceType: 'CURRENT',
+        filters: {},
+        config: { metric: 'count', order: 1 },
+      } as any,
+      'user-1',
+    );
+
+    await service.deleteTemplate(saved.id, 'user-1');
+
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: 'user-1',
+        action: 'reports.template.create',
+        entity: 'ReportTemplate',
+        entityId: saved.id,
+      }),
+    );
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: 'user-1',
+        action: 'reports.template.delete',
+        entity: 'ReportTemplate',
+        entityId: saved.id,
+      }),
+    );
+  });
 });
 
 function createPrismaMock() {
+  const templates: any[] = [];
   return {
+    reportTemplate: {
+      create: jest.fn(({ data }: any) => {
+        const template = {
+          id: `template-${templates.length + 1}`,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          ...data,
+        };
+        templates.push(template);
+        return Promise.resolve(template);
+      }),
+      update: jest.fn(({ where, data }: any) => {
+        const index = templates.findIndex((template) => template.id === where.id);
+        const template = { ...templates[index], ...data };
+        templates[index] = template;
+        return Promise.resolve(template);
+      }),
+      delete: jest.fn(({ where }: any) => {
+        const index = templates.findIndex((template) => template.id === where.id);
+        const [template] = templates.splice(index, 1);
+        return Promise.resolve(template);
+      }),
+      findMany: jest.fn(() => Promise.resolve(templates)),
+    },
     deal: {
       findMany: jest.fn(({ where, include, orderBy, take }: any = {}) => {
         const rows = deals
