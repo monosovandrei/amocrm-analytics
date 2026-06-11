@@ -7,3 +7,4 @@ apps/web/.next/
 apps/api/src/generated/prisma/
 *.tsbuildinfo
 *.log
+.codex-run/
