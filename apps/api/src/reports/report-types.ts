@@ -32,7 +32,15 @@ export interface ConversionStep {
 export interface DataContractMetric {
   id: string;
   label: string;
-  type: 'created_deals' | 'stage_reached' | 'current_stage' | 'field_condition' | 'conversion';
+  type:
+    | 'created_deals'
+    | 'stage_reached'
+    | 'current_stage'
+    | 'field_condition'
+    | 'field_changed'
+    | 'conversion'
+    | 'formula'
+    | 'task_count';
   measure?: 'deal_count' | 'field_sum' | 'field_avg';
   display?: 'number' | 'money' | 'percent';
   pipelineId?: string;
@@ -46,6 +54,51 @@ export interface DataContractMetric {
   toMetricId?: string;
   amountFieldId?: string;
   marginFieldId?: string;
+  formula?: string;
+  extraFilters?: DataContractFilter[];
+  createdWithinAmount?: number;
+  createdWithinUnit?: 'hours' | 'days' | 'weeks' | 'months';
+  lastNoteOlderThanAmount?: number;
+  lastNoteOlderThanUnit?: 'hours' | 'days' | 'weeks' | 'months';
+}
+
+export interface DataContractFilter {
+  id?: string;
+  subject:
+    | 'deal_created_at'
+    | 'deal_updated_at'
+    | 'deal_closed_at'
+    | 'deal_expected_close_at'
+    | 'deal_amount'
+    | 'deal_stage'
+    | 'deal_responsible'
+    | 'deal_group'
+    | 'deal_field'
+    | 'last_note_created_at'
+    | 'last_note_text'
+    | 'task_created_at'
+    | 'task_updated_at'
+    | 'task_due_at'
+    | 'task_completed_at'
+    | 'task_type'
+    | 'task_status'
+    | 'task_text'
+    | 'task_responsible'
+    | 'task_group';
+  fieldId?: string;
+  operator:
+    | 'equals'
+    | 'contains'
+    | 'is_set'
+    | 'lt'
+    | 'lte'
+    | 'gt'
+    | 'gte'
+    | 'within_last'
+    | 'older_than';
+  value?: unknown;
+  amount?: number;
+  unit?: 'hours' | 'days' | 'weeks' | 'months';
 }
 
 export interface DataContractConversion {
@@ -59,24 +112,48 @@ export interface DataContractDuration {
   id: string;
   label: string;
   stageId: string;
+  onlyExited?: boolean;
+  startMode?: 'stage_entry' | 'sales_responsible_task';
 }
 
 export interface DataContractConfig {
-  groupBy?: 'manager' | 'none';
+  entity?: 'deal' | 'task';
+  groupBy?: 'manager' | 'group' | 'none';
   metrics?: DataContractMetric[];
   conversions?: DataContractConversion[];
   durations?: DataContractDuration[];
+  includeRowTotal?: boolean;
+  rowTotalMode?: 'sum' | 'avg';
+  includeSummaryRow?: boolean;
+  summaryRowMode?: 'sum' | 'avg';
 }
 
 export interface ReportConfig {
-  metric?: 'count' | 'total_amount' | 'avg_amount' | 'conversion' | 'forecast' | 'contract';
+  filters?: ReportFilters;
+  metric?:
+    | 'count'
+    | 'total_amount'
+    | 'avg_amount'
+    | 'conversion'
+    | 'forecast'
+    | 'contract'
+    | 'deal_cycle'
+    | 'deal_stage_age'
+    | 'revenue_profit_forecast';
   denominator?: 'previous' | 'first';
   steps?: ConversionStep[];
   contract?: DataContractConfig;
   breakdownBy?: 'department' | 'manager' | 'group';
-  display?: 'kpi' | 'funnel' | 'table' | 'forecast';
+  display?: 'kpi' | 'funnel' | 'table' | 'forecast' | 'cycle';
   pinned?: boolean;
   size?: 'sm' | 'md' | 'lg';
   order?: number;
+  dashboardSection?: 'sales' | 'csm' | 'forecast';
+  lockPipelineFilter?: boolean;
+  lockTeamFilter?: boolean;
+  builtinKey?: string;
   builder?: Record<string, unknown>;
+  description?: string;
+  visibleUserIds?: string[];
+  conditionLabel?: string;
 }

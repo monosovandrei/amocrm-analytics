@@ -13,6 +13,12 @@ enum UserRole {
   ROP
 }
 
+enum PlatformBusinessRole {
+  OWNER
+  ROP
+  MANAGER
+}
+
 enum AmoConnectionStatus {
   ACTIVE
   INACTIVE
@@ -37,9 +43,13 @@ enum CrmEntityType {
   LEAD
   CONTACT
   COMPANY
+  CUSTOMER
   TASK
   NOTE
   EVENT
+  CATALOG
+  CATALOG_ELEMENT
+  SOURCE
 }
 
 enum ReportSourceType {
@@ -65,19 +75,79 @@ enum ExportJobStatus {
   ERROR
 }
 
+enum NotificationChannel {
+  TELEGRAM
+}
+
+enum DeliveryStatus {
+  QUEUED
+  SENT
+  ERROR
+  SKIPPED
+}
+
+enum AlertOperator {
+  GT
+  GTE
+  LT
+  LTE
+  EQ
+  NEQ
+}
+
+enum PlanPeriodType {
+  DAY
+  WEEK
+  MONTH
+  QUARTER
+  YEAR
+  CUSTOM
+}
+
+enum PlanTargetType {
+  COMPANY
+  GROUP
+  MANAGER
+}
+
+enum QualitySeverity {
+  INFO
+  WARNING
+  CRITICAL
+}
+
+enum ReportScheduleFrequency {
+  DAILY
+  WEEKLY
+  MONTHLY
+  CUSTOM_CRON
+}
+
 model User {
   id           String   @id @default(uuid())
   email        String   @unique
   passwordHash String
   name         String
   role         UserRole @default(ROP)
+  businessRole PlatformBusinessRole @default(MANAGER)
+  crmUserId    String?  @unique
   isActive     Boolean  @default(true)
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
+  crmUser          CrmUser? @relation(fields: [crmUserId], references: [id], onDelete: SetNull)
   dashboardLayouts DashboardLayout[]
   reportTemplates  ReportTemplate[]
   auditLogs        AuditLog[]
+  telegramAccount  TelegramAccount?
+  telegramChats    TelegramChat[]
+  telegramLinkCodes TelegramLinkCode[]
+  alertRules       AlertRule[]
+  notificationDeliveries NotificationDelivery[]
+  planSets         PlanSet[] @relation("PlanSetCreator")
+  reportSchedules  ReportSchedule[]
+
+  @@index([businessRole, isActive])
 }
 
 model AmoConnection {
@@ -88,7 +158,7 @@ model AmoConnection {
   credentials         String
   webhookSecret       String              @unique
   status              AmoConnectionStatus @default(INACTIVE)
-  syncIntervalMinutes Int                 @default(15)
+  syncIntervalMinutes Int                 @default(10)
   lastFullSyncAt      DateTime?
   lastIncrementalSyncAt DateTime?
   lastError           String?
@@ -98,6 +168,15 @@ model AmoConnection {
 
   syncJobs      SyncJob[]
   webhookEvents WebhookEvent[]
+}
+
+model AmoAccountSnapshot {
+  id         String   @id @default(uuid())
+  externalId String? @unique
+  name       String?
+  subdomain  String?
+  raw        Json     @default("{}")
+  updatedAt  DateTime @updatedAt
 }
 
 model SyncJob {
@@ -146,6 +225,14 @@ model CrmGroup {
   users CrmUser[]
 }
 
+model CrmRole {
+  id         String   @id @default(uuid())
+  externalId String  @unique
+  name       String
+  raw        Json     @default("{}")
+  updatedAt  DateTime @updatedAt
+}
+
 model CrmUser {
   id         String   @id @default(uuid())
   externalId String  @unique
@@ -157,6 +244,9 @@ model CrmUser {
   raw        Json    @default("{}")
 
   group CrmGroup? @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  platformUser User?
+  telegramAccount TelegramAccount?
+  telegramLinkCodes TelegramLinkCode[]
   deals Deal[]    @relation("ResponsibleDeals")
   tasks Task[]
 
@@ -212,6 +302,34 @@ model CustomFieldDefinition {
   @@unique([entityType, externalId])
 }
 
+model CrmTag {
+  id         String        @id @default(uuid())
+  externalId String
+  entityType CrmEntityType
+  name       String
+  color      String?
+  raw        Json          @default("{}")
+  updatedAt  DateTime      @updatedAt
+
+  @@unique([entityType, externalId])
+  @@index([entityType, name])
+}
+
+model EntityLink {
+  id                   String        @id @default(uuid())
+  entityType           CrmEntityType
+  entityExternalId     String
+  linkedEntityType     String
+  linkedEntityExternalId String
+  metadata             Json          @default("{}")
+  raw                  Json          @default("{}")
+  updatedAt            DateTime      @updatedAt
+
+  @@unique([entityType, entityExternalId, linkedEntityType, linkedEntityExternalId])
+  @@index([entityType, entityExternalId])
+  @@index([linkedEntityType, linkedEntityExternalId])
+}
+
 model Contact {
   id         String   @id @default(uuid())
   externalId String  @unique
@@ -234,6 +352,62 @@ model CrmCompany {
   raw        Json     @default("{}")
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
+}
+
+model CustomerStatus {
+  id         String   @id @default(uuid())
+  externalId String  @unique
+  name       String
+  sort       Int      @default(0)
+  color      String?
+  raw        Json     @default("{}")
+  updatedAt  DateTime @updatedAt
+
+  customers Customer[]
+}
+
+model CustomerSegment {
+  id         String   @id @default(uuid())
+  externalId String  @unique
+  name       String
+  raw        Json     @default("{}")
+  updatedAt  DateTime @updatedAt
+}
+
+model Customer {
+  id           String   @id @default(uuid())
+  externalId   String   @unique
+  statusId     String?
+  name         String
+  nextPrice    Decimal  @default(0)
+  periodicity  Int?
+  responsibleId String?
+  customFields Json     @default("{}")
+  raw          Json     @default("{}")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  status       CustomerStatus? @relation(fields: [statusId], references: [id], onDelete: SetNull)
+  transactions CustomerTransaction[]
+
+  @@index([statusId])
+  @@index([responsibleId])
+}
+
+model CustomerTransaction {
+  id         String   @id @default(uuid())
+  externalId String  @unique
+  customerId String?
+  amount     Decimal  @default(0)
+  comment    String?
+  raw        Json     @default("{}")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  customer Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+
+  @@index([customerId])
+  @@index([createdAt])
 }
 
 model LossReason {
@@ -378,6 +552,50 @@ model DealProduct {
   @@index([dealId])
 }
 
+model Catalog {
+  id              String   @id @default(uuid())
+  externalId      String   @unique
+  name            String
+  type            String?
+  sort            Int      @default(0)
+  canAddElements  Boolean  @default(false)
+  canShowInCards  Boolean  @default(false)
+  canLinkMultiple Boolean  @default(false)
+  raw             Json     @default("{}")
+  updatedAt       DateTime @updatedAt
+
+  elements CatalogElement[]
+}
+
+model CatalogElement {
+  id           String   @id @default(uuid())
+  catalogId    String
+  externalId   String
+  name         String
+  customFields Json     @default("{}")
+  raw          Json     @default("{}")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  catalog Catalog @relation(fields: [catalogId], references: [id], onDelete: Cascade)
+
+  @@unique([catalogId, externalId])
+  @@index([catalogId])
+}
+
+model CrmSource {
+  id         String   @id @default(uuid())
+  externalId String  @unique
+  name       String
+  pipelineId String?
+  originCode String?
+  isDefault  Boolean  @default(false)
+  raw        Json     @default("{}")
+  updatedAt  DateTime @updatedAt
+
+  @@index([pipelineId])
+}
+
 model ReportTemplate {
   id          String           @id @default(uuid())
   userId      String?
@@ -390,6 +608,8 @@ model ReportTemplate {
   updatedAt   DateTime         @updatedAt
 
   user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+  alertRules AlertRule[]
+  reportSchedules ReportSchedule[]
 }
 
 model DashboardLayout {
@@ -435,6 +655,295 @@ model ExportJob {
   error     String?
   createdAt DateTime        @default(now())
   finishedAt DateTime?
+}
+
+model TelegramAccount {
+  id        String   @id @default(uuid())
+  userId    String?  @unique
+  crmUserId String?  @unique
+  chatId    String   @unique
+  username  String?
+  firstName String?
+  lastName  String?
+  isActive  Boolean  @default(true)
+  linkedAt  DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User? @relation(fields: [userId], references: [id], onDelete: Cascade)
+  crmUser CrmUser? @relation(fields: [crmUserId], references: [id], onDelete: Cascade)
+  deliveries NotificationDelivery[]
+}
+
+model TelegramChat {
+  id        String   @id @default(uuid())
+  userId    String
+  chatId    String   @unique
+  type      String   @default("group")
+  title     String?
+  username  String?
+  isActive  Boolean  @default(true)
+  linkedAt  DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deliveries NotificationDelivery[]
+
+  @@index([userId, isActive])
+}
+
+model TelegramLinkCode {
+  id        String   @id @default(uuid())
+  userId    String?
+  crmUserId String?
+  code      String   @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: Cascade)
+  crmUser CrmUser? @relation(fields: [crmUserId], references: [id], onDelete: Cascade)
+
+  @@index([code, expiresAt])
+  @@index([userId, createdAt])
+  @@index([crmUserId, createdAt])
+}
+
+model AlertRule {
+  id                String        @id @default(uuid())
+  userId            String?
+  reportTemplateId  String?
+  name              String
+  description       String?
+  enabled           Boolean       @default(true)
+  metricKey         String?
+  operator          AlertOperator @default(GTE)
+  threshold         Decimal?
+  condition         Json          @default("{}")
+  recipients        Json          @default("[]")
+  checkEveryMinutes Int           @default(15)
+  cooldownMinutes   Int           @default(60)
+  lastCheckedAt     DateTime?
+  lastTriggeredAt   DateTime?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  user           User?           @relation(fields: [userId], references: [id], onDelete: SetNull)
+  reportTemplate ReportTemplate? @relation(fields: [reportTemplateId], references: [id], onDelete: SetNull)
+  events         AlertEvent[]
+
+  @@index([enabled, lastCheckedAt])
+  @@index([userId])
+  @@index([reportTemplateId])
+}
+
+model AlertEvent {
+  id          String         @id @default(uuid())
+  alertRuleId String
+  status      DeliveryStatus @default(QUEUED)
+  value       Decimal?
+  message     String
+  payload     Json           @default("{}")
+  createdAt   DateTime       @default(now())
+  sentAt      DateTime?
+
+  alertRule  AlertRule @relation(fields: [alertRuleId], references: [id], onDelete: Cascade)
+  deliveries NotificationDelivery[]
+
+  @@index([alertRuleId, createdAt])
+  @@index([status, createdAt])
+}
+
+model NotificationDelivery {
+  id                String              @id @default(uuid())
+  eventKey          String?             @unique
+  userId            String?
+  telegramAccountId String?
+  telegramChatId    String?
+  alertEventId      String?
+  channel           NotificationChannel @default(TELEGRAM)
+  status            DeliveryStatus      @default(QUEUED)
+  message           String
+  payload           Json                @default("{}")
+  error             String?
+  sentAt            DateTime?
+  createdAt         DateTime            @default(now())
+
+  user            User?            @relation(fields: [userId], references: [id], onDelete: SetNull)
+  telegramAccount TelegramAccount? @relation(fields: [telegramAccountId], references: [id], onDelete: SetNull)
+  telegramChat    TelegramChat?    @relation(fields: [telegramChatId], references: [id], onDelete: SetNull)
+  alertEvent      AlertEvent?      @relation(fields: [alertEventId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([status, createdAt])
+  @@index([telegramAccountId])
+  @@index([telegramChatId])
+}
+
+model NotificationTemplate {
+  id        String   @id @default(uuid())
+  eventType String   @unique
+  name      String
+  body      String
+  recipients Json    @default("[]")
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model PlanSet {
+  id          String   @id @default(uuid())
+  name        String
+  year        Int?
+  isActive    Boolean  @default(true)
+  version     Int      @default(1)
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  createdBy User? @relation("PlanSetCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  items     PlanItem[]
+  imports   PlanImport[]
+
+  @@index([isActive, year])
+  @@index([createdById])
+}
+
+model PlanItem {
+  id          String         @id @default(uuid())
+  planSetId   String
+  periodType  PlanPeriodType
+  periodStart DateTime
+  periodEnd   DateTime
+  targetType  PlanTargetType
+  targetId    String?
+  targetName  String?
+  metricKey   String
+  metricName  String
+  value       Decimal
+  unit        String         @default("number")
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  planSet PlanSet @relation(fields: [planSetId], references: [id], onDelete: Cascade)
+
+  @@index([planSetId, periodStart, periodEnd])
+  @@index([targetType, targetId])
+  @@index([metricKey])
+}
+
+model PlanImport {
+  id           String   @id @default(uuid())
+  planSetId    String?
+  fileName     String
+  status       String   @default("uploaded")
+  rowsTotal    Int      @default(0)
+  rowsAccepted Int      @default(0)
+  errors       Json     @default("[]")
+  createdAt    DateTime @default(now())
+
+  planSet PlanSet? @relation(fields: [planSetId], references: [id], onDelete: SetNull)
+
+  @@index([planSetId, createdAt])
+}
+
+model QualityRule {
+  id          String          @id @default(uuid())
+  code        String          @unique
+  name        String
+  description String?
+  severity    QualitySeverity @default(WARNING)
+  enabled     Boolean         @default(true)
+  config      Json            @default("{}")
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  snapshots  QualitySnapshot[]
+  violations QualityViolation[]
+
+  @@index([enabled, severity])
+}
+
+model QualitySnapshot {
+  id              String   @id @default(uuid())
+  ruleId          String?
+  managerId       String?
+  managerName     String?
+  groupId         String?
+  groupName       String?
+  score           Decimal?
+  violationsCount Int      @default(0)
+  payload         Json     @default("{}")
+  createdAt       DateTime @default(now())
+
+  rule QualityRule? @relation(fields: [ruleId], references: [id], onDelete: SetNull)
+
+  @@index([ruleId, createdAt])
+  @@index([managerId, createdAt])
+  @@index([groupId, createdAt])
+}
+
+model QualityViolation {
+  id          String          @id @default(uuid())
+  ruleId      String
+  managerId   String?
+  managerName String?
+  groupId     String?
+  groupName   String?
+  dealId      String?
+  taskId      String?
+  severity    QualitySeverity
+  message     String
+  payload     Json            @default("{}")
+  detectedAt  DateTime        @default(now())
+  resolvedAt  DateTime?
+
+  rule QualityRule @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+
+  @@index([ruleId, detectedAt])
+  @@index([managerId, detectedAt])
+  @@index([resolvedAt])
+}
+
+model ReportSchedule {
+  id               String                  @id @default(uuid())
+  userId           String
+  reportTemplateId String?
+  name             String
+  enabled          Boolean                 @default(true)
+  frequency        ReportScheduleFrequency @default(DAILY)
+  cron             String?
+  timeOfDay        String                  @default("09:00")
+  timezone         String                  @default("Europe/Moscow")
+  recipients       Json                    @default("[]")
+  format           String                  @default("telegram")
+  nextRunAt        DateTime?
+  lastRunAt        DateTime?
+  createdAt        DateTime                @default(now())
+  updatedAt        DateTime                @updatedAt
+
+  user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  reportTemplate ReportTemplate? @relation(fields: [reportTemplateId], references: [id], onDelete: SetNull)
+  logs           ReportDeliveryLog[]
+
+  @@index([enabled, nextRunAt])
+  @@index([userId])
+  @@index([reportTemplateId])
+}
+
+model ReportDeliveryLog {
+  id         String         @id @default(uuid())
+  scheduleId String
+  status     DeliveryStatus @default(QUEUED)
+  message    String?
+  payload    Json           @default("{}")
+  error      String?
+  sentAt     DateTime?
+  createdAt  DateTime       @default(now())
+
+  schedule ReportSchedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+
+  @@index([scheduleId, createdAt])
+  @@index([status, createdAt])
 }
 
 model AuditLog {

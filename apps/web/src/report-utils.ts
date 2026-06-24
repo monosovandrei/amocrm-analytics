@@ -18,8 +18,7 @@ export function buildReportPayload(
 ) {
   const existing = activeReportId ? templates.find((item) => item.id === activeReportId) : null;
   const filters: ReportFilters = {
-    dateFrom: workspaceFilters.dateFrom,
-    dateTo: workspaceFilters.dateTo,
+    ...resolveReportPeriod(workspaceFilters),
     pipelineIds: draft.pipelineId ? [draft.pipelineId] : workspaceFilters.pipelineIds ?? [],
     managerIds: workspaceFilters.managerIds ?? [],
     groupIds: workspaceFilters.groupIds ?? [],
@@ -28,10 +27,11 @@ export function buildReportPayload(
   if (draft.mode === 'contract') {
     const order = Number(existing?.config.order ?? templates.length + 1);
     const contract: DataContractConfig = {
+      entity: draft.entity,
       groupBy: draft.contractGroupBy,
       metrics: draft.contractMetrics.map((metric) => ({
         ...metric,
-        measure: metric.type === 'conversion' ? undefined : metric.measure,
+        measure: metric.type === 'conversion' || metric.type === 'task_count' ? undefined : metric.measure,
         display: metric.type === 'conversion' ? 'percent' : metric.display,
         pipelineId: metric.pipelineId || undefined,
         fromStageId: metric.fromStageId || undefined,
@@ -41,9 +41,32 @@ export function buildReportPayload(
         valueFieldId: metric.measure === 'deal_count' ? undefined : metric.valueFieldId || undefined,
         fromMetricId: metric.type === 'conversion' ? metric.fromMetricId : undefined,
         toMetricId: metric.type === 'conversion' ? metric.toMetricId : undefined,
+        formula: metric.type === 'formula' ? metric.formula : undefined,
+        extraFilters: metric.extraFilters
+          .filter((filter) => {
+            if (filter.subject === 'deal_field') return Boolean(filter.fieldId);
+            if (filter.operator === 'within_last' || filter.operator === 'older_than') return filter.amount > 0;
+            if (filter.operator === 'is_set') return true;
+            return filter.value.trim().length > 0;
+          })
+          .map((filter) => ({
+            id: filter.id,
+            subject: filter.subject,
+            fieldId: filter.subject === 'deal_field' ? filter.fieldId : undefined,
+            operator: filter.operator,
+            value: filter.operator === 'within_last' || filter.operator === 'older_than' || filter.operator === 'is_set'
+              ? undefined
+              : filter.value,
+            amount: filter.operator === 'within_last' || filter.operator === 'older_than' ? filter.amount : undefined,
+            unit: filter.operator === 'within_last' || filter.operator === 'older_than' ? filter.unit : undefined,
+          })),
       })),
       conversions: draft.contractConversions.filter((conversion) => conversion.fromMetricId && conversion.toMetricId),
       durations: draft.contractDurations.filter((duration) => duration.stageId),
+      includeRowTotal: draft.includeRowTotal,
+      rowTotalMode: draft.rowTotalMode,
+      includeSummaryRow: draft.includeSummaryRow,
+      summaryRowMode: draft.summaryRowMode,
     };
 
     const config: ReportConfig = {
@@ -52,10 +75,10 @@ export function buildReportPayload(
       display: 'table',
       contract,
       pinned: draft.pinned,
-      size: draft.size,
       order,
       builder: draft,
       description: draft.description,
+      visibleUserIds: draft.visibleUserIds,
       conditionLabel: buildConditionLabel(draft, options),
     };
 
@@ -130,6 +153,7 @@ export function buildReportPayload(
     order,
     builder: draft,
     description: draft.description,
+    visibleUserIds: draft.visibleUserIds,
     conditionLabel: buildConditionLabel(draft, options),
   };
 
@@ -142,15 +166,72 @@ export function buildReportPayload(
   };
 }
 
+function resolveReportPeriod(filters: ReportFilters): ReportFilters {
+  if (filters.periodMode === 'relative') {
+    const amount = Math.max(1, Number(filters.relativeAmount ?? 7));
+    const unit = filters.relativeUnit ?? 'days';
+    const to = new Date();
+    const from = new Date(to);
+    if (unit === 'hours') from.setHours(from.getHours() - amount);
+    if (unit === 'days') from.setDate(from.getDate() - amount);
+    if (unit === 'weeks') from.setDate(from.getDate() - amount * 7);
+    if (unit === 'months') from.setMonth(from.getMonth() - amount);
+    return { ...filters, dateFrom: from.toISOString(), dateTo: to.toISOString() };
+  }
+
+  if (filters.periodMode === 'preset' && filters.periodPreset) {
+    const { from, to } = presetPeriod(filters.periodPreset);
+    return { ...filters, dateFrom: from.toISOString(), dateTo: to.toISOString() };
+  }
+
+  return filters;
+}
+
+function presetPeriod(preset: NonNullable<ReportFilters['periodPreset']>) {
+  const now = new Date();
+  const startOfDay = (date: Date) => new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  const endOfDay = (date: Date) => new Date(date.getFullYear(), date.getMonth(), date.getDate(), 23, 59, 59, 999);
+  const day = now.getDay() || 7;
+
+  if (preset === 'today') return { from: startOfDay(now), to: endOfDay(now) };
+  if (preset === 'yesterday') {
+    const date = new Date(now);
+    date.setDate(date.getDate() - 1);
+    return { from: startOfDay(date), to: endOfDay(date) };
+  }
+  if (preset === 'this_week') {
+    const from = startOfDay(now);
+    from.setDate(from.getDate() - day + 1);
+    return { from, to: endOfDay(now) };
+  }
+  if (preset === 'last_week') {
+    const from = startOfDay(now);
+    from.setDate(from.getDate() - day - 6);
+    const to = endOfDay(from);
+    to.setDate(to.getDate() + 6);
+    return { from, to };
+  }
+  if (preset === 'last_month') {
+    const from = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const to = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59, 999);
+    return { from, to };
+  }
+  return {
+    from: new Date(now.getFullYear(), now.getMonth(), 1),
+    to: endOfDay(now),
+  };
+}
+
 export function buildQueryFromTemplate(template: ReportTemplate, workspaceFilters: ReportFilters) {
   const reportFilters = template.config.filters ?? {};
+  const resolvedWorkspaceFilters = resolveReportPeriod(workspaceFilters);
   const filters: ReportFilters = {
     ...reportFilters,
-    dateFrom: workspaceFilters.dateFrom ?? reportFilters.dateFrom,
-    dateTo: workspaceFilters.dateTo ?? reportFilters.dateTo,
-    pipelineIds: workspaceFilters.pipelineIds?.length ? workspaceFilters.pipelineIds : reportFilters.pipelineIds,
-    managerIds: workspaceFilters.managerIds?.length ? workspaceFilters.managerIds : reportFilters.managerIds,
-    groupIds: workspaceFilters.groupIds?.length ? workspaceFilters.groupIds : reportFilters.groupIds,
+    dateFrom: resolvedWorkspaceFilters.dateFrom ?? reportFilters.dateFrom,
+    dateTo: resolvedWorkspaceFilters.dateTo ?? reportFilters.dateTo,
+    pipelineIds: reportFilters.pipelineIds,
+    managerIds: reportFilters.managerIds,
+    groupIds: reportFilters.groupIds,
   };
   return {
     name: template.name,
@@ -175,6 +256,10 @@ export function validateDraft(draft: ReportDraft) {
         if (metric.fromMetricId === metric.toMetricId) errors.push(`Конверсия “${metric.label}” не может ссылаться на один и тот же показатель`);
         continue;
       }
+      if (metric.type === 'formula') {
+        if (!metric.formula.trim()) errors.push(`Укажите формулу для показателя “${metric.label}”`);
+        continue;
+      }
       if (metric.measure === 'deal_count' && metric.display !== 'number') {
         errors.push(`Показатель “${metric.label}” с количеством сделок может отображаться только числом`);
       }
@@ -189,6 +274,17 @@ export function validateDraft(draft: ReportDraft) {
       }
       if (metric.type === 'field_condition' && metric.fieldOperator !== 'is_set' && !metric.fieldValue.trim()) {
         errors.push(`Укажите значение поля для показателя “${metric.label}”`);
+      }
+      for (const filter of metric.extraFilters) {
+        if (filter.subject === 'deal_field' && !filter.fieldId) {
+          errors.push(`Выберите поле amoCRM в дополнительном условии показателя “${metric.label}”`);
+        }
+        if (filter.operator !== 'is_set' && filter.operator !== 'within_last' && filter.operator !== 'older_than' && !filter.value.trim()) {
+          errors.push(`Укажите значение в дополнительном условии показателя “${metric.label}”`);
+        }
+        if ((filter.operator === 'within_last' || filter.operator === 'older_than') && filter.amount <= 0) {
+          errors.push(`Укажите период в дополнительном условии показателя “${metric.label}”`);
+        }
       }
     }
     for (const conversion of draft.contractConversions) {
@@ -213,8 +309,7 @@ export function validateDraft(draft: ReportDraft) {
 
 export function buildConditionLabel(draft: ReportDraft, options: Options | null) {
   if (draft.mode === 'contract') {
-    const conversions = draft.contractMetrics.filter((metric) => metric.type === 'conversion').length;
-    return `${draft.contractMetrics.length} показателей, ${conversions} конверсий, ${draft.contractDurations.length} длительностей`;
+    return draft.description.trim() || 'Настраиваемый отчёт';
   }
   if (draft.operator === 'stage_reached') return `Сделка перешла в этап “${getStageName(options, draft.stageId) || 'этап'}”`;
   if (draft.operator === 'stage_changed') {
@@ -243,12 +338,56 @@ export function getMetric(template: Pick<ReportTemplate, 'name' | 'config'>, res
 
   if (result.type === 'contract') {
     const metrics = (result.metrics ?? []) as ContractMetricPayload[];
-    const metricsCount = metrics.length;
-    const conversionsCount = metrics.filter((metric) => metric.type === 'conversion').length;
-    const rowsCount = ((result.rows ?? []) as unknown[]).length;
+    const headlineMetric =
+      metrics.find((item) => item.id === 'weighted_total') ??
+      metrics.find((item) => String(item.label ?? '').toLowerCase().replace(/ё/g, 'е').trim() === 'итого взвешенно') ??
+      metrics[0];
+    const summaryMetric = headlineMetric
+      ? ((result.summaryRows?.[0]?.metrics ?? {}) as Record<string, any>)[headlineMetric.id]
+      : null;
+    const firstDuration = (result.durations ?? [])[0] as { id: string; label: string } | undefined;
+    if (!headlineMetric && firstDuration) {
+      const values = ((result.rows ?? []) as Array<Record<string, any>>)
+        .map((row) => Number((row.durations as Record<string, any> | undefined)?.[firstDuration.id]?.avgDays))
+        .filter((value) => Number.isFinite(value));
+      const avg = values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : null;
+      return {
+        value: avg == null ? 'нет данных' : formatDurationFromDays(Number(avg.toFixed(2))),
+        caption: firstDuration.label,
+      };
+    }
     return {
-      value: `${metricsCount}`,
-      caption: `показателей в контракте, ${conversionsCount} конверсий, ${rowsCount} срезов`,
+      value: summaryMetric ? formatMetricValue(summaryMetric.value, summaryMetric.unit) : 'нет данных',
+      caption: headlineMetric?.label ?? '',
+    };
+  }
+
+  if (result.type === 'dealCycle' || result.type === 'dealStageAge') {
+    const summary = result.summary ?? {};
+    const stageValues = ((summary.stages ?? []) as Array<{ avgDays?: number | null; sampleSize?: number }>)
+      .filter((stage) => stage.avgDays !== null && stage.avgDays !== undefined && Number(stage.sampleSize ?? 0) > 0);
+    const weightedStageAvg = stageValues.length
+      ? stageValues.reduce((sum, stage) => sum + Number(stage.avgDays) * Number(stage.sampleSize ?? 0), 0) /
+        stageValues.reduce((sum, stage) => sum + Number(stage.sampleSize ?? 0), 0)
+      : null;
+    if (result.type === 'dealStageAge') {
+      return {
+        value: weightedStageAvg == null ? 'нет данных' : formatDurationFromDays(weightedStageAvg),
+        caption: `Среднее нахождение в текущем этапе. Сделок в работе: ${formatNumber(summary.totalDeals ?? 0)}`,
+      };
+    }
+    const successAvg = summary.successCycle?.avgDays;
+    const lostAvg = summary.lostCycle?.avgDays;
+    const avg = successAvg ?? lostAvg ?? weightedStageAvg;
+    const caption =
+      successAvg != null
+        ? 'Средний цикл до успеха'
+        : lostAvg != null
+          ? 'Средний цикл до отказа'
+          : 'Среднее время прохождения этапа';
+    return {
+      value: avg == null ? 'нет данных' : formatDurationFromDays(avg),
+      caption: `${caption}. Сделок в срезе: ${formatNumber(summary.totalDeals ?? 0)}`,
     };
   }
 
@@ -257,6 +396,15 @@ export function getMetric(template: Pick<ReportTemplate, 'name' | 'config'>, res
     return {
       value: formatMoney(forecast.totalForecast),
       caption: `Закрыто: ${formatMoney(forecast.closedAmount)} / Взвешено: ${formatMoney(forecast.weightedAmount)}`,
+    };
+  }
+
+  if (result.type === 'revenueProfitForecast') {
+    const summary = result.summary ?? {};
+    const profitText = result.profit?.available ? ` / прибыль: ${formatMoney(summary.profit)}` : '';
+    return {
+      value: formatMoney(summary.revenue),
+      caption: `До конца месяца: ${formatNumber(summary.count ?? 0)} сделок${profitText}`,
     };
   }
 
@@ -284,7 +432,7 @@ export function formatMoney(value: unknown) {
   const number = Number(value ?? 0);
   return new Intl.NumberFormat('ru-RU', {
     style: 'currency',
-    currency: 'RUB',
+    currency: 'EUR',
     maximumFractionDigits: 0,
   }).format(number);
 }
@@ -310,10 +458,39 @@ export function formatDays(value: unknown) {
   return `${formatNumber(value)} дн.`;
 }
 
+export function formatDurationFromDays(value: unknown) {
+  if (value === null || value === undefined) return 'нет данных';
+  const days = Number(value);
+  if (!Number.isFinite(days)) return 'нет данных';
+
+  const totalMinutes = Math.round(days * 24 * 60);
+  if (totalMinutes < 60) return `${Math.max(totalMinutes, 1)} мин.`;
+
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  if (hours < 24) return minutes ? `${hours} ч ${minutes} мин.` : `${hours} ч`;
+
+  const wholeDays = Math.floor(hours / 24);
+  const restHours = hours % 24;
+  return restHours ? `${wholeDays} дн. ${restHours} ч` : `${wholeDays} дн.`;
+}
+
 export function formatDateTime(value: unknown) {
   if (!value) return '-';
   return new Intl.DateTimeFormat('ru-RU', {
     dateStyle: 'short',
     timeStyle: 'short',
+  }).format(new Date(String(value)));
+}
+
+export function formatMoscowDateTime(value: unknown) {
+  if (!value) return 'нет данных';
+  return new Intl.DateTimeFormat('ru-RU', {
+    timeZone: 'Europe/Moscow',
+    day: '2-digit',
+    month: '2-digit',
+    year: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
   }).format(new Date(String(value)));
 }

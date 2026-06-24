@@ -7,7 +7,7 @@ export class OAuthExchangeDto {
   subdomain!: string;
 
   @IsString()
-  @MaxLength(512)
+  @MaxLength(4096)
   code!: string;
 
   @IsUrl({ require_tld: false })

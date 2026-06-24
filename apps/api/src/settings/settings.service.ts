@@ -14,17 +14,68 @@ export class SettingsService {
   ) {}
 
   async getOptions() {
-    const [pipelines, managers, groups, customFields] = await Promise.all([
+    const [
+      pipelines,
+      managers,
+      groups,
+      customFields,
+      tags,
+      catalogs,
+      sources,
+      customerStatuses,
+      customerSegments,
+      roles,
+      appUsers,
+      taskTypeRows,
+    ] = await Promise.all([
       this.prisma.pipeline.findMany({
         orderBy: { name: 'asc' },
         include: { stages: { orderBy: { position: 'asc' } } },
       }),
-      this.prisma.crmUser.findMany({ orderBy: { name: 'asc' }, include: { group: true } }),
+      this.prisma.crmUser.findMany({
+        where: { isActive: true },
+        orderBy: { name: 'asc' },
+        include: { group: true },
+      }),
       this.prisma.crmGroup.findMany({ orderBy: { name: 'asc' } }),
       this.prisma.customFieldDefinition.findMany({ orderBy: [{ entityType: 'asc' }, { name: 'asc' }] }),
+      this.prisma.crmTag.findMany({ orderBy: [{ entityType: 'asc' }, { name: 'asc' }] }),
+      this.prisma.catalog.findMany({ orderBy: [{ type: 'asc' }, { name: 'asc' }] }),
+      this.prisma.crmSource.findMany({ orderBy: { name: 'asc' } }),
+      this.prisma.customerStatus.findMany({ orderBy: [{ sort: 'asc' }, { name: 'asc' }] }),
+      this.prisma.customerSegment.findMany({ orderBy: { name: 'asc' } }),
+      this.prisma.crmRole.findMany({ orderBy: { name: 'asc' } }),
+      this.prisma.user.findMany({
+        where: { isActive: true },
+        orderBy: { name: 'asc' },
+        select: { id: true, email: true, name: true, role: true, businessRole: true, crmUserId: true },
+      }),
+      this.prisma.task.findMany({
+        where: { typeId: { not: null } },
+        distinct: ['typeId'],
+        orderBy: { typeId: 'asc' },
+        select: { typeId: true, typeName: true },
+      }),
     ]);
+    const taskTypes = taskTypeRows.map((item) => ({
+      id: String(item.typeId),
+      name: item.typeName || `Тип ${item.typeId}`,
+    }));
 
-    return { pipelines, managers, groups, customFields };
+    return {
+      pipelines,
+      managers,
+      groups,
+      customFields,
+      tags,
+      catalogs,
+      sources,
+      customerStatuses,
+      customerSegments,
+      roles,
+      appUsers,
+      taskTypes,
+    };
   }
 
   async getForecastSettings() {

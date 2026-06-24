@@ -8,6 +8,7 @@ const stages = {
   kp: { id: 'stage-kp', name: 'КП отправлено', pipelineId: 'pipe-sales', isWon: false, isLost: false },
   invoice: { id: 'stage-invoice', name: 'Счет выставлен', pipelineId: 'pipe-sales', isWon: false, isLost: false },
   paid: { id: 'stage-paid', name: 'Оплата', pipelineId: 'pipe-sales', isWon: true, isLost: false },
+  lost: { id: 'stage-lost', name: 'Отказ', pipelineId: 'pipe-sales', isWon: false, isLost: true },
 };
 
 const managers = {
@@ -26,7 +27,7 @@ const deals = [
     responsible: managers.first,
     pipeline: { id: 'pipe-sales', name: 'Продажи' },
     stage: stages.paid,
-    customFields: { sla: { value: 15 }, margin: { value: 300 }, source: { value: 'Принят' } },
+    customFields: { sla: { value: 15 }, margin: { value: 300 }, source: { value: 'Принят' }, marketing: { value: 'Принято' } },
     createdAt: new Date('2026-01-02T10:00:00.000Z'),
     updatedAt: new Date('2026-01-08T10:00:00.000Z'),
     deletedAt: null,
@@ -41,7 +42,7 @@ const deals = [
     responsible: managers.first,
     pipeline: { id: 'pipe-sales', name: 'Продажи' },
     stage: stages.invoice,
-    customFields: { sla: { value: 30 }, margin: { value: 500 }, source: { value: 'Принят' } },
+    customFields: { sla: { value: 30 }, margin: { value: 500 }, source: { value: 'Принят' }, marketing: { value: 'Принято' } },
     createdAt: new Date('2026-01-03T10:00:00.000Z'),
     updatedAt: new Date('2026-01-09T10:00:00.000Z'),
     deletedAt: null,
@@ -56,7 +57,7 @@ const deals = [
     responsible: managers.second,
     pipeline: { id: 'pipe-sales', name: 'Продажи' },
     stage: stages.kp,
-    customFields: { sla: { value: 10 }, margin: { value: 1000 }, source: { value: 'Реклама' } },
+    customFields: { sla: { value: 10 }, margin: { value: 1000 }, source: { value: 'Реклама' }, marketing: { value: 'Не принято' } },
     createdAt: new Date('2026-01-04T10:00:00.000Z'),
     updatedAt: new Date('2026-01-12T10:00:00.000Z'),
     deletedAt: null,
@@ -71,14 +72,46 @@ const deals = [
     responsible: managers.second,
     pipeline: { id: 'pipe-sales', name: 'Продажи' },
     stage: stages.kp,
-    customFields: { sla: { value: 5 }, margin: { value: 2000 }, source: { value: 'Принят' } },
+    customFields: { sla: { value: 5 }, margin: { value: 2000 }, source: { value: 'Принят' }, marketing: { value: 'Принято' } },
     createdAt: new Date('2026-02-01T10:00:00.000Z'),
     updatedAt: new Date('2026-02-02T10:00:00.000Z'),
+    deletedAt: null,
+  },
+  {
+    id: 'deal-5',
+    title: 'Отказ',
+    amount: 5000,
+    pipelineId: 'pipe-sales',
+    stageId: stages.lost.id,
+    responsibleId: managers.second.id,
+    responsible: managers.second,
+    pipeline: { id: 'pipe-sales', name: 'Продажи' },
+    stage: stages.lost,
+    customFields: { sla: { value: 40 }, margin: { value: 1500 }, source: { value: 'Принят' } },
+    createdAt: new Date('2026-03-01T10:00:00.000Z'),
+    updatedAt: new Date('2026-03-05T10:00:00.000Z'),
+    closedAt: new Date('2026-03-05T10:00:00.000Z'),
+    deletedAt: null,
+  },
+  {
+    id: 'deal-6',
+    title: 'Создана до периода',
+    amount: 6000,
+    pipelineId: 'pipe-sales',
+    stageId: stages.kp.id,
+    responsibleId: managers.first.id,
+    responsible: managers.first,
+    pipeline: { id: 'pipe-sales', name: 'Продажи' },
+    stage: stages.kp,
+    customFields: { sla: { value: 20 }, margin: { value: 1200 }, source: { value: 'Принят' } },
+    createdAt: new Date('2026-02-28T10:00:00.000Z'),
+    updatedAt: new Date('2026-03-02T10:00:00.000Z'),
     deletedAt: null,
   },
 ];
 
 const history = [
+  { id: 'h0', dealId: 'deal-4', fromStageId: stages.lead.id, toStageId: stages.kp.id, movedAt: new Date('2025-12-20T10:00:00.000Z') },
   { id: 'h1', dealId: 'deal-1', fromStageId: stages.lead.id, toStageId: stages.qualified.id, movedAt: new Date('2026-01-05T10:00:00.000Z') },
   { id: 'h2', dealId: 'deal-1', fromStageId: stages.qualified.id, toStageId: stages.kp.id, movedAt: new Date('2026-01-06T10:00:00.000Z') },
   { id: 'h3', dealId: 'deal-1', fromStageId: stages.kp.id, toStageId: stages.invoice.id, movedAt: new Date('2026-01-07T10:00:00.000Z') },
@@ -89,6 +122,31 @@ const history = [
   { id: 'h8', dealId: 'deal-3', fromStageId: stages.lead.id, toStageId: stages.kp.id, movedAt: new Date('2026-01-10T10:00:00.000Z') },
   { id: 'h9', dealId: 'deal-3', fromStageId: stages.kp.id, toStageId: stages.invoice.id, movedAt: new Date('2026-01-12T10:00:00.000Z') },
   { id: 'h10', dealId: 'deal-4', fromStageId: stages.lead.id, toStageId: stages.kp.id, movedAt: new Date('2026-02-02T10:00:00.000Z') },
+  { id: 'h11', dealId: 'deal-5', fromStageId: stages.lead.id, toStageId: stages.qualified.id, movedAt: new Date('2026-03-02T10:00:00.000Z') },
+  { id: 'h12', dealId: 'deal-5', fromStageId: stages.qualified.id, toStageId: stages.kp.id, movedAt: new Date('2026-03-03T10:00:00.000Z') },
+  { id: 'h13', dealId: 'deal-5', fromStageId: stages.kp.id, toStageId: stages.lost.id, movedAt: new Date('2026-03-05T10:00:00.000Z') },
+  { id: 'h14', dealId: 'deal-6', fromStageId: stages.lead.id, toStageId: stages.qualified.id, movedAt: new Date('2026-02-28T10:00:00.000Z') },
+  { id: 'h15', dealId: 'deal-6', fromStageId: stages.qualified.id, toStageId: stages.kp.id, movedAt: new Date('2026-03-02T10:00:00.000Z') },
+];
+
+const responsibleHistory = [
+  {
+    id: 'rh1',
+    dealId: 'deal-5',
+    fromUserId: null,
+    toUserId: managers.second.id,
+    changedAt: new Date('2026-03-02T18:00:00.000Z'),
+  },
+];
+
+const tasks = [
+  {
+    id: 'task-1',
+    dealId: 'deal-5',
+    responsibleId: managers.second.id,
+    createdAt: new Date('2026-03-03T09:00:00.000Z'),
+    raw: { created_at: Date.parse('2026-03-02T22:00:00.000Z') / 1000 },
+  },
 ];
 
 describe('ReportsService data contract', () => {
@@ -183,6 +241,42 @@ describe('ReportsService data contract', () => {
     expect(row.durations.kpDuration).toMatchObject({ avgDays: 1.5, sampleSize: 2 });
   });
 
+  it('counts received leads by creation date and current Marketing = accepted field', async () => {
+    const result = await service.compute(
+      {
+        sourceType: 'CURRENT' as any,
+        filters: { dateFrom: '2026-01-01T00:00:00.000Z', dateTo: '2026-01-31T23:59:59.999Z', pipelineIds: ['pipe-sales'] },
+        config: {
+          metric: 'contract',
+          contract: {
+            groupBy: 'none',
+            metrics: [
+              {
+                id: 'leads_received',
+                label: 'Лиды получены',
+                type: 'created_deals',
+                measure: 'deal_count',
+                display: 'number',
+                extraFilters: [
+                  {
+                    subject: 'deal_field',
+                    fieldId: 'marketing',
+                    operator: 'equals',
+                    value: 'Принято',
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      } as any,
+      { id: 'user-1', role: 'ADMIN' as any },
+    );
+
+    const row = (result as any).rows.find((item: any) => item.groupId === 'all');
+    expect(row.metrics.leads_received).toMatchObject({ value: 2, unit: 'number', dealCount: 2 });
+  });
+
   it('filters current stage and CRM field conditions by selected manager', async () => {
     const result = await service.compute(
       {
@@ -240,7 +334,7 @@ describe('ReportsService data contract', () => {
       'user-1',
     );
 
-    await service.deleteTemplate(saved.id, 'user-1');
+    await service.deleteTemplate(saved.id, { id: 'user-1', role: 'ADMIN' as any });
 
     expect(audit.record).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -259,11 +353,115 @@ describe('ReportsService data contract', () => {
       }),
     );
   });
+
+  it('counts only the first-ever transition into a selected stage', async () => {
+    const result = await service.compute(
+      {
+        sourceType: 'EVENT' as any,
+        filters: { dateFrom: '2026-02-01T00:00:00.000Z', dateTo: '2026-02-28T23:59:59.999Z' },
+        config: {
+          metric: 'contract',
+          contract: {
+            groupBy: 'none',
+            metrics: [
+              {
+                id: 'kp',
+                label: 'КП',
+                type: 'stage_reached',
+                stageIds: [stages.kp.id],
+                measure: 'deal_count',
+                display: 'number',
+              },
+            ],
+          },
+        },
+      } as any,
+      { id: 'user-1', role: 'ADMIN' as any },
+    );
+
+    const row = (result as any).rows.find((item: any) => item.groupId === 'all');
+    expect(row.metrics.kp).toMatchObject({ value: 0, dealCount: 0 });
+  });
+
+  it('computes deal cycle durations from stage entry to stage exit', async () => {
+    const result = await service.compute(
+      {
+        sourceType: 'EVENT' as any,
+        filters: {
+          dateFrom: '2026-03-01T00:00:00.000Z',
+          dateTo: '2026-03-31T23:59:59.999Z',
+          pipelineIds: ['pipe-sales'],
+          groupIds: ['group-1'],
+        },
+        config: { metric: 'deal_cycle' },
+      } as any,
+      { id: 'user-1', role: 'ADMIN' as any },
+    );
+
+    const row = (result as any).rows.find((item: any) => item.managerId === managers.second.id);
+    const previousPeriodCreatedRow = (result as any).rows.find((item: any) => item.managerId === managers.first.id);
+    const qualified = row.stages.find((stage: any) => stage.stageId === stages.qualified.id);
+    const kp = row.stages.find((stage: any) => stage.stageId === stages.kp.id);
+    const qualifiedFromPreviousPeriodDeal = previousPeriodCreatedRow.stages.find((stage: any) => stage.stageId === stages.qualified.id);
+
+    expect(result).toMatchObject({ type: 'dealCycle' });
+    expect(qualified).toMatchObject({ avgDays: 1, sampleSize: 1 });
+    expect(kp).toMatchObject({ avgDays: 2, sampleSize: 1 });
+    expect(qualifiedFromPreviousPeriodDeal).toMatchObject({ avgDays: 2, sampleSize: 1 });
+    expect(previousPeriodCreatedRow.totalDeals).toBe(1);
+    expect(row.lostCycle).toMatchObject({ avgDays: 4, sampleSize: 1 });
+    expect((result as any).summary.lostCycle).toMatchObject({ avgDays: 4, sampleSize: 1 });
+  });
+
+  it('computes assigned-stage speed from sales responsibility and manager task to stage exit', async () => {
+    const result = await service.compute(
+      {
+        sourceType: 'EVENT' as any,
+        filters: {
+          dateFrom: '2026-03-01T00:00:00.000Z',
+          dateTo: '2026-03-31T23:59:59.999Z',
+          pipelineIds: ['pipe-sales'],
+          groupIds: ['group-1'],
+        },
+        config: {
+          metric: 'contract',
+          contract: {
+            groupBy: 'manager',
+            metrics: [],
+            durations: [
+              {
+                id: 'assigned_stage_speed',
+                label: 'Среднее время до взятия',
+                stageId: stages.qualified.id,
+                onlyExited: true,
+                startMode: 'sales_responsible_task',
+              },
+            ],
+          },
+        },
+      } as any,
+      { id: 'user-1', role: 'ADMIN' as any },
+    );
+
+    const row = (result as any).rows.find((item: any) => item.groupId === managers.second.id);
+    const emptyRow = (result as any).rows.find((item: any) => item.groupId === managers.first.id);
+
+    expect(row.durations.assigned_stage_speed).toMatchObject({ avgDays: 0.5, sampleSize: 1 });
+    expect(emptyRow.durations.assigned_stage_speed).toMatchObject({ avgDays: null, sampleSize: 0 });
+  });
 });
 
 function createPrismaMock() {
   const templates: any[] = [];
   return {
+    $transaction: jest.fn(function (this: any, callback: any) {
+      return callback(this);
+    }),
+    $executeRawUnsafe: jest.fn(() => Promise.resolve(undefined)),
+    $queryRaw: jest.fn(() => Promise.resolve([])),
+    amoConnection: {
+      findFirst: jest.fn(() => Promise.resolve(null)),
+    },
     reportTemplate: {
       create: jest.fn(({ data }: any) => {
         const template = {
@@ -286,10 +484,11 @@ function createPrismaMock() {
         const [template] = templates.splice(index, 1);
         return Promise.resolve(template);
       }),
+      findUnique: jest.fn(({ where }: any) => Promise.resolve(templates.find((template) => template.id === where.id) ?? null)),
       findMany: jest.fn(() => Promise.resolve(templates)),
     },
     deal: {
-      findMany: jest.fn(({ where, include, orderBy, take }: any = {}) => {
+      findMany: jest.fn(({ where, select, include, orderBy, take }: any = {}) => {
         const rows = deals
           .filter((deal) => matchesDealWhere(deal, where ?? {}))
           .sort((a, b) => {
@@ -298,9 +497,10 @@ function createPrismaMock() {
           })
           .slice(0, take ?? deals.length);
 
-        return Promise.resolve(
-          rows.map((deal) => (include ? deal : { id: deal.id, amount: deal.amount })),
-        );
+        return Promise.resolve(rows.map((deal) => {
+          if (select) return selectShape(deal, select);
+          return include ? deal : { id: deal.id, amount: deal.amount };
+        }));
       }),
     },
     dealStageHistory: {
@@ -326,10 +526,47 @@ function createPrismaMock() {
         );
       }),
     },
+    dealResponsibleHistory: {
+      findMany: jest.fn(({ where, select, orderBy }: any = {}) => {
+        let rows = responsibleHistory.filter((entry) => matchesResponsibleHistoryWhere(entry, where ?? {}));
+        if (orderBy) rows = [...rows].sort((a, b) => a.dealId.localeCompare(b.dealId) || a.changedAt.getTime() - b.changedAt.getTime());
+        return Promise.resolve(rows.map((entry) => (select ? selectShape(entry, select) : entry)));
+      }),
+    },
+    task: {
+      findMany: jest.fn(({ where, select, orderBy }: any = {}) => {
+        let rows = tasks.filter((task) => matchesTaskWhere(task, where ?? {}));
+        if (orderBy) rows = [...rows].sort((a, b) => a.dealId.localeCompare(b.dealId) || a.createdAt.getTime() - b.createdAt.getTime());
+        return Promise.resolve(rows.map((task) => (select ? selectShape(task, select) : task)));
+      }),
+    },
+    pipelineStage: {
+      findMany: jest.fn(({ where, select }: any = {}) => {
+        const rows = Object.values(stages).filter((stage) => matchesStageWhere(stage, where ?? {}));
+        return Promise.resolve(rows.map((stage) => (select ? selectShape(stage, select) : stage)));
+      }),
+    },
     crmUser: {
-      findMany: jest.fn(() => Promise.resolve(Object.values(managers).map((manager) => ({ id: manager.id })))),
+      findMany: jest.fn(() => Promise.resolve(Object.values(managers).map((manager) => ({ id: manager.id, name: manager.name })))),
     },
   };
+}
+
+function matchesResponsibleHistoryWhere(entry: (typeof responsibleHistory)[number], where: Where) {
+  if (where.dealId && !matchesValue(entry.dealId, where.dealId)) return false;
+  return true;
+}
+
+function matchesTaskWhere(task: (typeof tasks)[number], where: Where) {
+  if (where.dealId && !matchesValue(task.dealId, where.dealId)) return false;
+  if (where.responsibleId && !matchesValue(task.responsibleId, where.responsibleId)) return false;
+  return true;
+}
+
+function matchesStageWhere(stage: (typeof stages)[keyof typeof stages], where: Where) {
+  if (where.pipelineId && !matchesValue(stage.pipelineId, where.pipelineId)) return false;
+  if (where.isVisible !== undefined && 'isVisible' in stage && stage.isVisible !== where.isVisible) return false;
+  return true;
 }
 
 function matchesHistoryWhere(entry: (typeof history)[number], where: Where) {
@@ -369,4 +606,17 @@ function matchesDate(value: Date, range: { gte?: Date; lte?: Date }) {
 
 function pick<T extends Record<string, any>>(source: T, keys: string[]) {
   return Object.fromEntries(keys.map((key) => [key, source[key]]));
+}
+
+function selectShape(source: Record<string, any>, select: Record<string, any>): Record<string, any> {
+  return Object.fromEntries(
+    Object.entries(select).map(([key, value]) => {
+      if (value === true) return [key, source[key]];
+      if (value && typeof value === 'object' && 'select' in value) {
+        const nested = source[key];
+        return [key, nested ? selectShape(nested, (value as any).select) : nested];
+      }
+      return [key, source[key]];
+    }),
+  );
 }

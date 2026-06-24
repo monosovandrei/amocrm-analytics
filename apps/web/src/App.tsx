@@ -1,7 +1,14 @@
-﻿'use client';
+'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import type { FormEvent, ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type {
+  Dispatch,
+  FormEvent,
+  MouseEvent as ReactMouseEvent,
+  PointerEvent as ReactPointerEvent,
+  ReactNode,
+  SetStateAction,
+} from 'react';
 import {
   Activity,
   AlertCircle,
@@ -9,7 +16,10 @@ import {
   ArrowUp,
   BarChart3,
   CalendarDays,
+  ChevronDown,
+  ChevronRight,
   CheckCircle2,
+  Clock3,
   Database,
   Download,
   Eye,
@@ -30,12 +40,15 @@ import {
   Trash2,
   Users,
 } from 'lucide-react';
-import { api, downloadExcel } from '@/lib/api';
+import { api, downloadExcel, downloadFile } from '@/lib/api';
 import type {
   BuilderOperator,
   ContractConversionDraft,
   ContractDisplay,
   ContractDurationDraft,
+  ContractFilterDraft,
+  ContractFilterOperator,
+  ContractFilterSubject,
   ContractMeasure,
   ContractMetricDraft,
   ContractMetricPayload,
@@ -53,12 +66,22 @@ import type {
   Manager,
   MetricType,
   Options,
+  AlertRule,
+  PlanFactRow,
+  PlanSet,
+  PeriodMode,
+  PeriodPreset,
+  PlatformBusinessRole,
   Pipeline,
   PipelineStage,
+  PlatformOverview,
+  QualityRule,
+  QualityViolation,
+  RelativeUnit,
   ReportConfig,
   ReportDraft,
   ReportFilters,
-  ReportMode,
+  ReportSchedule,
   ReportTemplate,
   SourceType,
   Tab,
@@ -72,8 +95,10 @@ import {
   buildReportPayload,
   formatDateTime,
   formatDays,
+  formatDurationFromDays,
   formatMetricValue,
   formatMoney,
+  formatMoscowDateTime,
   formatNumber,
   formatPercent,
   getFieldName,
@@ -82,11 +107,12 @@ import {
   validateDraft,
 } from './report-utils';
 
-const navItems: Array<{ id: Tab; label: string; icon: ReactNode }> = [
-  { id: 'workspace', label: 'Рабочий стол', icon: <LayoutDashboard size={17} /> },
-  { id: 'builder', label: 'Конструктор', icon: <SlidersHorizontal size={17} /> },
-  { id: 'integration', label: 'amoCRM', icon: <PlugZap size={17} /> },
-  { id: 'settings', label: 'Настройки', icon: <Settings size={17} /> },
+type AppTab = Tab | 'leadSla';
+
+const navItems: Array<{ id: AppTab; label: string; icon: ReactNode }> = [
+  { id: 'workspace', label: 'Отчёты', icon: <LayoutDashboard size={17} /> },
+  { id: 'leadSla', label: 'SLA лидов', icon: <Clock3 size={17} /> },
+  { id: 'platform', label: 'Telegram', icon: <Activity size={17} /> },
 ];
 
 const operatorLabels: Record<BuilderOperator, string> = {
@@ -105,7 +131,10 @@ const metricLabels: Record<MetricType, string> = {
   avg_amount: 'Средний чек',
   conversion: 'Конверсия',
   forecast: 'Прогноз',
+  revenue_profit_forecast: 'Прогноз выручки',
   contract: 'Контракт данных',
+  deal_cycle: 'Цикл сделки',
+  deal_stage_age: 'Текущие этапы',
 };
 
 const displayLabels: Record<DisplayType, string> = {
@@ -113,6 +142,7 @@ const displayLabels: Record<DisplayType, string> = {
   funnel: 'Воронка',
   table: 'Таблица',
   forecast: 'Прогноз',
+  cycle: 'Циклы сделки',
 };
 
 const sizeLabels: Record<WidgetSize, string> = {
@@ -121,9 +151,185 @@ const sizeLabels: Record<WidgetSize, string> = {
   lg: '4 колонки',
 };
 
+type LeadSlaCard = {
+  dealId: string;
+  dealExternalId: string;
+  title: string;
+  amount: number;
+  managerName: string;
+  groupName: string;
+  pipelineName: string;
+  stageName: string;
+  createdAt: string;
+  startAt: string;
+  dueAt: string;
+  elapsedSeconds: number;
+  remainingSeconds: number;
+  progressPercent: number;
+  status: 'waiting' | 'active' | 'warning' | 'overdue';
+  statusLabel: string;
+  dealUrl: string;
+};
+
+type LeadSlaResponse = {
+  now: string;
+  timezone: string;
+  slaMinutes: number;
+  workTime: string;
+  warning?: string;
+  summary: {
+    total: number;
+    waiting: number;
+    active: number;
+    warning: number;
+    overdue: number;
+  };
+  cards: LeadSlaCard[];
+};
+
+type LinkedCrmUser = {
+  id: string;
+  externalId: string;
+  name: string;
+  email?: string | null;
+  group?: { id: string; name: string } | null;
+};
+
+type TelegramAccountSummary = {
+  id: string;
+  username?: string | null;
+  firstName?: string | null;
+  lastName?: string | null;
+  isActive: boolean;
+  linkedAt: string;
+};
+
+type PlatformUserLink = User & {
+  businessRole: PlatformBusinessRole;
+  crmUserId?: string | null;
+  crmUser?: (LinkedCrmUser & { isActive?: boolean }) | null;
+  telegramAccount?: TelegramAccountSummary | null;
+};
+
+type UserLinksResponse = {
+  users: PlatformUserLink[];
+  crmUsers: LinkedCrmUser[];
+};
+
+type CrmTelegramLink = LinkedCrmUser & {
+  isActive: boolean;
+  telegramAccount?: TelegramAccountSummary | null;
+  activeCode?: {
+    id: string;
+    code: string;
+    expiresAt: string;
+    createdAt: string;
+  } | null;
+};
+
+type CrmTelegramLinksResponse = {
+  crmUsers: CrmTelegramLink[];
+};
+
+type TelegramTemplateRecipient = {
+  kind: 'platform_user' | 'crm_user';
+  id: string;
+};
+
+type TelegramRecipientMode = 'default' | 'custom';
+
+type TelegramTemplate = {
+  eventType: string;
+  name: string;
+  body: string;
+  recipients?: TelegramTemplateRecipient[];
+  recipientsMode?: TelegramRecipientMode;
+};
+
+type UserLinkDraft = {
+  businessRole: PlatformBusinessRole;
+  crmUserId: string;
+};
+
+const periodPresetLabels: Record<PeriodPreset, string> = {
+  today: 'За сегодня',
+  yesterday: 'За вчера',
+  this_week: 'За эту неделю',
+  last_week: 'Прошлая неделя',
+  this_month: 'За этот месяц',
+  last_month: 'Прошлый месяц',
+};
+
+const workspacePeriodPresets: PeriodPreset[] = ['today', 'yesterday', 'this_week', 'this_month'];
+
+const relativeUnitLabels: Record<RelativeUnit, string> = {
+  hours: 'часов',
+  days: 'дней',
+  weeks: 'недель',
+  months: 'месяцев',
+};
+
+const filterSubjectLabels: Record<ContractFilterSubject, string> = {
+  deal_created_at: 'Дата создания сделки',
+  deal_updated_at: 'Дата изменения сделки',
+  deal_closed_at: 'Дата закрытия сделки',
+  deal_expected_close_at: 'Ожидаемая дата закрытия',
+  deal_amount: 'Бюджет сделки',
+  deal_stage: 'Текущий этап',
+  deal_responsible: 'Ответственный',
+  deal_group: 'Группа ответственного',
+  deal_field: 'Поле сделки amoCRM',
+  last_note_created_at: 'Дата последнего примечания',
+  last_note_text: 'Текст последнего примечания',
+  task_created_at: 'Дата создания задачи',
+  task_updated_at: 'Дата изменения задачи',
+  task_due_at: 'Срок задачи',
+  task_completed_at: 'Дата выполнения задачи',
+  task_type: 'Тип задачи',
+  task_status: 'Статус задачи',
+  task_text: 'Текст задачи',
+  task_responsible: 'Ответственный',
+  task_group: 'Группа ответственного',
+};
+
+const filterOperatorLabels: Record<ContractFilterOperator, string> = {
+  equals: 'равно',
+  contains: 'содержит',
+  is_set: 'заполнено',
+  lt: '<',
+  lte: '<=',
+  gt: '>',
+  gte: '>=',
+  within_last: 'за последние',
+  older_than: 'старше чем',
+};
+
+const taskStatusLabels: Record<string, string> = {
+  planned_today: 'Запланирована на сегодня',
+  overdue: 'Просрочена',
+  completed: 'Выполнена',
+  planned_future: 'Запланирована на будущее',
+  no_due: 'Без срока',
+};
+
+function isWideMetric(metric?: MetricType) {
+  return metric === 'contract' || metric === 'deal_cycle' || metric === 'deal_stage_age' || metric === 'revenue_profit_forecast';
+}
+
+function defaultDisplayForMetric(metric?: MetricType): DisplayType {
+  if (metric === 'forecast' || metric === 'revenue_profit_forecast') return 'forecast';
+  if (metric === 'deal_cycle' || metric === 'deal_stage_age') return 'cycle';
+  if (metric === 'contract') return 'table';
+  return 'kpi';
+}
+
 function getInitialFilters(): ReportFilters {
   const now = new Date();
   return {
+    periodMode: 'preset',
+    periodPreset: 'this_month',
+    relativeAmount: 7,
+    relativeUnit: 'days',
     dateFrom: toDateInput(new Date(now.getFullYear(), now.getMonth(), 1)),
     dateTo: toDateInput(now),
     pipelineIds: [],
@@ -135,6 +341,38 @@ function getInitialFilters(): ReportFilters {
 function toDateInput(date: Date) {
   const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
   return local.toISOString().slice(0, 10);
+}
+
+function dateInputValue(value?: string) {
+  if (!value) return '';
+  return value.slice(0, 10);
+}
+
+function presetDateInputs(preset: PeriodPreset) {
+  const now = new Date();
+  const startOfDay = (date: Date) => new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  const day = now.getDay() || 7;
+
+  if (preset === 'today') {
+    return { dateFrom: toDateInput(now), dateTo: toDateInput(now) };
+  }
+
+  if (preset === 'yesterday') {
+    const yesterday = new Date(now);
+    yesterday.setDate(yesterday.getDate() - 1);
+    return { dateFrom: toDateInput(yesterday), dateTo: toDateInput(yesterday) };
+  }
+
+  if (preset === 'this_week') {
+    const monday = startOfDay(now);
+    monday.setDate(monday.getDate() - day + 1);
+    return { dateFrom: toDateInput(monday), dateTo: toDateInput(now) };
+  }
+
+  return {
+    dateFrom: toDateInput(new Date(now.getFullYear(), now.getMonth(), 1)),
+    dateTo: toDateInput(now),
+  };
 }
 
 function makeId(prefix: string) {
@@ -157,7 +395,48 @@ function createContractMetric(label: string, type: ContractMetricType): Contract
     valueFieldId: '',
     fromMetricId: '',
     toMetricId: '',
+    formula: '',
+    extraFilters: [],
   };
+}
+
+function createContractFilter(): ContractFilterDraft {
+  return {
+    id: makeId('filter'),
+    subject: 'deal_field',
+    fieldId: '',
+    operator: 'equals',
+    value: '',
+    amount: 1,
+    unit: 'days',
+  };
+}
+
+function createTaskFilter(subject: ContractFilterSubject, value: string): ContractFilterDraft {
+  return {
+    id: makeId('filter'),
+    subject,
+    fieldId: '',
+    operator: 'equals',
+    value,
+    amount: 1,
+    unit: 'days',
+  };
+}
+
+function createTaskMetric(label: string, filters: ContractFilterDraft[] = []): ContractMetricDraft {
+  return {
+    ...createContractMetric(label, 'task_count'),
+    display: 'number',
+    extraFilters: filters,
+  };
+}
+
+function getDefaultTaskMetrics() {
+  return [
+    createTaskMetric('Задачи на сегодня', [createTaskFilter('task_status', 'planned_today')]),
+    createTaskMetric('Просроченные задачи', [createTaskFilter('task_status', 'overdue')]),
+  ];
 }
 
 function getDefaultContractMetrics() {
@@ -172,22 +451,22 @@ function getDefaultContractMetrics() {
   return [
     ...metrics,
     {
-      ...createContractMetric('Лид → квалификация', 'conversion'),
+      ...createContractMetric('Конверсия лид > квалификация', 'conversion'),
       fromMetricId: metrics[0]?.id ?? '',
       toMetricId: metrics[2]?.id ?? '',
     },
     {
-      ...createContractMetric('Квалификация → КП', 'conversion'),
+      ...createContractMetric('Конверсия квалификация > КП', 'conversion'),
       fromMetricId: metrics[2]?.id ?? '',
       toMetricId: metrics[3]?.id ?? '',
     },
     {
-      ...createContractMetric('КП → счёт', 'conversion'),
+      ...createContractMetric('Конверсия КП > счёт', 'conversion'),
       fromMetricId: metrics[3]?.id ?? '',
       toMetricId: metrics[4]?.id ?? '',
     },
     {
-      ...createContractMetric('Счёт → оплата', 'conversion'),
+      ...createContractMetric('Конверсия счёт > оплата', 'conversion'),
       fromMetricId: metrics[4]?.id ?? '',
       toMetricId: metrics[5]?.id ?? '',
     },
@@ -212,6 +491,11 @@ function getDefaultDraft(): ReportDraft {
     display: 'table',
     denominator: 'previous',
     contractGroupBy: 'manager',
+    visibleUserIds: [],
+    includeRowTotal: false,
+    rowTotalMode: 'sum',
+    includeSummaryRow: true,
+    summaryRowMode: 'sum',
     contractMetrics,
     contractConversions: [],
     contractDurations: [],
@@ -223,7 +507,7 @@ function getDefaultDraft(): ReportDraft {
 export default function HomePage() {
   const [user, setUser] = useState<User | null>(null);
   const [tokenLoaded, setTokenLoaded] = useState(false);
-  const [tab, setTab] = useState<Tab>('workspace');
+  const [tab, setTab] = useState<AppTab>('workspace');
   const [options, setOptions] = useState<Options | null>(null);
   const [connection, setConnection] = useState<Record<string, any> | null>(null);
   const [forecastSettings, setForecastSettings] = useState<ForecastSettings | null>(null);
@@ -234,6 +518,8 @@ export default function HomePage() {
   const [preview, setPreview] = useState<Record<string, any> | null>(null);
   const [message, setMessage] = useState('');
   const [refreshStamp, setRefreshStamp] = useState(0);
+  const [amoSyncState, setAmoSyncState] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
+  const lastAmoSyncSeenRef = useRef<string | null>(null);
 
   const loadData = useCallback(async () => {
     const [nextOptions, nextConnection, nextForecast, nextTemplates, nextLayout] = await Promise.all([
@@ -276,7 +562,70 @@ export default function HomePage() {
   }, [loadData]);
 
   const ordered = useMemo(() => orderTemplates(templates), [templates]);
-  const pinned = ordered.filter((item) => item.config.pinned);
+  const amoHasConnection = Boolean(connection?.subdomain);
+  const amoConnected = amoHasConnection && connection?.status !== 'INACTIVE';
+  const lastAmoSyncAt = connection?.lastIncrementalSyncAt ?? connection?.lastFullSyncAt;
+  const amoConnectionHealthy = amoConnected;
+  const amoStatusText = 'amoCRM подключена';
+
+  useEffect(() => {
+    if (!user) return;
+    const currentSyncAt = String(lastAmoSyncAt ?? '');
+    if (currentSyncAt) {
+      lastAmoSyncSeenRef.current = currentSyncAt;
+    }
+  }, [lastAmoSyncAt, user]);
+
+  useEffect(() => {
+    if (!user || !amoHasConnection) return;
+
+    let cancelled = false;
+    const pollConnection = async () => {
+      try {
+        const nextConnection = await api<Record<string, any> | null>('/amo/connection');
+        if (cancelled || !nextConnection) return;
+
+        setConnection(nextConnection);
+        const nextSyncAt = String(nextConnection.lastIncrementalSyncAt ?? nextConnection.lastFullSyncAt ?? '');
+        if (nextSyncAt && lastAmoSyncSeenRef.current && nextSyncAt !== lastAmoSyncSeenRef.current) {
+          lastAmoSyncSeenRef.current = nextSyncAt;
+          setRefreshStamp((value) => value + 1);
+        } else if (nextSyncAt) {
+          lastAmoSyncSeenRef.current = nextSyncAt;
+        }
+      } catch {
+        // Reports stay on the last loaded data if the status poll fails.
+      }
+    };
+
+    const timer = window.setInterval(() => void pollConnection(), 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [amoHasConnection, user]);
+
+  async function triggerAmoSync() {
+    if (!amoConnected) {
+      setMessage('amoCRM не подключена');
+      return;
+    }
+
+    setAmoSyncState('running');
+    try {
+      await api('/amo/sync', {
+        method: 'POST',
+        body: JSON.stringify({ type: 'INCREMENTAL' }),
+      });
+      await loadData();
+      setRefreshStamp((value) => value + 1);
+      setAmoSyncState('done');
+      setMessage('Синхронизация amoCRM запущена');
+    } catch (error) {
+      setAmoSyncState('error');
+      setMessage(error instanceof Error ? error.message : 'Синхронизация amoCRM не запущена');
+    }
+  }
 
   async function handleLogin(nextUser: User) {
     setUser(nextUser);
@@ -299,7 +648,10 @@ export default function HomePage() {
   }
 
   async function moveTemplate(id: string, direction: -1 | 1) {
-    const visible = orderTemplates(templates.filter((item) => item.config.pinned));
+    const source = templates.find((item) => item.id === id);
+    if (!source) return;
+    const section = dashboardSectionKey(source);
+    const visible = orderTemplates(templates.filter((item) => item.config.pinned && dashboardSectionKey(item) === section));
     const index = visible.findIndex((item) => item.id === id);
     const targetIndex = index + direction;
     if (index < 0 || targetIndex < 0 || targetIndex >= visible.length) return;
@@ -399,73 +751,74 @@ export default function HomePage() {
 
   return (
     <main className="app-shell">
-      <aside className="sidebar">
-        <div className="sidebar-brand">
-          <div className="sidebar-logo">
-            <BarChart3 size={20} />
-          </div>
-          <div>
-            <div className="text-base font-bold">amoCRM Analytics</div>
-            <div className="text-xs text-white/60">Рабочий стол РОПа</div>
-          </div>
-        </div>
-
-        <nav className="sidebar-nav">
-          {navItems.map((item) => (
-            <button
-              key={item.id}
-              className={`nav-item ${tab === item.id ? 'active' : ''}`}
-              onClick={() => setTab(item.id)}
-              type="button"
-            >
-              {item.icon}
-              <span>{item.label}</span>
-            </button>
-          ))}
-        </nav>
-
-        <div className="sidebar-profile">
-          <div className="flex items-center gap-3">
-            <div className="avatar">{user.name.slice(0, 1).toUpperCase()}</div>
-            <div className="min-w-0 flex-1">
-              <div className="truncate text-sm font-semibold">{user.name}</div>
-              <div className="truncate text-xs text-white/55">{user.role === 'ADMIN' ? 'Администратор' : 'РОП'}</div>
-            </div>
-            <button
-              className="icon-btn border-white/15 bg-white/10 text-white hover:bg-white/15 hover:text-white"
-              title="Выйти"
-              type="button"
-              onClick={() => {
-                localStorage.removeItem('accessToken');
-                setUser(null);
-              }}
-            >
-              <LogOut size={16} />
-            </button>
-          </div>
-        </div>
-      </aside>
-
       <section className="app-main">
         <header className="topbar">
-          <div>
-            <div className="text-xs font-semibold uppercase text-[var(--pb-text-muted)]">PulseBoard / amoCRM</div>
-            <div className="mt-1 text-sm text-[var(--pb-text-secondary)]">
-              {tab === 'workspace' && 'Рабочий стол'}
-              {tab === 'builder' && 'Конструктор отчётов'}
-              {tab === 'integration' && 'Интеграция amoCRM'}
-              {tab === 'settings' && 'Настройки проекта'}
+          <div className="topbar-main">
+            <div className="topbar-brand">
+              <div className="topbar-logo">
+                <BarChart3 size={20} />
+              </div>
+              <div>
+                <div className="text-base font-bold">amoCRM Analytics</div>
+                <div className="text-xs text-[var(--pb-text-secondary)]">Рабочий стол РОПа</div>
+              </div>
             </div>
+
+            <nav className="topbar-nav" aria-label="Основное меню">
+              {navItems.map((item) => (
+                <button
+                  key={item.id}
+                  className={`topbar-nav-item ${tab === item.id ? 'active' : ''}`}
+                  onClick={() => setTab(item.id)}
+                  type="button"
+                >
+                  {item.icon}
+                  <span>{item.label}</span>
+                </button>
+              ))}
+            </nav>
           </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <span className={`badge ${connection?.status === 'ACTIVE' ? 'badge-green' : 'badge-yellow'}`}>
-              {connection?.status === 'ACTIVE' ? <CheckCircle2 size={14} /> : <AlertCircle size={14} />}
-              {connection?.status === 'ACTIVE' ? 'amoCRM подключена' : 'Нужна интеграция'}
-            </span>
-            <button className="btn" type="button" onClick={() => setRefreshStamp((value) => value + 1)}>
-              <RefreshCw size={15} />
-              Обновить
-            </button>
+
+          <div className="topbar-actions">
+            <div className={`sync-panel ${amoConnectionHealthy ? 'sync-panel-ok' : 'sync-panel-warn'}`}>
+              {amoConnectionHealthy ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}
+              <div className="min-w-0">
+                <div className="sync-panel-title">{amoConnected ? amoStatusText : 'amoCRM не подключена'}</div>
+                <div className="sync-panel-meta">
+                  {amoConnected ? `Обновлено: ${formatMoscowDateTime(lastAmoSyncAt)} МСК` : 'Данные не обновляются'}
+                </div>
+              </div>
+            </div>
+            {amoSyncState === 'error' && <span className="badge badge-red">Ошибка синхронизации</span>}
+            <div className="topbar-buttons">
+              <button
+                className="btn btn-primary"
+                type="button"
+                disabled={!amoConnected || amoSyncState === 'running'}
+                onClick={() => void triggerAmoSync()}
+              >
+                <RefreshCw size={15} />
+                {amoSyncState === 'running' ? 'Синхронизация...' : 'Синхронизировать'}
+              </button>
+            </div>
+            <div className="topbar-user">
+                <div className="avatar">{user.name.slice(0, 1).toUpperCase()}</div>
+                <div className="topbar-user-text">
+                  <div className="truncate text-sm font-semibold">{user.name}</div>
+                <div className="truncate text-xs text-[var(--pb-text-muted)]">{businessRoleLabel(user.businessRole)}</div>
+                </div>
+              <button
+                className="icon-btn"
+                title="Выйти"
+                type="button"
+                onClick={() => {
+                  localStorage.removeItem('accessToken');
+                  setUser(null);
+                }}
+              >
+                <LogOut size={16} />
+              </button>
+            </div>
           </div>
         </header>
 
@@ -480,52 +833,23 @@ export default function HomePage() {
 
             {tab === 'workspace' && (
               <WorkspaceTab
+                amoDomain={connection?.subdomain ?? ''}
                 filters={filters}
                 options={options}
-                pinnedTemplates={pinned}
-                allTemplates={ordered}
+                reportTemplates={ordered}
                 refreshStamp={refreshStamp}
-                onCreateReport={startNewReport}
-                onEditReport={editReport}
-                onMoveTemplate={moveTemplate}
-                onSetFilters={setFilters}
-                onUpdateLayout={updateTemplateLayout}
-              />
-            )}
-
-            {tab === 'builder' && (
-              <BuilderTab
-                activeReportId={activeReportId}
-                draft={draft}
-                filters={filters}
-                options={options}
-                preview={preview}
-                templates={ordered}
-                onComputePreview={computePreview}
-                onDeleteReport={deleteReport}
-                onEditReport={editReport}
-                onNewReport={startNewReport}
-                onSaveReport={() => saveReport(false)}
-                onSaveAndPin={() => saveReport(true)}
-                onSetDraft={setDraft}
                 onSetFilters={setFilters}
               />
             )}
 
-            {tab === 'integration' && (
-              <IntegrationTab
-                connection={connection}
-                onMessage={setMessage}
-                onReload={loadData}
-              />
+            {tab === 'leadSla' && (
+              <LeadSlaTab />
             )}
 
-            {tab === 'settings' && (
-              <SettingsTab
-                forecastSettings={forecastSettings}
-                options={options}
+            {tab === 'platform' && (
+              <PlatformTab
+                user={user}
                 onMessage={setMessage}
-                onReload={loadData}
               />
             )}
           </div>
@@ -591,125 +915,179 @@ function LoginScreen({ onLogin }: { onLogin: (user: User) => void }) {
 }
 
 function WorkspaceTab({
-  allTemplates,
+  amoDomain,
   filters,
   options,
-  pinnedTemplates,
+  reportTemplates,
   refreshStamp,
-  onCreateReport,
-  onEditReport,
-  onMoveTemplate,
   onSetFilters,
-  onUpdateLayout,
 }: {
-  allTemplates: ReportTemplate[];
+  amoDomain: string;
   filters: ReportFilters;
   options: Options | null;
-  pinnedTemplates: ReportTemplate[];
+  reportTemplates: ReportTemplate[];
   refreshStamp: number;
-  onCreateReport: () => void;
-  onEditReport: (template: ReportTemplate) => void;
-  onMoveTemplate: (id: string, direction: -1 | 1) => void;
   onSetFilters: (filters: ReportFilters) => void;
-  onUpdateLayout: (id: string, patch: Partial<Pick<ReportConfig, 'pinned' | 'order' | 'size'>>) => void;
 }) {
-  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [sectionOpen, setSectionOpen] = useState<Record<'sales' | 'csm' | 'forecast', boolean>>({
+    sales: true,
+    csm: true,
+    forecast: true,
+  });
+  const salesTemplates = reportTemplates.filter((template) => dashboardSectionKey(template) === 'sales');
+  const csmTemplates = reportTemplates.filter((template) => dashboardSectionKey(template) === 'csm');
+  const forecastTemplates = reportTemplates.filter((template) => dashboardSectionKey(template) === 'forecast');
+
+  const renderWidget = (template: ReportTemplate) => (
+    <ReportWidget
+      key={template.id}
+      amoDomain={amoDomain}
+      filters={filters}
+      refreshStamp={refreshStamp}
+      template={template}
+    />
+  );
 
   return (
     <>
       <div className="page-row">
         <div>
-          <h1 className="page-title">Рабочий стол РОПа</h1>
+          <h1 className="page-title">Отчёты</h1>
           <p className="page-description">
-            Закреплённые отчёты пересчитываются по данным amoCRM и обновляются автоматически.
+            Продажи, CSM и прогноз по актуальным данным amoCRM.
           </p>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <button className="btn" type="button" onClick={() => setSettingsOpen((value) => !value)}>
-            <GripVertical size={15} />
-            Настроить рабочий стол
-          </button>
-          <button className="btn btn-primary" type="button" onClick={onCreateReport}>
-            <Plus size={15} />
-            Создать отчёт
-          </button>
         </div>
       </div>
 
-      <WorkspaceFilters filters={filters} options={options} onSetFilters={onSetFilters} />
+      <WorkspaceFilters filters={filters} onSetFilters={onSetFilters} />
 
-      {settingsOpen && (
-        <DashboardSettings
-          templates={allTemplates}
-          onEditReport={onEditReport}
-          onMoveTemplate={onMoveTemplate}
-          onUpdateLayout={onUpdateLayout}
-        />
-      )}
-
-      {pinnedTemplates.length === 0 ? (
+      {reportTemplates.length === 0 ? (
         <div className="empty-state">
           <div>
             <div className="mx-auto grid h-11 w-11 place-items-center rounded-[10px] bg-white text-[var(--pb-primary)] shadow-sm">
               <LayoutDashboard size={22} />
             </div>
-            <h2 className="mt-4 text-lg font-bold">На рабочем столе пока нет закреплённых отчётов</h2>
+            <h2 className="mt-4 text-lg font-bold">Отчётов пока нет</h2>
             <p className="mt-2 max-w-[560px] text-sm text-[var(--pb-text-secondary)]">
-              Создайте отчёт в конструкторе, задайте условие amoCRM и закрепите его как виджет.
+              Отчёты добавляются через код и появятся здесь после обновления сервиса.
             </p>
-            <button className="btn btn-primary mt-4" type="button" onClick={onCreateReport}>
-              <Plus size={15} />
-              Создать первый отчёт
-            </button>
           </div>
         </div>
       ) : (
-        <div className="dashboard-grid">
-          {pinnedTemplates.map((template) => (
-            <ReportWidget
-              key={`${template.id}-${refreshStamp}`}
-              filters={filters}
-              onEdit={() => onEditReport(template)}
-              onMoveDown={() => onMoveTemplate(template.id, 1)}
-              onMoveUp={() => onMoveTemplate(template.id, -1)}
-              onResize={(size) => onUpdateLayout(template.id, { size })}
-              onUnpin={() => onUpdateLayout(template.id, { pinned: false })}
-              template={template}
-            />
-          ))}
+        <div className="dashboard-sections">
+          {salesTemplates.length > 0 && (
+            <DashboardSection
+              count={salesTemplates.length}
+              isOpen={sectionOpen.sales}
+              title="Продажи"
+              onToggle={() => setSectionOpen((current) => ({ ...current, sales: !current.sales }))}
+            >
+              {salesTemplates.map(renderWidget)}
+            </DashboardSection>
+          )}
+          {csmTemplates.length > 0 && (
+            <DashboardSection
+              count={csmTemplates.length}
+              isOpen={sectionOpen.csm}
+              title="CSM"
+              onToggle={() => setSectionOpen((current) => ({ ...current, csm: !current.csm }))}
+            >
+              {csmTemplates.map(renderWidget)}
+            </DashboardSection>
+          )}
+          {forecastTemplates.length > 0 && (
+            <DashboardSection
+              count={forecastTemplates.length}
+              isOpen={sectionOpen.forecast}
+              title="Прогноз"
+              onToggle={() => setSectionOpen((current) => ({ ...current, forecast: !current.forecast }))}
+            >
+              {forecastTemplates.map(renderWidget)}
+            </DashboardSection>
+          )}
         </div>
       )}
     </>
   );
 }
 
+function DashboardSection({
+  children,
+  count,
+  isOpen,
+  onToggle,
+  title,
+}: {
+  children: ReactNode;
+  count: number;
+  isOpen: boolean;
+  onToggle: () => void;
+  title: string;
+}) {
+  return (
+    <section className="dashboard-section">
+      <button className="dashboard-section-header" type="button" onClick={onToggle} aria-expanded={isOpen}>
+        <span className="dashboard-section-title">
+          {isOpen ? <ChevronDown size={18} /> : <ChevronRight size={18} />}
+          {title}
+        </span>
+        <span className="dashboard-section-count">{formatNumber(count)} отчётов</span>
+      </button>
+      {isOpen && <div className="dashboard-grid">{children}</div>}
+    </section>
+  );
+}
+
 function WorkspaceFilters({
   filters,
-  options,
   onSetFilters,
 }: {
   filters: ReportFilters;
-  options: Options | null;
   onSetFilters: (filters: ReportFilters) => void;
 }) {
+  function setPreset(preset: PeriodPreset) {
+    onSetFilters({
+      ...filters,
+      ...presetDateInputs(preset),
+      periodMode: 'preset',
+      periodPreset: preset,
+    });
+  }
+
   return (
-    <div className="card">
+    <div className="card filter-card">
       <div className="card-header">
-        <div className="card-title">Фильтр рабочего стола</div>
+        <div>
+          <div className="card-title">Период отчётов</div>
+          <div className="filter-card-caption">Команды и воронки закреплены в каждом отчёте</div>
+        </div>
         <span className="badge">
           <CalendarDays size={14} />
-          Период применяется ко всем виджетам
+          {formatFilterPeriod(filters)}
         </span>
       </div>
       <div className="card-body">
+        <div className="workspace-presets">
+          {workspacePeriodPresets.map((preset) => (
+            <button
+              key={preset}
+              className={`segmented-option ${filters.periodMode === 'preset' && filters.periodPreset === preset ? 'active' : ''}`}
+              type="button"
+              onClick={() => setPreset(preset)}
+            >
+              {periodPresetLabels[preset]}
+            </button>
+          ))}
+        </div>
+
         <div className="toolbar">
           <label>
             <span className="label">Дата с</span>
             <input
               className="field"
               type="date"
-              value={filters.dateFrom ?? ''}
-              onChange={(event) => onSetFilters({ ...filters, dateFrom: event.target.value })}
+              value={dateInputValue(filters.dateFrom)}
+              onChange={(event) => onSetFilters({ ...filters, periodMode: 'custom', dateFrom: event.target.value })}
             />
           </label>
           <label>
@@ -717,32 +1095,10 @@ function WorkspaceFilters({
             <input
               className="field"
               type="date"
-              value={filters.dateTo ?? ''}
-              onChange={(event) => onSetFilters({ ...filters, dateTo: event.target.value })}
+              value={dateInputValue(filters.dateTo)}
+              onChange={(event) => onSetFilters({ ...filters, periodMode: 'custom', dateTo: event.target.value })}
             />
           </label>
-          <MultiCheckbox
-            label="Воронки"
-            values={filters.pipelineIds ?? []}
-            options={(options?.pipelines ?? []).map((item) => ({ value: item.id, label: item.name }))}
-            onChange={(pipelineIds) => onSetFilters({ ...filters, pipelineIds })}
-          />
-          <MultiCheckbox
-            label="Менеджеры"
-            values={filters.managerIds ?? []}
-            options={(options?.managers ?? [])
-              .filter((item) => item.isVisible)
-              .map((item) => ({ value: item.id, label: item.name }))}
-            onChange={(managerIds) => onSetFilters({ ...filters, managerIds })}
-          />
-          <MultiCheckbox
-            label="Группы"
-            values={filters.groupIds ?? []}
-            options={(options?.groups ?? [])
-              .filter((item) => item.isVisible)
-              .map((item) => ({ value: item.id, label: item.name }))}
-            onChange={(groupIds) => onSetFilters({ ...filters, groupIds })}
-          />
           <div className="grid content-end">
             <button className="btn" type="button" onClick={() => onSetFilters(getInitialFilters())}>
               Сбросить
@@ -752,6 +1108,18 @@ function WorkspaceFilters({
       </div>
     </div>
   );
+}
+
+function formatFilterPeriod(filters: ReportFilters) {
+  if (filters.periodMode === 'preset' && filters.periodPreset) {
+    return periodPresetLabels[filters.periodPreset];
+  }
+  if (filters.periodMode === 'relative') {
+    return `Последние ${filters.relativeAmount ?? 0} ${relativeUnitLabels[filters.relativeUnit ?? 'days']}`;
+  }
+  const from = dateInputValue(filters.dateFrom) || '...';
+  const to = dateInputValue(filters.dateTo) || '...';
+  return `${from} - ${to}`;
 }
 
 function DashboardSettings({
@@ -777,7 +1145,9 @@ function DashboardSettings({
       </div>
       <div className="card-body grid gap-3">
         {templates.length === 0 && <div className="muted text-sm">Сначала создайте отчёт в конструкторе.</div>}
-        {templates.map((template) => (
+        {templates.map((template) => {
+          const isContract = template.config.metric === 'contract';
+          return (
           <div key={template.id} className="grid gap-3 rounded-[10px] border border-[var(--pb-border)] p-3 md:grid-cols-[1fr_150px_150px_160px] md:items-center">
             <label className="flex items-center gap-3">
               <input
@@ -790,15 +1160,19 @@ function DashboardSettings({
                 <span className="block text-xs text-[var(--pb-text-secondary)]">{template.config.conditionLabel}</span>
               </span>
             </label>
-            <select
-              className="select"
-              value={template.config.size ?? 'md'}
-              onChange={(event) => onUpdateLayout(template.id, { size: event.target.value as WidgetSize })}
-            >
-              <option value="sm">{sizeLabels.sm}</option>
-              <option value="md">{sizeLabels.md}</option>
-              <option value="lg">{sizeLabels.lg}</option>
-            </select>
+            {isContract ? (
+              <span />
+            ) : (
+              <select
+                className="select"
+                value={template.config.size ?? 'md'}
+                onChange={(event) => onUpdateLayout(template.id, { size: event.target.value as WidgetSize })}
+              >
+                <option value="sm">{sizeLabels.sm}</option>
+                <option value="md">{sizeLabels.md}</option>
+                <option value="lg">{sizeLabels.lg}</option>
+              </select>
+            )}
             <div className="flex gap-2">
               <button className="icon-btn" title="Выше" type="button" onClick={() => onMoveTemplate(template.id, -1)}>
                 <ArrowUp size={15} />
@@ -812,62 +1186,75 @@ function DashboardSettings({
               Открыть в конструкторе
             </button>
           </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );
 }
 
 function ReportWidget({
+  amoDomain,
   filters,
-  onEdit,
-  onMoveDown,
-  onMoveUp,
-  onResize,
-  onUnpin,
+  refreshStamp,
   template,
 }: {
+  amoDomain: string;
   filters: ReportFilters;
-  onEdit: () => void;
-  onMoveDown: () => void;
-  onMoveUp: () => void;
-  onResize: (size: WidgetSize) => void;
-  onUnpin: () => void;
+  refreshStamp: number;
   template: ReportTemplate;
 }) {
   const [result, setResult] = useState<Record<string, any> | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const hasLoadedRef = useRef(false);
 
   const query = useMemo(() => buildQueryFromTemplate(template, filters), [template, filters]);
+  const cacheKey = useMemo(() => reportWidgetCacheKey(query), [query]);
+
+  useEffect(() => {
+    const cached = readReportWidgetCache(cacheKey);
+    setResult(cached);
+    setLoading(!cached);
+    setError('');
+    hasLoadedRef.current = Boolean(cached);
+  }, [cacheKey]);
 
   useEffect(() => {
     let cancelled = false;
     async function load() {
-      setLoading(true);
-      setError('');
+      const initialLoad = !hasLoadedRef.current;
+      setLoading(initialLoad);
+      if (initialLoad) setError('');
       try {
         const next = await api<Record<string, any>>('/reports/compute', {
           method: 'POST',
           body: JSON.stringify(query),
         });
-        if (!cancelled) setResult(next);
+        if (!cancelled) {
+          setResult(next);
+          writeReportWidgetCache(cacheKey, next);
+          hasLoadedRef.current = true;
+        }
       } catch (err) {
-        if (!cancelled) setError(err instanceof Error ? err.message : 'Не удалось посчитать отчёт');
+        if (!cancelled && initialLoad) {
+          setError(err instanceof Error ? err.message : 'Не удалось посчитать отчёт');
+        }
       } finally {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) {
+          setLoading(false);
+        }
       }
     }
     void load();
-    const timer = window.setInterval(load, 60_000);
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
     };
-  }, [query]);
+  }, [cacheKey, query, refreshStamp]);
 
   const metric = getMetric(template, result);
-  const size = template.config.size ?? 'md';
+  const isWideReport = isWideMetric(template.config.metric);
+  const size = isWideReport ? 'contract' : template.config.size ?? 'md';
 
   return (
     <article className={`card card-hover widget-${size}`} data-testid={`widget-${template.id}`}>
@@ -876,48 +1263,69 @@ function ReportWidget({
           <div className="card-title truncate">{template.name}</div>
           <div className="mt-1 truncate text-xs text-[var(--pb-text-secondary)]">{template.config.conditionLabel}</div>
         </div>
-        <div className="flex shrink-0 gap-1">
-          <button className="icon-btn" title="Выше" type="button" onClick={onMoveUp}>
-            <ArrowUp size={14} />
-          </button>
-          <button className="icon-btn" title="Ниже" type="button" onClick={onMoveDown}>
-            <ArrowDown size={14} />
-          </button>
-          <button className="icon-btn" title="Настроить" type="button" onClick={onEdit}>
-            <SlidersHorizontal size={14} />
-          </button>
-          <button className="icon-btn" title="Скрыть" type="button" onClick={onUnpin}>
-            <EyeOff size={14} />
-          </button>
-        </div>
       </div>
       <div className="card-body grid gap-4">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <span className="badge badge-blue">
-            <Activity size={14} />
-            Автообновление 60 сек
-          </span>
-          <select className="select max-w-[150px]" value={size} onChange={(event) => onResize(event.target.value as WidgetSize)}>
-            <option value="sm">{sizeLabels.sm}</option>
-            <option value="md">{sizeLabels.md}</option>
-            <option value="lg">{sizeLabels.lg}</option>
-          </select>
-        </div>
-
         {loading && <div className="muted text-sm">Считаю по данным amoCRM...</div>}
         {error && <div className="badge badge-red justify-start">{error}</div>}
-        {!loading && !error && (
+        {!loading && !error && result && (
           <>
             <div>
               <div className="metric-value mono-num">{metric.value}</div>
-              <div className="metric-caption">{metric.caption}</div>
+              <div className="metric-caption">
+                {metric.caption}
+              </div>
             </div>
-            <ReportResultDetails result={result} template={template} />
+            <ReportResultDetails amoDomain={amoDomain} result={result} template={template} />
           </>
         )}
       </div>
     </article>
   );
+}
+
+function reportWidgetCacheKey(query: Record<string, any>) {
+  return `amocrm-report:${hashString(stableStringify(query))}`;
+}
+
+function readReportWidgetCache(cacheKey: string) {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(cacheKey);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return parsed?.result && typeof parsed.result === 'object' ? parsed.result as Record<string, any> : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeReportWidgetCache(cacheKey: string, result: Record<string, any>) {
+  if (typeof window === 'undefined') return;
+  try {
+    const payload = JSON.stringify({ savedAt: new Date().toISOString(), result });
+    if (payload.length > 1_500_000) return;
+    window.localStorage.setItem(cacheKey, payload);
+  } catch {
+    // Cache is best-effort. Reports still work without it.
+  }
+}
+
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((item) => stableStringify(item)).join(',')}]`;
+  const object = value as Record<string, unknown>;
+  return `{${Object.keys(object)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableStringify(object[key])}`)
+    .join(',')}}`;
+}
+
+function hashString(value: string) {
+  let hash = 5381;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 33) ^ value.charCodeAt(index);
+  }
+  return (hash >>> 0).toString(36);
 }
 
 function BuilderTab({
@@ -959,7 +1367,7 @@ function BuilderTab({
         <div>
           <h1 className="page-title">Конструктор отчётов</h1>
           <p className="page-description">
-            Соберите правило из amoCRM: объект, действие, этапы, поля, фильтры и формат отображения.
+            Соберите таблицу: строки по менеджерам или группам, столбцы с показателями и формулами.
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -1008,171 +1416,273 @@ function BuilderTab({
           </div>
         </aside>
 
-        <section className="card">
-          <div className="card-header">
-            <div>
-              <div className="card-title">Правило отчёта</div>
-              <div className="mt-1 text-sm text-[var(--pb-text-secondary)]">
-                Пример: сделки, которые перешли в этап “КП презентовано”.
+        <section className="builder-flow">
+          <div className="builder-step">
+            <div className="step-marker">1</div>
+            <div className="builder-step-body">
+              <div className="step-heading">
+                <div>
+                  <div className="card-title">Основное</div>
+                  <div className="mt-1 text-sm text-[var(--pb-text-secondary)]">
+                    Название, описание и доступ к отчёту.
+                  </div>
+                </div>
+                {draft.mode === 'contract' && <span className="badge badge-blue">Таблица</span>}
+                {draft.mode !== 'contract' && <span className="badge badge-yellow">Старый KPI-виджет</span>}
+              </div>
+
+              <div className="grid gap-4 md:grid-cols-2">
+                <label>
+                  <span className="label">Название отчёта</span>
+                  <input
+                    className="field"
+                    value={draft.name}
+                    onChange={(event) => onSetDraft({ ...draft, name: event.target.value })}
+                  />
+                </label>
+                <label className="md:col-span-2">
+                  <span className="label">Описание</span>
+                  <textarea
+                    className="textarea"
+                    value={draft.description}
+                    onChange={(event) => onSetDraft({ ...draft, description: event.target.value })}
+                  />
+                </label>
+                <div className="md:col-span-2">
+                  <MultiCheckbox
+                    label="Кому виден отчёт"
+                    values={draft.visibleUserIds}
+                    options={(options?.appUsers ?? []).map((item) => ({
+                      value: item.id,
+                      label: `${item.name} (${item.email})`,
+                    }))}
+                    onChange={(visibleUserIds) => onSetDraft({ ...draft, visibleUserIds })}
+                  />
+                  <div className="mt-2 text-xs text-[var(--pb-text-secondary)]">
+                    Автор и администратор видят отчёт всегда.
+                  </div>
+                </div>
               </div>
             </div>
           </div>
-          <div className="card-body grid gap-5">
-            <div className="grid gap-4 md:grid-cols-2">
-              <label>
-                <span className="label">Тип отчёта</span>
-                <select
-                  className="select"
-                  value={draft.mode}
-                  onChange={(event) => {
-                    const mode = event.target.value as ReportMode;
-                    onSetDraft({
-                      ...draft,
-                      mode,
-                      metric: mode === 'contract' ? 'contract' : draft.metric === 'contract' ? 'count' : draft.metric,
-                      display: mode === 'contract' ? 'table' : draft.display,
-                      size: mode === 'contract' ? 'lg' : draft.size,
-                    });
-                  }}
-                >
-                  <option value="contract">Контракт данных: много показателей в одном отчёте</option>
-                  <option value="single">Один показатель / простой KPI</option>
-                </select>
-              </label>
-              <label>
-                <span className="label">Название отчёта</span>
-                <input
-                  className="field"
-                  value={draft.name}
-                  onChange={(event) => onSetDraft({ ...draft, name: event.target.value })}
-                />
-              </label>
-              <label>
-                <span className="label">Размер виджета</span>
-                <select
-                  className="select"
-                  value={draft.size}
-                  onChange={(event) => onSetDraft({ ...draft, size: event.target.value as WidgetSize })}
-                >
-                  <option value="sm">{sizeLabels.sm}</option>
-                  <option value="md">{sizeLabels.md}</option>
-                  <option value="lg">{sizeLabels.lg}</option>
-                </select>
-              </label>
-              <label className="md:col-span-2">
-                <span className="label">Описание</span>
-                <textarea
-                  className="textarea"
-                  value={draft.description}
-                  onChange={(event) => onSetDraft({ ...draft, description: event.target.value })}
-                />
-              </label>
-            </div>
 
-            {draft.mode === 'contract' ? (
-              <ContractBuilder draft={draft} onSetDraft={onSetDraft} options={options} />
-            ) : (
-              <>
-                <RuleBuilder draft={draft} onSetDraft={onSetDraft} options={options} />
+          {draft.mode === 'contract' ? (
+            <>
+              <div className="builder-step">
+                <div className="step-marker">2</div>
+                <div className="builder-step-body">
+                  <div className="step-heading">
+                    <div>
+                      <div className="card-title">Период и строки</div>
+                      <div className="mt-1 text-sm text-[var(--pb-text-secondary)]">
+                        Сначала задаём общий период и разрез таблицы.
+                      </div>
+                    </div>
+                  </div>
 
-                <div className="grid gap-4 md:grid-cols-3">
-                  <label>
-                    <span className="label">Показатель</span>
-                    <select
-                      className="select"
-                      value={draft.metric}
-                      onChange={(event) => onSetDraft({ ...draft, metric: event.target.value as MetricType })}
-                    >
-                      <option value="count">{metricLabels.count}</option>
-                      <option value="total_amount">{metricLabels.total_amount}</option>
-                      <option value="avg_amount">{metricLabels.avg_amount}</option>
-                      <option value="conversion">{metricLabels.conversion}</option>
-                      <option value="forecast">{metricLabels.forecast}</option>
-                    </select>
-                  </label>
-                  <label>
-                    <span className="label">Формат отображения</span>
-                    <select
-                      className="select"
-                      value={draft.display}
-                      onChange={(event) => onSetDraft({ ...draft, display: event.target.value as DisplayType })}
-                    >
-                      <option value="kpi">{displayLabels.kpi}</option>
-                      <option value="funnel">{displayLabels.funnel}</option>
-                      <option value="table">{displayLabels.table}</option>
-                      <option value="forecast">{displayLabels.forecast}</option>
-                    </select>
-                  </label>
-                  <label>
-                    <span className="label">Конверсия считать от</span>
-                    <select
-                      className="select"
-                      value={draft.denominator}
-                      onChange={(event) => onSetDraft({ ...draft, denominator: event.target.value as DenominatorType })}
-                    >
-                      <option value="previous">предыдущего шага</option>
-                      <option value="first">первого шага</option>
-                    </select>
-                  </label>
+                  <div className="grid gap-4">
+                    <label className="max-w-[360px]">
+                      <span className="label">Что анализируем</span>
+                      <select
+                        className="select"
+                        value={draft.entity}
+                        onChange={(event) => {
+                          const entity = event.target.value as ReportDraft['entity'];
+                          onSetDraft({
+                            ...draft,
+                            entity,
+                            contractMetrics: entity === 'task' ? getDefaultTaskMetrics() : getDefaultContractMetrics(),
+                            contractConversions: [],
+                            contractDurations: [],
+                          });
+                        }}
+                      >
+                        <option value="deal">Сделки</option>
+                        <option value="task">Задачи</option>
+                      </select>
+                    </label>
+
+                    <PeriodPicker filters={filters} onSetFilters={onSetFilters} />
+
+                    <div className="grid gap-4 md:grid-cols-3">
+                      <label>
+                        <span className="label">Строки таблицы</span>
+                        <select
+                          className="select"
+                          value={draft.contractGroupBy}
+                          onChange={(event) => onSetDraft({ ...draft, contractGroupBy: event.target.value as 'manager' | 'group' | 'none' })}
+                        >
+                          <option value="manager">Менеджеры</option>
+                          <option value="group">Группы менеджеров</option>
+                          <option value="none">Только весь отдел</option>
+                        </select>
+                      </label>
+                      <div className="md:col-span-2 grid gap-4 md:grid-cols-2">
+                        <MultiCheckbox
+                          label="Менеджеры"
+                          values={filters.managerIds ?? []}
+                          options={(options?.managers ?? [])
+                            .filter((item) => item.isVisible)
+                            .map((item) => ({ value: item.id, label: item.name }))}
+                          onChange={(managerIds) => onSetFilters({ ...filters, managerIds })}
+                        />
+                        <MultiCheckbox
+                          label="Группы"
+                          values={filters.groupIds ?? []}
+                          options={(options?.groups ?? [])
+                            .filter((item) => item.isVisible)
+                            .map((item) => ({ value: item.id, label: item.name }))}
+                          onChange={(groupIds) => onSetFilters({ ...filters, groupIds })}
+                        />
+                      </div>
+                    </div>
+
+                    <div className="grid gap-3 rounded-[10px] border border-[var(--pb-border)] bg-white p-4 md:grid-cols-2">
+                      <label className="flex items-center gap-3 text-sm font-semibold">
+                        <input
+                          checked={draft.includeRowTotal}
+                          type="checkbox"
+                          onChange={(event) => onSetDraft({ ...draft, includeRowTotal: event.target.checked })}
+                        />
+                        Итог в конце каждой строки
+                      </label>
+                      <label>
+                        <span className="label">Как считать итог строки</span>
+                        <select
+                          className="select"
+                          value={draft.rowTotalMode}
+                          onChange={(event) => onSetDraft({ ...draft, rowTotalMode: event.target.value as 'sum' | 'avg' })}
+                        >
+                          <option value="sum">Сумма</option>
+                          <option value="avg">Среднее</option>
+                        </select>
+                      </label>
+                      <label className="flex items-center gap-3 text-sm font-semibold">
+                        <input
+                          checked={draft.includeSummaryRow}
+                          type="checkbox"
+                          onChange={(event) => onSetDraft({ ...draft, includeSummaryRow: event.target.checked })}
+                        />
+                        Итоговая строка внизу таблицы
+                      </label>
+                      <label>
+                        <span className="label">Как считать итог столбца</span>
+                        <select
+                          className="select"
+                          value={draft.summaryRowMode}
+                          onChange={(event) => onSetDraft({ ...draft, summaryRowMode: event.target.value as 'sum' | 'avg' })}
+                        >
+                          <option value="sum">Сумма</option>
+                          <option value="avg">Среднее</option>
+                        </select>
+                      </label>
+                    </div>
+                  </div>
                 </div>
-              </>
-            )}
-
-            <div className="grid gap-4 md:grid-cols-2">
-              <label>
-                <span className="label">Дата с</span>
-                <input
-                  className="field"
-                  type="date"
-                  value={filters.dateFrom ?? ''}
-                  onChange={(event) => onSetFilters({ ...filters, dateFrom: event.target.value })}
-                />
-              </label>
-              <label>
-                <span className="label">Дата по</span>
-                <input
-                  className="field"
-                  type="date"
-                  value={filters.dateTo ?? ''}
-                  onChange={(event) => onSetFilters({ ...filters, dateTo: event.target.value })}
-                />
-              </label>
-            </div>
-
-            <div className="grid gap-4 md:grid-cols-2">
-              <MultiCheckbox
-                label="Менеджеры для отчёта"
-                values={filters.managerIds ?? []}
-                options={(options?.managers ?? [])
-                  .filter((item) => item.isVisible)
-                  .map((item) => ({ value: item.id, label: item.name }))}
-                onChange={(managerIds) => onSetFilters({ ...filters, managerIds })}
-              />
-              <MultiCheckbox
-                label="Группы для отчёта"
-                values={filters.groupIds ?? []}
-                options={(options?.groups ?? [])
-                  .filter((item) => item.isVisible)
-                  .map((item) => ({ value: item.id, label: item.name }))}
-                onChange={(groupIds) => onSetFilters({ ...filters, groupIds })}
-              />
-            </div>
-
-            <label className="flex items-center gap-3 text-sm font-semibold">
-              <input
-                checked={draft.pinned}
-                type="checkbox"
-                onChange={(event) => onSetDraft({ ...draft, pinned: event.target.checked })}
-              />
-              Закрепить на рабочем столе после сохранения
-            </label>
-
-            {errors.length > 0 && (
-              <div className="badge badge-yellow justify-start">
-                <AlertCircle size={14} />
-                {errors[0]}
               </div>
-            )}
+
+              <div className="builder-step">
+                <div className="step-marker">3</div>
+                <div className="builder-step-body">
+                  <div className="step-heading">
+                    <div>
+                      <div className="card-title">Показатели</div>
+                      <div className="mt-1 text-sm text-[var(--pb-text-secondary)]">
+                        Каждый столбец задаёт свою выборку, расчёт и дополнительные условия.
+                      </div>
+                    </div>
+                  </div>
+                  <ContractBuilder draft={draft} onSetDraft={onSetDraft} options={options} />
+                </div>
+              </div>
+            </>
+          ) : (
+            <div className="builder-step">
+              <div className="step-marker">2</div>
+              <div className="builder-step-body">
+                <div className="step-heading">
+                  <div>
+                    <div className="card-title">Старый простой виджет</div>
+                    <div className="mt-1 text-sm text-[var(--pb-text-secondary)]">
+                      Этот режим оставлен только для редактирования ранее созданных KPI.
+                    </div>
+                  </div>
+                </div>
+                <div className="grid gap-5">
+                  <PeriodPicker filters={filters} onSetFilters={onSetFilters} />
+                  <RuleBuilder draft={draft} onSetDraft={onSetDraft} options={options} />
+                  <div className="grid gap-4 md:grid-cols-3">
+                    <label>
+                      <span className="label">Показатель</span>
+                      <select
+                        className="select"
+                        value={draft.metric}
+                        onChange={(event) => onSetDraft({ ...draft, metric: event.target.value as MetricType })}
+                      >
+                        <option value="count">{metricLabels.count}</option>
+                        <option value="total_amount">{metricLabels.total_amount}</option>
+                        <option value="avg_amount">{metricLabels.avg_amount}</option>
+                        <option value="conversion">{metricLabels.conversion}</option>
+                        <option value="forecast">{metricLabels.forecast}</option>
+                      </select>
+                    </label>
+                    <label>
+                      <span className="label">Формат отображения</span>
+                      <select
+                        className="select"
+                        value={draft.display}
+                        onChange={(event) => onSetDraft({ ...draft, display: event.target.value as DisplayType })}
+                      >
+                        <option value="kpi">{displayLabels.kpi}</option>
+                        <option value="funnel">{displayLabels.funnel}</option>
+                        <option value="table">{displayLabels.table}</option>
+                        <option value="forecast">{displayLabels.forecast}</option>
+                      </select>
+                    </label>
+                    <label>
+                      <span className="label">Размер виджета</span>
+                      <select
+                        className="select"
+                        value={draft.size}
+                        onChange={(event) => onSetDraft({ ...draft, size: event.target.value as WidgetSize })}
+                      >
+                        <option value="sm">{sizeLabels.sm}</option>
+                        <option value="md">{sizeLabels.md}</option>
+                        <option value="lg">{sizeLabels.lg}</option>
+                      </select>
+                    </label>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <div className="builder-step">
+            <div className="step-marker">{draft.mode === 'contract' ? '4' : '3'}</div>
+            <div className="builder-step-body">
+              <div className="step-heading">
+                <div>
+                  <div className="card-title">Проверка и сохранение</div>
+                  <div className="mt-1 text-sm text-[var(--pb-text-secondary)]">
+                    Проверьте отчёт, затем сохраните или закрепите на рабочем столе.
+                  </div>
+                </div>
+              </div>
+              <label className="flex items-center gap-3 text-sm font-semibold">
+                <input
+                  checked={draft.pinned}
+                  type="checkbox"
+                  onChange={(event) => onSetDraft({ ...draft, pinned: event.target.checked })}
+                />
+                Закрепить на рабочем столе после сохранения
+              </label>
+              {errors.length > 0 && (
+                <div className="badge badge-yellow justify-start">
+                  <AlertCircle size={14} />
+                  {errors[0]}
+                </div>
+              )}
+            </div>
           </div>
         </section>
 
@@ -1229,6 +1739,109 @@ function BuilderTab({
   );
 }
 
+function PeriodPicker({
+  filters,
+  onSetFilters,
+}: {
+  filters: ReportFilters;
+  onSetFilters: (filters: ReportFilters) => void;
+}) {
+  const mode = filters.periodMode ?? 'preset';
+  return (
+    <section className="grid gap-3 rounded-[10px] border border-[var(--pb-border)] bg-[var(--pb-bg)] p-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <div className="card-title">Период отчёта</div>
+          <div className="mt-1 text-sm text-[var(--pb-text-secondary)]">
+            Период применяется ко всем столбцам, если в показателе не задано отдельное условие.
+          </div>
+        </div>
+        <select
+          className="select max-w-[240px]"
+          value={mode}
+          onChange={(event) => onSetFilters({ ...filters, periodMode: event.target.value as PeriodMode })}
+        >
+          <option value="preset">Пресет</option>
+          <option value="custom">Календарь</option>
+          <option value="relative">Относительный период</option>
+        </select>
+      </div>
+
+      {mode === 'preset' && (
+        <div className="grid gap-3 md:grid-cols-3">
+          {(Object.keys(periodPresetLabels) as PeriodPreset[]).map((preset) => (
+            <button
+              key={preset}
+              className={`segmented-option ${filters.periodPreset === preset ? 'active' : ''}`}
+              type="button"
+              onClick={() => onSetFilters({ ...filters, periodMode: 'preset', periodPreset: preset })}
+            >
+              {periodPresetLabels[preset]}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {mode === 'custom' && (
+        <div className="grid gap-4 md:grid-cols-2">
+          <label>
+            <span className="label">Дата с</span>
+            <input
+              className="field"
+              type="date"
+              value={filters.dateFrom ?? ''}
+              onChange={(event) => onSetFilters({ ...filters, periodMode: 'custom', dateFrom: event.target.value })}
+            />
+          </label>
+          <label>
+            <span className="label">Дата по</span>
+            <input
+              className="field"
+              type="date"
+              value={filters.dateTo ?? ''}
+              onChange={(event) => onSetFilters({ ...filters, periodMode: 'custom', dateTo: event.target.value })}
+            />
+          </label>
+        </div>
+      )}
+
+      {mode === 'relative' && (
+        <div className="grid gap-4 md:grid-cols-[160px_1fr]">
+          <label>
+            <span className="label">Последние</span>
+            <input
+              className="field"
+              min={1}
+              type="number"
+              value={filters.relativeAmount ?? 7}
+              onChange={(event) => onSetFilters({ ...filters, periodMode: 'relative', relativeAmount: Number(event.target.value) })}
+            />
+          </label>
+          <label>
+            <span className="label">Единица</span>
+            <select
+              className="select"
+              value={filters.relativeUnit ?? 'days'}
+              onChange={(event) =>
+                onSetFilters({
+                  ...filters,
+                  periodMode: 'relative',
+                  relativeUnit: event.target.value as NonNullable<ReportFilters['relativeUnit']>,
+                })
+              }
+            >
+              <option value="hours">часов</option>
+              <option value="days">дней</option>
+              <option value="weeks">недель</option>
+              <option value="months">месяцев</option>
+            </select>
+          </label>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function ContractBuilder({
   draft,
   onSetDraft,
@@ -1251,7 +1864,11 @@ function ContractBuilder({
     { value: '', label: 'Бюджет сделки', description: 'Системное поле сделки' },
     ...dealFieldOptions,
   ];
-  const sourceMetrics = draft.contractMetrics.filter((metric) => metric.type !== 'conversion');
+  const sourceMetrics = draft.contractMetrics.filter((metric) => metric.type !== 'conversion' && metric.type !== 'formula');
+  const isTaskReport = draft.entity === 'task';
+  const draggingMetricIdRef = useRef<string | null>(null);
+  const [draggingMetricId, setDraggingMetricId] = useState<string | null>(null);
+  const [metricDropTarget, setMetricDropTarget] = useState<{ id: string; position: 'before' | 'after' } | null>(null);
 
   function patchMetric(id: string, patch: Partial<ContractMetricDraft>) {
     onSetDraft({
@@ -1261,6 +1878,174 @@ function ContractBuilder({
       ),
     });
   }
+
+  function patchMetricFilter(metricId: string, filterId: string, patch: Partial<ContractFilterDraft>) {
+    onSetDraft({
+      ...draft,
+      contractMetrics: draft.contractMetrics.map((metric) =>
+        metric.id === metricId
+          ? {
+              ...metric,
+              extraFilters: metric.extraFilters.map((filter) =>
+                filter.id === filterId ? { ...filter, ...patch } : filter,
+              ),
+            }
+          : metric,
+      ),
+    });
+  }
+
+  function addMetricFilter(metricId: string) {
+    onSetDraft({
+      ...draft,
+      contractMetrics: draft.contractMetrics.map((metric) =>
+        metric.id === metricId
+          ? {
+              ...metric,
+              extraFilters: [
+                ...metric.extraFilters,
+                metric.type === 'task_count' ? createTaskFilter('task_type', '') : createContractFilter(),
+              ],
+            }
+          : metric,
+      ),
+    });
+  }
+
+  function removeMetricFilter(metricId: string, filterId: string) {
+    onSetDraft({
+      ...draft,
+      contractMetrics: draft.contractMetrics.map((metric) =>
+        metric.id === metricId
+          ? { ...metric, extraFilters: metric.extraFilters.filter((filter) => filter.id !== filterId) }
+          : metric,
+      ),
+    });
+  }
+
+  function moveMetric(sourceId: string, targetId: string, position: 'before' | 'after') {
+    if (sourceId === targetId) return;
+
+    const sourceIndex = draft.contractMetrics.findIndex((metric) => metric.id === sourceId);
+    const targetIndex = draft.contractMetrics.findIndex((metric) => metric.id === targetId);
+    if (sourceIndex < 0 || targetIndex < 0) return;
+
+    const nextMetrics = [...draft.contractMetrics];
+    const [sourceMetric] = nextMetrics.splice(sourceIndex, 1);
+    let insertIndex = targetIndex + (position === 'after' ? 1 : 0);
+    if (sourceIndex < insertIndex) insertIndex -= 1;
+    nextMetrics.splice(insertIndex, 0, sourceMetric);
+
+    onSetDraft({
+      ...draft,
+      contractMetrics: nextMetrics,
+    });
+  }
+
+  function moveMetricByStep(metricId: string, direction: -1 | 1) {
+    const currentIndex = draft.contractMetrics.findIndex((metric) => metric.id === metricId);
+    const targetIndex = currentIndex + direction;
+    if (currentIndex < 0 || targetIndex < 0 || targetIndex >= draft.contractMetrics.length) return;
+
+    const nextMetrics = [...draft.contractMetrics];
+    [nextMetrics[currentIndex], nextMetrics[targetIndex]] = [nextMetrics[targetIndex], nextMetrics[currentIndex]];
+    onSetDraft({
+      ...draft,
+      contractMetrics: nextMetrics,
+    });
+  }
+
+  function startMetricDrag(metricId: string) {
+    draggingMetricIdRef.current = metricId;
+    setDraggingMetricId(metricId);
+    setMetricDropTarget(null);
+  }
+
+  function getMetricDropTargetFromPoint(clientX: number, clientY: number) {
+    const element = document.elementFromPoint(clientX, clientY);
+    const card = element?.closest<HTMLElement>('[data-metric-id]');
+    const id = card?.dataset.metricId;
+    if (!card || !id) return null;
+
+    const bounds = card.getBoundingClientRect();
+    return {
+      id,
+      position: clientY > bounds.top + bounds.height / 2 ? 'after' as const : 'before' as const,
+    };
+  }
+
+  function handleMetricPointerDown(event: ReactPointerEvent<HTMLButtonElement>, metricId: string) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    startMetricDrag(metricId);
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function handleMetricPointerMove(event: ReactPointerEvent<HTMLButtonElement>) {
+    const sourceId = draggingMetricIdRef.current;
+    if (!sourceId) return;
+    event.preventDefault();
+
+    const target = getMetricDropTargetFromPoint(event.clientX, event.clientY);
+    setMetricDropTarget(target && target.id !== sourceId ? target : null);
+  }
+
+  function handleMetricPointerUp(event: ReactPointerEvent<HTMLButtonElement>) {
+    const sourceId = draggingMetricIdRef.current;
+    if (!sourceId) return;
+    event.preventDefault();
+
+    const target = getMetricDropTargetFromPoint(event.clientX, event.clientY) ?? metricDropTarget;
+    if (target && target.id !== sourceId) {
+      moveMetric(sourceId, target.id, target.position);
+    }
+
+    event.currentTarget.releasePointerCapture(event.pointerId);
+    clearMetricDragState();
+  }
+
+  function handleMetricMouseDown(event: ReactMouseEvent<HTMLButtonElement>, metricId: string) {
+    if (event.button !== 0 || draggingMetricIdRef.current) return;
+    event.preventDefault();
+    startMetricDrag(metricId);
+  }
+
+  function clearMetricDragState() {
+    draggingMetricIdRef.current = null;
+    setDraggingMetricId(null);
+    setMetricDropTarget(null);
+  }
+
+  useEffect(() => {
+    if (!draggingMetricId) return;
+
+    function handleMouseMove(event: MouseEvent) {
+      const sourceId = draggingMetricIdRef.current;
+      if (!sourceId) return;
+
+      const target = getMetricDropTargetFromPoint(event.clientX, event.clientY);
+      setMetricDropTarget(target && target.id !== sourceId ? target : null);
+    }
+
+    function handleMouseUp(event: MouseEvent) {
+      const sourceId = draggingMetricIdRef.current;
+      if (!sourceId) return;
+
+      const target = getMetricDropTargetFromPoint(event.clientX, event.clientY) ?? metricDropTarget;
+      if (target && target.id !== sourceId) {
+        moveMetric(sourceId, target.id, target.position);
+      }
+      clearMetricDragState();
+    }
+
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [draggingMetricId, metricDropTarget, draft]);
 
   function removeMetric(id: string) {
     onSetDraft({
@@ -1292,26 +2077,6 @@ function ContractBuilder({
 
   return (
     <div className="grid gap-5">
-      <div className="condition-strip">
-        <Filter size={16} className="text-[var(--pb-primary)]" />
-        <span className="text-sm font-semibold">Контракт данных</span>
-        <span className="text-sm text-[var(--pb-text-secondary)]">
-          В одном отчёте: любые показатели, допустимые операции, конверсии и среднее время по этапам.
-        </span>
-      </div>
-
-      <label className="max-w-[360px]">
-        <span className="label">Срез отчёта</span>
-        <select
-          className="select"
-          value={draft.contractGroupBy}
-          onChange={(event) => onSetDraft({ ...draft, contractGroupBy: event.target.value as 'manager' | 'none' })}
-        >
-          <option value="manager">По отделу и менеджерам</option>
-          <option value="none">Только весь отдел</option>
-        </select>
-      </label>
-
       <section className="grid gap-3">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
@@ -1321,19 +2086,57 @@ function ContractBuilder({
             </div>
           </div>
           <div className="flex flex-wrap gap-2">
-            <button
-              className="btn"
-              type="button"
-              onClick={() =>
-                onSetDraft({
-                  ...draft,
-                  contractMetrics: [...draft.contractMetrics, createContractMetric('Новый показатель', 'stage_reached')],
-                })
-              }
-            >
-              <Plus size={15} />
-              Добавить показатель
-            </button>
+            {isTaskReport ? (
+              <button
+                className="btn"
+                type="button"
+                onClick={() =>
+                  onSetDraft({
+                    ...draft,
+                    contractMetrics: [...draft.contractMetrics, createTaskMetric('Новый показатель задач')],
+                  })
+                }
+              >
+                <Plus size={15} />
+                Добавить показатель задач
+              </button>
+            ) : (
+              <button
+                className="btn"
+                type="button"
+                onClick={() =>
+                  onSetDraft({
+                    ...draft,
+                    contractMetrics: [...draft.contractMetrics, createContractMetric('Новый показатель', 'stage_reached')],
+                  })
+                }
+              >
+                <Plus size={15} />
+                Добавить показатель
+              </button>
+            )}
+            {!isTaskReport && (
+              <button
+                className="btn"
+                type="button"
+                onClick={() =>
+                  onSetDraft({
+                    ...draft,
+                    contractMetrics: [
+                      ...draft.contractMetrics,
+                      {
+                        ...createContractMetric('Новая конверсия', 'conversion'),
+                        fromMetricId: sourceMetrics[0]?.id ?? '',
+                        toMetricId: sourceMetrics[1]?.id ?? '',
+                      },
+                    ],
+                  })
+                }
+              >
+                <Plus size={15} />
+                Добавить конверсию
+              </button>
+            )}
             <button
               className="btn"
               type="button"
@@ -1343,24 +2146,66 @@ function ContractBuilder({
                   contractMetrics: [
                     ...draft.contractMetrics,
                     {
-                      ...createContractMetric('Новая конверсия', 'conversion'),
-                      fromMetricId: sourceMetrics[0]?.id ?? '',
-                      toMetricId: sourceMetrics[1]?.id ?? '',
+                      ...createContractMetric('Формула', 'formula'),
+                      formula: sourceMetrics[0] ? `[${sourceMetrics[0].label}]` : '',
                     },
                   ],
                 })
               }
             >
               <Plus size={15} />
-              Добавить конверсию
+              Добавить формулу
             </button>
           </div>
         </div>
 
-        {draft.contractMetrics.map((metric, index) => (
-          <div key={metric.id} className="grid gap-4 rounded-[12px] border border-[var(--pb-border)] bg-white p-4">
+        {draft.contractMetrics.map((metric, index) => {
+          const dropClass =
+            metricDropTarget?.id === metric.id ? `drop-${metricDropTarget.position}` : '';
+
+          return (
+          <div
+            key={metric.id}
+            data-metric-id={metric.id}
+            className={`metric-card ${draggingMetricId === metric.id ? 'dragging' : ''} ${dropClass}`}
+          >
             <div className="flex flex-wrap items-center justify-between gap-3">
-              <span className="badge badge-blue">#{index + 1}</span>
+              <div className="flex items-center gap-2">
+                <button
+                  aria-label="Переместить показатель"
+                  className="metric-drag-handle"
+                  title="Переместить показатель"
+                  type="button"
+                  onMouseDown={(event) => handleMetricMouseDown(event, metric.id)}
+                  onPointerCancel={clearMetricDragState}
+                  onPointerDown={(event) => handleMetricPointerDown(event, metric.id)}
+                  onPointerMove={handleMetricPointerMove}
+                  onPointerUp={handleMetricPointerUp}
+                >
+                  <GripVertical size={16} />
+                </button>
+                <button
+                  aria-label="Выше"
+                  className="icon-btn metric-order-btn"
+                  disabled={index === 0}
+                  title="Выше"
+                  type="button"
+                  onClick={() => moveMetricByStep(metric.id, -1)}
+                >
+                  <ArrowUp size={14} />
+                </button>
+                <button
+                  aria-label="Ниже"
+                  className="icon-btn metric-order-btn"
+                  disabled={index === draft.contractMetrics.length - 1}
+                  title="Ниже"
+                  type="button"
+                  onClick={() => moveMetricByStep(metric.id, 1)}
+                >
+                  <ArrowDown size={14} />
+                </button>
+                <span className="badge badge-blue">#{index + 1}</span>
+              </div>
               <button className="btn btn-danger" type="button" onClick={() => removeMetric(metric.id)}>
                 <Trash2 size={14} />
                 Удалить
@@ -1376,30 +2221,97 @@ function ContractBuilder({
                   onChange={(event) => patchMetric(metric.id, { label: event.target.value })}
                 />
               </label>
-              <label>
-                <span className="label">Что считать</span>
-                <select
-                  className="select"
-                  value={metric.type}
-                  onChange={(event) => {
-                    const type = event.target.value as ContractMetricType;
-                    patchMetric(metric.id, {
-                      type,
-                      measure: type === 'conversion' ? 'deal_count' : metric.measure,
-                      display: type === 'conversion' ? 'percent' : metric.display === 'percent' ? 'number' : metric.display,
-                    });
-                  }}
-                >
-                  <option value="created_deals">Лиды/сделки, полученные за период</option>
-                  <option value="field_condition">Сделки, где поле соответствует условию</option>
-                  <option value="stage_reached">Сделки, перешедшие в выбранные этапы</option>
-                  <option value="current_stage">Сделки, которые сейчас находятся в этапах</option>
-                  <option value="conversion">Конверсию между показателями</option>
-                </select>
-              </label>
+              {metric.type === 'task_count' ? (
+                <div>
+                  <span className="label">Что считать</span>
+                  <div className="condition-strip">
+                    <span className="badge badge-blue">Количество задач</span>
+                  </div>
+                </div>
+              ) : (
+                <label>
+                  <span className="label">Что считать</span>
+                  <select
+                    className="select"
+                    value={metric.type}
+                    onChange={(event) => {
+                      const type = event.target.value as ContractMetricType;
+                      patchMetric(metric.id, {
+                        type,
+                        measure: type === 'conversion' ? 'deal_count' : metric.measure,
+                        display: type === 'conversion' ? 'percent' : metric.display === 'percent' ? 'number' : metric.display,
+                      });
+                    }}
+                  >
+                    <option value="created_deals">Лиды/сделки, полученные за период</option>
+                    <option value="field_condition">Сделки, где поле соответствует условию</option>
+                    <option value="stage_reached">Сделки, перешедшие в выбранные этапы</option>
+                    <option value="current_stage">Сделки, которые сейчас находятся в этапах</option>
+                    <option value="conversion">Конверсию между показателями</option>
+                    <option value="formula">Формулу по другим показателям</option>
+                  </select>
+                </label>
+              )}
             </div>
 
-            {metric.type === 'conversion' ? (
+            {metric.type === 'formula' ? (
+              <div className="grid gap-4">
+                <label>
+                  <span className="label">Формула</span>
+                  <input
+                    className="field"
+                    value={metric.formula}
+                    onChange={(event) => patchMetric(metric.id, { formula: event.target.value })}
+                    placeholder="[Лиды] / [КП отправлены] * 100"
+                  />
+                </label>
+                <div className="flex flex-wrap gap-2">
+                  {sourceMetrics.map((item) => (
+                    <button
+                      key={item.id}
+                      className="btn"
+                      type="button"
+                      onClick={() => patchMetric(metric.id, { formula: `${metric.formula}${metric.formula ? ' ' : ''}[${item.label}]` })}
+                    >
+                      Вставить: {item.label}
+                    </button>
+                  ))}
+                </div>
+                <label className="max-w-[220px]">
+                  <span className="label">Формат</span>
+                  <select
+                    className="select"
+                    value={metric.display}
+                    onChange={(event) => patchMetric(metric.id, { display: event.target.value as ContractDisplay })}
+                  >
+                    <option value="number">Число</option>
+                    <option value="money">Деньги</option>
+                    <option value="percent">Процент</option>
+                  </select>
+                </label>
+              </div>
+            ) : metric.type === 'task_count' ? (
+              <div className="grid gap-4">
+                <div className="condition-strip">
+                  <span className="badge badge-blue">Задачи</span>
+                  <span className="text-sm text-[var(--pb-text-secondary)]">
+                    Считаем количество задач. Типы и статусы задаются через дополнительные условия.
+                  </span>
+                </div>
+                <MetricExtraFilters
+                  allStages={allStages}
+                  dealFieldOptions={dealFieldOptions}
+                  entity="task"
+                  filters={metric.extraFilters}
+                  groups={options?.groups ?? []}
+                  managers={options?.managers ?? []}
+                  taskTypes={options?.taskTypes ?? []}
+                  onAdd={() => addMetricFilter(metric.id)}
+                  onPatch={(filterId, patch) => patchMetricFilter(metric.id, filterId, patch)}
+                  onRemove={(filterId) => removeMetricFilter(metric.id, filterId)}
+                />
+              </div>
+            ) : metric.type === 'conversion' ? (
               <div className="grid gap-4 md:grid-cols-2">
                 <label>
                   <span className="label">Откуда</span>
@@ -1554,13 +2466,27 @@ function ContractBuilder({
                     </label>
                   </div>
                 )}
+
+                <MetricExtraFilters
+                  allStages={allStages}
+                  dealFieldOptions={dealFieldOptions}
+                  entity="deal"
+                  filters={metric.extraFilters}
+                  groups={options?.groups ?? []}
+                  managers={options?.managers ?? []}
+                  taskTypes={options?.taskTypes ?? []}
+                  onAdd={() => addMetricFilter(metric.id)}
+                  onPatch={(filterId, patch) => patchMetricFilter(metric.id, filterId, patch)}
+                  onRemove={(filterId) => removeMetricFilter(metric.id, filterId)}
+                />
               </div>
             )}
           </div>
-        ))}
+          );
+        })}
       </section>
 
-      <section className="grid gap-3">
+      {!isTaskReport && <section className="grid gap-3">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <div className="card-title">Среднее время в этапах</div>
@@ -1616,9 +2542,346 @@ function ContractBuilder({
             </button>
           </div>
         ))}
-      </section>
+      </section>}
     </div>
   );
+}
+
+function MetricExtraFilters({
+  allStages,
+  dealFieldOptions,
+  entity,
+  filters,
+  groups,
+  managers,
+  taskTypes,
+  onAdd,
+  onPatch,
+  onRemove,
+}: {
+  allStages: FieldOption[];
+  dealFieldOptions: FieldOption[];
+  entity: 'deal' | 'task';
+  filters: ContractFilterDraft[];
+  groups: Group[];
+  managers: Manager[];
+  taskTypes: Array<{ id: string; name: string }>;
+  onAdd: () => void;
+  onPatch: (filterId: string, patch: Partial<ContractFilterDraft>) => void;
+  onRemove: (filterId: string) => void;
+}) {
+  return (
+    <div className="grid gap-4 rounded-[10px] border border-[var(--pb-border)] bg-[var(--pb-bg)] p-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <div className="card-title">Дополнительные условия</div>
+          <div className="mt-1 text-sm text-[var(--pb-text-secondary)]">
+            Все условия применяются одновременно: условие 1 + условие 2 + условие 3.
+          </div>
+        </div>
+        <button className="btn" type="button" onClick={onAdd}>
+          <Plus size={15} />
+          Добавить условие
+        </button>
+      </div>
+
+      {filters.length === 0 ? (
+        <div className="muted text-sm">Дополнительных условий нет.</div>
+      ) : (
+        <div className="grid gap-3">
+          {filters.map((filter, index) => {
+            const operators = operatorsForSubject(filter.subject);
+            return (
+              <div key={filter.id} className="grid gap-3 rounded-[10px] border border-[var(--pb-border)] bg-white p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="badge badge-blue">Условие {index + 1}</span>
+                  <button className="btn btn-danger" type="button" onClick={() => onRemove(filter.id)}>
+                    <Trash2 size={14} />
+                    Удалить
+                  </button>
+                </div>
+
+                <div className="grid gap-3 md:grid-cols-3">
+                  <label>
+                    <span className="label">Данные</span>
+                    <select
+                      className="select"
+                      value={filter.subject}
+                      onChange={(event) => {
+                        const subject = event.target.value as ContractFilterSubject;
+                        onPatch(filter.id, {
+                          subject,
+                          fieldId: '',
+                          operator: defaultOperatorForSubject(subject),
+                          value: '',
+                          amount: 1,
+                          unit: subject === 'last_note_created_at' ? 'hours' : 'days',
+                        });
+                      }}
+                    >
+                      {filterSubjectsForEntity(entity).map((subject) => (
+                        <option key={subject} value={subject}>
+                          {filterSubjectLabels[subject]}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  {filter.subject === 'deal_field' && (
+                    <label>
+                      <span className="label">Поле amoCRM</span>
+                      <select
+                        className="select"
+                        value={filter.fieldId}
+                        onChange={(event) => onPatch(filter.id, { fieldId: event.target.value })}
+                      >
+                        <option value="">Выберите поле</option>
+                        {dealFieldOptions.map((field) => (
+                          <option key={field.value} value={field.value}>
+                            {field.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  )}
+
+                  <label>
+                    <span className="label">Условие</span>
+                    <select
+                      className="select"
+                      value={filter.operator}
+                      onChange={(event) => onPatch(filter.id, { operator: event.target.value as ContractFilterOperator })}
+                    >
+                      {operators.map((operator) => (
+                        <option key={operator} value={operator}>
+                          {filterOperatorLabels[operator]}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <FilterValueControl
+                    allStages={allStages}
+                    filter={filter}
+                    groups={groups}
+                    managers={managers}
+                    taskTypes={taskTypes}
+                    onPatch={(patch) => onPatch(filter.id, patch)}
+                  />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FilterValueControl({
+  allStages,
+  filter,
+  groups,
+  managers,
+  taskTypes,
+  onPatch,
+}: {
+  allStages: FieldOption[];
+  filter: ContractFilterDraft;
+  groups: Group[];
+  managers: Manager[];
+  taskTypes: Array<{ id: string; name: string }>;
+  onPatch: (patch: Partial<ContractFilterDraft>) => void;
+}) {
+  if (filter.operator === 'is_set') return null;
+
+  if (filter.operator === 'within_last' || filter.operator === 'older_than') {
+    return (
+      <div className="grid gap-3 md:col-span-1 md:grid-cols-[1fr_140px]">
+        <label>
+          <span className="label">Количество</span>
+          <input
+            className="field"
+            min={1}
+            type="number"
+            value={filter.amount}
+            onChange={(event) => onPatch({ amount: Math.max(1, Number(event.target.value)) })}
+          />
+        </label>
+        <label>
+          <span className="label">Единица</span>
+          <select className="select" value={filter.unit} onChange={(event) => onPatch({ unit: event.target.value as RelativeUnit })}>
+            {(Object.keys(relativeUnitLabels) as RelativeUnit[]).map((unit) => (
+              <option key={unit} value={unit}>
+                {relativeUnitLabels[unit]}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+    );
+  }
+
+  if (filter.subject === 'deal_stage') {
+    return (
+      <label>
+        <span className="label">Значение</span>
+        <select className="select" value={filter.value} onChange={(event) => onPatch({ value: event.target.value })}>
+          <option value="">Выберите этап</option>
+          {allStages.map((stage) => (
+            <option key={stage.value} value={stage.value}>
+              {stage.label}
+            </option>
+          ))}
+        </select>
+      </label>
+    );
+  }
+
+  if (filter.subject === 'task_type') {
+    return (
+      <label>
+        <span className="label">Значение</span>
+        <select className="select" value={filter.value} onChange={(event) => onPatch({ value: event.target.value })}>
+          <option value="">Выберите тип задачи</option>
+          {taskTypes.map((type) => (
+            <option key={type.id} value={type.id}>
+              {type.name}
+            </option>
+          ))}
+        </select>
+      </label>
+    );
+  }
+
+  if (filter.subject === 'task_status') {
+    return (
+      <label>
+        <span className="label">Значение</span>
+        <select className="select" value={filter.value} onChange={(event) => onPatch({ value: event.target.value })}>
+          <option value="">Выберите статус</option>
+          {Object.entries(taskStatusLabels).map(([value, label]) => (
+            <option key={value} value={value}>
+              {label}
+            </option>
+          ))}
+        </select>
+      </label>
+    );
+  }
+
+  if (filter.subject === 'deal_responsible' || filter.subject === 'task_responsible') {
+    return (
+      <label>
+        <span className="label">Значение</span>
+        <select className="select" value={filter.value} onChange={(event) => onPatch({ value: event.target.value })}>
+          <option value="">Выберите менеджера</option>
+          {managers.map((manager) => (
+            <option key={manager.id} value={manager.id}>
+              {manager.name}
+            </option>
+          ))}
+        </select>
+      </label>
+    );
+  }
+
+  if (filter.subject === 'deal_group' || filter.subject === 'task_group') {
+    return (
+      <label>
+        <span className="label">Значение</span>
+        <select className="select" value={filter.value} onChange={(event) => onPatch({ value: event.target.value })}>
+          <option value="">Выберите группу</option>
+          {groups.map((group) => (
+            <option key={group.id} value={group.id}>
+              {group.name}
+            </option>
+          ))}
+        </select>
+      </label>
+    );
+  }
+
+  return (
+    <label>
+      <span className="label">Значение</span>
+      <input
+        className="field"
+        type={filter.subject === 'deal_amount' ? 'number' : 'text'}
+        value={filter.value}
+        onChange={(event) => onPatch({ value: event.target.value })}
+        placeholder={filter.subject === 'deal_amount' ? 'Например: 100000' : 'Введите значение'}
+      />
+    </label>
+  );
+}
+
+function filterSubjectsForEntity(entity: 'deal' | 'task'): ContractFilterSubject[] {
+  if (entity === 'task') {
+    return [
+      'task_type',
+      'task_status',
+      'task_due_at',
+      'task_created_at',
+      'task_updated_at',
+      'task_completed_at',
+      'task_text',
+      'task_responsible',
+      'task_group',
+    ];
+  }
+  return [
+    'deal_created_at',
+    'deal_updated_at',
+    'deal_closed_at',
+    'deal_expected_close_at',
+    'deal_amount',
+    'deal_stage',
+    'deal_responsible',
+    'deal_group',
+    'deal_field',
+    'last_note_created_at',
+    'last_note_text',
+  ];
+}
+
+function operatorsForSubject(subject: ContractFilterSubject): ContractFilterOperator[] {
+  if ([
+    'deal_created_at',
+    'deal_updated_at',
+    'deal_closed_at',
+    'deal_expected_close_at',
+    'last_note_created_at',
+    'task_created_at',
+    'task_updated_at',
+    'task_due_at',
+    'task_completed_at',
+  ].includes(subject)) {
+    return ['within_last', 'older_than', 'is_set'];
+  }
+  if (subject === 'deal_amount') return ['gt', 'gte', 'lt', 'lte', 'equals'];
+  if (subject === 'last_note_text' || subject === 'task_text') return ['contains', 'equals', 'is_set'];
+  if (subject === 'deal_field') return ['equals', 'contains', 'is_set', 'lt', 'lte', 'gt', 'gte'];
+  return ['equals', 'is_set'];
+}
+
+function defaultOperatorForSubject(subject: ContractFilterSubject): ContractFilterOperator {
+  if ([
+    'deal_created_at',
+    'deal_updated_at',
+    'deal_closed_at',
+    'deal_expected_close_at',
+    'last_note_created_at',
+    'task_created_at',
+    'task_updated_at',
+    'task_due_at',
+    'task_completed_at',
+  ].includes(subject)) {
+    return 'within_last';
+  }
+  if (subject === 'deal_amount') return 'gte';
+  if (subject === 'last_note_text' || subject === 'task_text') return 'contains';
+  return 'equals';
 }
 
 function RuleBuilder({
@@ -1793,6 +3056,855 @@ function RuleBuilder({
   );
 }
 
+function LeadSlaTab() {
+  const [data, setData] = useState<LeadSlaResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  const load = useCallback(async () => {
+    try {
+      const next = await api<LeadSlaResponse>('/platform/lead-sla');
+      setData(next);
+      setError('');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Не удалось загрузить SLA лидов');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+    const timer = window.setInterval(() => void load(), 15_000);
+    return () => window.clearInterval(timer);
+  }, [load]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const cards = data?.cards ?? [];
+
+  return (
+    <section className="grid gap-4">
+      <div className="page-head">
+        <div>
+          <h1 className="page-title">SLA лидов</h1>
+        </div>
+      </div>
+
+      {error && <div className="alert alert-error"><AlertCircle size={17} />{error}</div>}
+      {data?.warning && <div className="alert"><AlertCircle size={17} />{data.warning}</div>}
+
+      {loading && !data ? (
+        <div className="card p-5 text-sm text-[var(--pb-text-secondary)]">Загрузка лидов...</div>
+      ) : cards.length === 0 ? (
+        <div className="empty-state">
+          <Clock3 size={24} />
+          <div>
+            <strong>Активных лидов по SLA нет</strong>
+            <span>Сейчас нет сделок воронки продаж на этапе “Назначен ответственный”.</span>
+          </div>
+        </div>
+      ) : (
+        <div className="lead-sla-grid">
+          {cards.map((card) => {
+            const runtime = leadSlaRuntime(card, nowMs);
+            return (
+            <article key={card.dealId} className={`lead-sla-card lead-sla-${runtime.status}`}>
+              <div className="lead-sla-card-head">
+                <div className="min-w-0">
+                  <a className="lead-sla-title" href={card.dealUrl} target="_blank" rel="noreferrer" title={card.title}>
+                    {card.title}
+                  </a>
+                  <div className="lead-sla-meta">{card.pipelineName} · {card.stageName}</div>
+                </div>
+                <span className={`lead-sla-badge lead-sla-badge-${runtime.status}`}>{runtime.statusLabel}</span>
+              </div>
+
+              <div className="lead-sla-timer">
+                <span>{formatSlaClock(runtime.elapsedSeconds)}</span>
+                <small>из {formatSlaClock(runtime.totalSeconds)}</small>
+              </div>
+
+              <div className="lead-sla-progress" aria-label={`SLA ${runtime.progressPercent}%`}>
+                <div style={{ width: `${runtime.progressPercent}%` }} />
+              </div>
+
+              <div className="lead-sla-info">
+                <InfoRow label="Менеджер" value={card.managerName} />
+                <InfoRow label="Поступил" value={formatMoscowDateTime(card.createdAt)} />
+                <InfoRow label="Старт SLA" value={formatMoscowDateTime(card.startAt)} />
+                <InfoRow label="Дедлайн" value={formatMoscowDateTime(card.dueAt)} />
+              </div>
+            </article>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function leadSlaRuntime(card: LeadSlaCard, nowMs: number) {
+  const startMs = Date.parse(card.startAt);
+  const dueMs = Date.parse(card.dueAt);
+  const totalSeconds = Math.max(1, Math.round((dueMs - startMs) / 1000));
+  const elapsedSeconds = Math.max(0, Math.round((nowMs - startMs) / 1000));
+  const remainingSeconds = Math.max(0, Math.round((dueMs - nowMs) / 1000));
+  const progressPercent = Math.min(100, Math.max(0, Math.round((elapsedSeconds / totalSeconds) * 100)));
+  const status = nowMs < startMs
+    ? 'waiting'
+    : nowMs >= dueMs
+      ? 'overdue'
+      : remainingSeconds <= 5 * 60
+        ? 'warning'
+        : 'active';
+
+  return {
+    elapsedSeconds,
+    progressPercent,
+    status,
+    statusLabel: leadSlaStatusLabel(status),
+    totalSeconds,
+  };
+}
+
+function leadSlaStatusLabel(status: string) {
+  if (status === 'waiting') return 'Ждёт рабочего времени';
+  if (status === 'overdue') return 'Просрочен';
+  if (status === 'warning') return 'Скоро просрочится';
+  return 'В работе';
+}
+
+function formatSlaClock(seconds: number) {
+  const safeSeconds = Math.max(0, Math.round(Number(seconds) || 0));
+  const hours = Math.floor(safeSeconds / 3600);
+  const minutes = Math.floor((safeSeconds % 3600) / 60);
+  const rest = safeSeconds % 60;
+  const mmss = `${String(minutes).padStart(2, '0')}:${String(rest).padStart(2, '0')}`;
+  if (hours < 1) return mmss;
+  return `${String(hours).padStart(2, '0')}:${mmss}`;
+}
+
+function PlatformTab({ user, onMessage }: { user: User; onMessage: (message: string) => void }) {
+  const [telegramTemplates, setTelegramTemplates] = useState<TelegramTemplate[]>([]);
+  const [telegramTemplateDrafts, setTelegramTemplateDrafts] = useState<Record<string, string>>({});
+  const [telegramRecipientDrafts, setTelegramRecipientDrafts] = useState<Record<string, string[]>>({});
+  const [telegramRecipientModes, setTelegramRecipientModes] = useState<Record<string, TelegramRecipientMode>>({});
+  const [telegramTemplateSaveState, setTelegramTemplateSaveState] = useState<Record<string, 'saving' | 'saved' | 'error'>>({});
+  const [userLinks, setUserLinks] = useState<UserLinksResponse | null>(null);
+  const [userLinkDrafts, setUserLinkDrafts] = useState<Record<string, UserLinkDraft>>({});
+  const [userLinkSaveState, setUserLinkSaveState] = useState<Record<string, 'saving' | 'saved' | 'error'>>({});
+  const [crmTelegramLinks, setCrmTelegramLinks] = useState<CrmTelegramLinksResponse | null>(null);
+  const [crmTelegramActionState, setCrmTelegramActionState] = useState<Record<string, 'saving' | 'saved' | 'error'>>({});
+  const [loading, setLoading] = useState(true);
+  const isAdmin = user.role === 'ADMIN';
+
+  const reload = useCallback(async () => {
+    setLoading(true);
+    const [nextTelegramTemplates, nextUserLinks, nextCrmTelegramLinks] = await Promise.all([
+      isAdmin ? api<TelegramTemplate[]>('/platform/telegram/templates') : Promise.resolve([]),
+      isAdmin ? api<UserLinksResponse>('/platform/admin/user-links') : Promise.resolve(null),
+      api<CrmTelegramLinksResponse>('/platform/telegram/crm-users').catch(() => null),
+    ]);
+    setTelegramTemplates(nextTelegramTemplates);
+    setTelegramTemplateDrafts(Object.fromEntries(nextTelegramTemplates.map((template) => [template.eventType, String(template.body ?? '')])));
+    setTelegramRecipientDrafts(Object.fromEntries(nextTelegramTemplates.map((template) => [
+      template.eventType,
+      (template.recipients ?? []).map((recipient) => recipientValue(recipient)),
+    ])));
+    setTelegramRecipientModes(Object.fromEntries(nextTelegramTemplates.map((template) => [
+      template.eventType,
+      template.recipientsMode ?? ((template.recipients ?? []).length ? 'custom' : 'default'),
+    ])));
+    setUserLinks(nextUserLinks);
+    setCrmTelegramLinks(nextCrmTelegramLinks);
+    if (nextUserLinks) {
+      setUserLinkDrafts(Object.fromEntries(nextUserLinks.users.map((item) => [
+        item.id,
+        {
+          businessRole: item.businessRole,
+          crmUserId: item.crmUserId ?? '',
+        },
+      ])));
+    }
+    setLoading(false);
+  }, [isAdmin]);
+
+  useEffect(() => {
+    void reload().catch((error) => {
+      setLoading(false);
+      onMessage(error instanceof Error ? error.message : 'Не удалось загрузить Telegram');
+    });
+  }, [reload, onMessage]);
+
+  async function saveTelegramTemplate(eventType: string) {
+    setTelegramTemplateSaveState((current) => ({ ...current, [eventType]: 'saving' }));
+    try {
+      await api(`/platform/telegram/templates/${encodeURIComponent(eventType)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          body: telegramTemplateDrafts[eventType] ?? '',
+          recipientsMode: telegramRecipientModes[eventType] ?? 'default',
+          recipients: (telegramRecipientDrafts[eventType] ?? []).map(parseRecipientValue).filter(Boolean),
+        }),
+      });
+      await reload();
+      setTelegramTemplateSaveState((current) => ({ ...current, [eventType]: 'saved' }));
+      onMessage('Шаблон Telegram сохранён');
+    } catch (error) {
+      setTelegramTemplateSaveState((current) => ({ ...current, [eventType]: 'error' }));
+      onMessage(error instanceof Error ? error.message : 'Шаблон Telegram не сохранён');
+    }
+  }
+
+  async function saveUserLink(userId: string) {
+    const draft = userLinkDrafts[userId];
+    if (!draft) return;
+    setUserLinkSaveState((current) => ({ ...current, [userId]: 'saving' }));
+    try {
+      await api(`/platform/admin/user-links/${encodeURIComponent(userId)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          businessRole: draft.businessRole,
+          crmUserId: draft.crmUserId || null,
+        }),
+      });
+      await reload();
+      setUserLinkSaveState((current) => ({ ...current, [userId]: 'saved' }));
+      onMessage('Пользователь сохранён');
+    } catch (error) {
+      setUserLinkSaveState((current) => ({ ...current, [userId]: 'error' }));
+      onMessage(error instanceof Error ? error.message : 'Пользователь не сохранён');
+    }
+  }
+
+  async function createCrmTelegramCode(crmUserId: string) {
+    setCrmTelegramActionState((current) => ({ ...current, [crmUserId]: 'saving' }));
+    try {
+      await api(`/platform/telegram/crm-users/${encodeURIComponent(crmUserId)}/link-code`, { method: 'POST' });
+      await reload();
+      setCrmTelegramActionState((current) => ({ ...current, [crmUserId]: 'saved' }));
+      onMessage('Код Telegram для менеджера создан');
+    } catch (error) {
+      setCrmTelegramActionState((current) => ({ ...current, [crmUserId]: 'error' }));
+      onMessage(error instanceof Error ? error.message : 'Код Telegram не создан');
+    }
+  }
+
+  async function disconnectCrmTelegram(crmUserId: string) {
+    setCrmTelegramActionState((current) => ({ ...current, [crmUserId]: 'saving' }));
+    try {
+      await api(`/platform/telegram/crm-users/${encodeURIComponent(crmUserId)}/link`, { method: 'DELETE' });
+      await reload();
+      setCrmTelegramActionState((current) => ({ ...current, [crmUserId]: 'saved' }));
+      onMessage('Telegram менеджера отключён');
+    } catch (error) {
+      setCrmTelegramActionState((current) => ({ ...current, [crmUserId]: 'error' }));
+      onMessage(error instanceof Error ? error.message : 'Telegram не отключён');
+    }
+  }
+
+  return (
+    <>
+      <div className="page-row">
+        <div>
+          <h1 className="page-title">Telegram</h1>
+          <p className="page-description">Пользователи, роли, Telegram и правила доставки уведомлений.</p>
+        </div>
+        <button className="btn" type="button" onClick={() => void reload()} disabled={loading}>
+          <RefreshCw size={15} />
+          Обновить
+        </button>
+      </div>
+
+      {isAdmin && (
+        <>
+          <UserLinksPanel
+            userLinks={userLinks}
+            userLinkDrafts={userLinkDrafts}
+            userLinkSaveState={userLinkSaveState}
+            setUserLinkDrafts={setUserLinkDrafts}
+            setUserLinkSaveState={setUserLinkSaveState}
+            onSaveUserLink={saveUserLink}
+          />
+        </>
+      )}
+
+      <CrmTelegramLinksPanel
+        crmTelegramLinks={crmTelegramLinks}
+        actionState={crmTelegramActionState}
+        onCreateCode={createCrmTelegramCode}
+        onDisconnect={disconnectCrmTelegram}
+      />
+
+      {isAdmin && (
+        <section className="card">
+          <div className="card-header">
+            <div className="card-title">Telegram-уведомления</div>
+          </div>
+          <div className="card-body grid gap-4">
+            {telegramTemplates.length === 0 && <div className="muted text-sm">Шаблоны уведомлений пока не загружены.</div>}
+            {telegramTemplates.map((template) => (
+              <div className="grid gap-3" key={template.eventType}>
+                <label className="label">{template.name}</label>
+                <TelegramRecipientsSelect
+                  mode={telegramRecipientModes[template.eventType] ?? 'default'}
+                  value={telegramRecipientDrafts[template.eventType] ?? []}
+                  userLinks={userLinks}
+                  crmTelegramLinks={crmTelegramLinks}
+                  onModeChange={(nextMode) => {
+                    setTelegramRecipientModes((current) => ({
+                      ...current,
+                      [template.eventType]: nextMode,
+                    }));
+                    setTelegramTemplateSaveState((current) => {
+                      const next = { ...current };
+                      delete next[template.eventType];
+                      return next;
+                    });
+                  }}
+                  onChange={(nextValue) => {
+                    setTelegramRecipientDrafts((current) => ({
+                      ...current,
+                      [template.eventType]: nextValue,
+                    }));
+                    setTelegramTemplateSaveState((current) => {
+                      const next = { ...current };
+                      delete next[template.eventType];
+                      return next;
+                    });
+                  }}
+                />
+                <textarea
+                  className="field min-h-[96px]"
+                  value={telegramTemplateDrafts[template.eventType] ?? ''}
+                  onChange={(event) => {
+                    setTelegramTemplateDrafts((current) => ({
+                      ...current,
+                      [template.eventType]: event.target.value,
+                    }));
+                    setTelegramTemplateSaveState((current) => {
+                      const next = { ...current };
+                      delete next[template.eventType];
+                      return next;
+                    });
+                  }}
+                />
+                <div className="text-xs text-[var(--pb-text-secondary)]">
+                  Вставки: {'{managerMention}'}, {'{dealUrl}'}, {'{deal}'}, {'{manager}'}, {'{amount}'}, {'{stage}'}, {'{pipeline}'}, {'{group}'}
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    className="btn btn-primary"
+                    type="button"
+                    disabled={telegramTemplateSaveState[template.eventType] === 'saving'}
+                    onClick={() => saveTelegramTemplate(template.eventType)}
+                  >
+                    <Save size={15} />
+                    {telegramTemplateSaveState[template.eventType] === 'saving' ? 'Сохраняю...' : 'Сохранить'}
+                  </button>
+                  {telegramTemplateSaveState[template.eventType] === 'saved' && <span className="badge badge-green">Сохранено</span>}
+                  {telegramTemplateSaveState[template.eventType] === 'error' && <span className="badge badge-red">Не сохранено</span>}
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+    </>
+  );
+}
+
+function TelegramRecipientsSelect({
+  mode,
+  value,
+  userLinks,
+  crmTelegramLinks,
+  onModeChange,
+  onChange,
+}: {
+  mode: TelegramRecipientMode;
+  value: string[];
+  userLinks: UserLinksResponse | null;
+  crmTelegramLinks: CrmTelegramLinksResponse | null;
+  onModeChange: (mode: TelegramRecipientMode) => void;
+  onChange: (value: string[]) => void;
+}) {
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState('');
+  const options = telegramRecipientOptions(userLinks, crmTelegramLinks);
+  const activeValue = mode === 'custom' ? value : [];
+  const selected = new Set(activeValue);
+  const selectedOptions = options.filter((option) => selected.has(option.value));
+  const filteredOptions = options.filter((option) =>
+    option.label.toLowerCase().includes(search.trim().toLowerCase()),
+  );
+  const buttonText = mode === 'default'
+    ? 'По системному правилу'
+    : selectedOptions.length === 0
+      ? 'Никому'
+      : selectedOptions.length === 1
+        ? selectedOptions[0].label
+        : `${selectedOptions.length} получателя`;
+  const hint = mode === 'default'
+    ? 'Работает системная логика доставки.'
+    : selectedOptions.length === 0
+      ? 'Уведомление отключено: получателей нет.'
+      : 'Уведомление уйдёт только выбранным.';
+
+  useEffect(() => {
+    if (!open) return undefined;
+
+    function handlePointerDown(event: PointerEvent) {
+      if (rootRef.current && !rootRef.current.contains(event.target as Node)) setOpen(false);
+    }
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') setOpen(false);
+    }
+
+    document.addEventListener('pointerdown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [open]);
+
+  function toggleRecipient(optionValue: string) {
+    const currentValue = mode === 'custom' ? value : [];
+    const currentSelected = new Set(currentValue);
+    onModeChange('custom');
+    onChange(currentSelected.has(optionValue) ? currentValue.filter((item) => item !== optionValue) : [...currentValue, optionValue]);
+  }
+
+  return (
+    <div className="telegram-recipient-dropdown" ref={rootRef}>
+      <label className="label">Кому</label>
+      <button
+        className={`telegram-recipient-trigger ${mode === 'custom' && selectedOptions.length === 0 ? 'empty' : ''}`}
+        type="button"
+        aria-expanded={open}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <span>{buttonText}</span>
+        <ChevronDown size={15} />
+      </button>
+      <div className="telegram-recipient-hint">{hint}</div>
+      {open && (
+        <div className="telegram-recipient-panel">
+          <div className="telegram-recipient-actions">
+            <button className={mode === 'default' ? 'active' : ''} type="button" onClick={() => onModeChange('default')}>
+              По умолчанию
+            </button>
+            <button
+              className={mode === 'custom' && selectedOptions.length === 0 ? 'active danger' : ''}
+              type="button"
+              onClick={() => {
+                onModeChange('custom');
+                onChange([]);
+              }}
+            >
+              Никому
+            </button>
+          </div>
+          <input
+            className="telegram-recipient-search"
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder="Найти получателя"
+          />
+          <div className="telegram-recipient-list">
+            {filteredOptions.length === 0 && <div className="telegram-recipient-empty">Подключённых получателей нет</div>}
+            {filteredOptions.map((option) => (
+              <label className="telegram-recipient-row" key={option.value}>
+                <input
+                  checked={mode === 'custom' && selected.has(option.value)}
+                  type="checkbox"
+                  onChange={() => toggleRecipient(option.value)}
+                />
+                <span>{option.label}</span>
+              </label>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function UserLinksPanel({
+  userLinks,
+  userLinkDrafts,
+  userLinkSaveState,
+  setUserLinkDrafts,
+  setUserLinkSaveState,
+  onSaveUserLink,
+}: {
+  userLinks: UserLinksResponse | null;
+  userLinkDrafts: Record<string, UserLinkDraft>;
+  userLinkSaveState: Record<string, 'saving' | 'saved' | 'error'>;
+  setUserLinkDrafts: Dispatch<SetStateAction<Record<string, UserLinkDraft>>>;
+  setUserLinkSaveState: Dispatch<SetStateAction<Record<string, 'saving' | 'saved' | 'error'>>>;
+  onSaveUserLink: (userId: string) => Promise<void>;
+}) {
+  return (
+    <section className="card">
+      <div className="card-header">
+        <div>
+          <div className="card-title">Пользователи и роли</div>
+          <div className="mt-1 text-sm text-[var(--pb-text-secondary)]">
+            Здесь задаётся связка: аккаунт платформы, человек в amoCRM, роль в сервисе и Telegram.
+          </div>
+        </div>
+      </div>
+      <div className="card-body">
+        {!userLinks ? (
+          <div className="muted text-sm">Загрузка пользователей...</div>
+        ) : userLinks.users.length === 0 ? (
+          <div className="empty-state">Пользователей платформы пока нет.</div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="table admin-user-links-table">
+              <thead>
+                <tr>
+                  <th>Аккаунт платформы</th>
+                  <th>Роль</th>
+                  <th>Аккаунт amoCRM</th>
+                  <th>Telegram</th>
+                  <th>Сохранение</th>
+                </tr>
+              </thead>
+              <tbody>
+                {userLinks.users.map((item) => {
+                  const draft = userLinkDrafts[item.id] ?? {
+                    businessRole: item.businessRole,
+                    crmUserId: item.crmUserId ?? '',
+                  };
+                  const telegramLabel = telegramAccountLabel(item.telegramAccount);
+                  const saveState = userLinkSaveState[item.id];
+                  return (
+                    <tr key={item.id}>
+                      <td>
+                        <div className="font-bold text-[var(--pb-text-primary)]">{item.name}</div>
+                        <div className="text-xs text-[var(--pb-text-secondary)]">{item.email}</div>
+                        <div className="mt-1 text-xs text-[var(--pb-text-muted)]">
+                          Доступ: {platformAccessLabel(item.role)}
+                        </div>
+                      </td>
+                      <td>
+                        <select
+                          className="select admin-link-select"
+                          value={draft.businessRole}
+                          onChange={(event) => {
+                            const businessRole = event.target.value as PlatformBusinessRole;
+                            setUserLinkDrafts((current) => ({
+                              ...current,
+                              [item.id]: { ...draft, businessRole },
+                            }));
+                            setUserLinkSaveState((current) => {
+                              const next = { ...current };
+                              delete next[item.id];
+                              return next;
+                            });
+                          }}
+                        >
+                          <option value="OWNER">Владелец</option>
+                          <option value="ROP">РОП</option>
+                          <option value="MANAGER">Менеджер</option>
+                        </select>
+                      </td>
+                      <td>
+                        <select
+                          className="select admin-link-select"
+                          value={draft.crmUserId}
+                          onChange={(event) => {
+                            setUserLinkDrafts((current) => ({
+                              ...current,
+                              [item.id]: { ...draft, crmUserId: event.target.value },
+                            }));
+                            setUserLinkSaveState((current) => {
+                              const next = { ...current };
+                              delete next[item.id];
+                              return next;
+                            });
+                          }}
+                        >
+                          <option value="">Не выбран</option>
+                          {item.crmUser && !userLinks.crmUsers.some((crmUser) => crmUser.id === item.crmUser?.id) && (
+                            <option value={item.crmUser.id}>{crmUserOptionLabel(item.crmUser)}</option>
+                          )}
+                          {userLinks.crmUsers.map((crmUser) => (
+                            <option key={crmUser.id} value={crmUser.id}>
+                              {crmUserOptionLabel(crmUser)}
+                            </option>
+                          ))}
+                        </select>
+                      </td>
+                      <td>
+                        <span className={`badge ${item.telegramAccount?.isActive ? 'badge-green' : 'badge-yellow'}`}>
+                          {telegramLabel}
+                        </span>
+                      </td>
+                      <td>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <button
+                            className="btn"
+                            type="button"
+                            disabled={saveState === 'saving'}
+                            onClick={() => onSaveUserLink(item.id)}
+                          >
+                            <Save size={15} />
+                            {saveState === 'saving' ? 'Сохраняю...' : 'Сохранить'}
+                          </button>
+                          {saveState === 'saved' && <span className="badge badge-green">Сохранено</span>}
+                          {saveState === 'error' && <span className="badge badge-red">Ошибка</span>}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function CrmTelegramLinksPanel({
+  crmTelegramLinks,
+  actionState,
+  onCreateCode,
+  onDisconnect,
+}: {
+  crmTelegramLinks: CrmTelegramLinksResponse | null;
+  actionState: Record<string, 'saving' | 'saved' | 'error'>;
+  onCreateCode: (crmUserId: string) => Promise<void>;
+  onDisconnect: (crmUserId: string) => Promise<void>;
+}) {
+  return (
+    <section className="card">
+      <div className="card-header">
+        <div>
+          <div className="card-title">Telegram менеджеров</div>
+          <div className="mt-1 text-sm text-[var(--pb-text-secondary)]">
+            Менеджер отправляет код боту в личку. Доступ в платформу ему не нужен.
+          </div>
+        </div>
+      </div>
+      <div className="card-body">
+        {!crmTelegramLinks ? (
+          <div className="muted text-sm">Нет доступа к списку менеджеров или не задана связка с amoCRM.</div>
+        ) : crmTelegramLinks.crmUsers.length === 0 ? (
+          <div className="empty-state">Нет активных менеджеров amoCRM.</div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="table crm-telegram-links-table">
+              <thead>
+                <tr>
+                  <th>Менеджер amoCRM</th>
+                  <th>Группа</th>
+                  <th>Telegram</th>
+                  <th>Код</th>
+                  <th>Действие</th>
+                </tr>
+              </thead>
+              <tbody>
+                {crmTelegramLinks.crmUsers.map((item) => {
+                  const state = actionState[item.id];
+                  return (
+                    <tr key={item.id}>
+                      <td>
+                        <div className="font-bold text-[var(--pb-text-primary)]">{item.name}</div>
+                        {item.email && <div className="text-xs text-[var(--pb-text-secondary)]">{item.email}</div>}
+                      </td>
+                      <td>{item.group?.name ?? '-'}</td>
+                      <td>
+                        <span className={`badge ${item.telegramAccount?.isActive ? 'badge-green' : 'badge-yellow'}`}>
+                          {telegramAccountLabel(item.telegramAccount)}
+                        </span>
+                      </td>
+                      <td>
+                        {item.activeCode?.code ? (
+                          <div>
+                            <div className="mono-num font-bold">{item.activeCode.code}</div>
+                            <div className="text-xs text-[var(--pb-text-secondary)]">/start {item.activeCode.code}</div>
+                          </div>
+                        ) : (
+                          '-'
+                        )}
+                      </td>
+                      <td>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <button
+                            className="btn"
+                            type="button"
+                            disabled={state === 'saving'}
+                            onClick={() => onCreateCode(item.id)}
+                          >
+                            <Plus size={15} />
+                            {state === 'saving' ? 'Создаю...' : 'Выдать код'}
+                          </button>
+                          {item.telegramAccount?.isActive && (
+                            <button
+                              className="btn"
+                              type="button"
+                              disabled={state === 'saving'}
+                              onClick={() => onDisconnect(item.id)}
+                            >
+                              <Trash2 size={15} />
+                              Отключить
+                            </button>
+                          )}
+                          {state === 'saved' && <span className="badge badge-green">Готово</span>}
+                          {state === 'error' && <span className="badge badge-red">Ошибка</span>}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function telegramRecipientOptions(userLinks: UserLinksResponse | null, crmTelegramLinks: CrmTelegramLinksResponse | null) {
+  const platformOptions = (userLinks?.users ?? [])
+    .filter((item) => item.telegramAccount?.isActive)
+    .map((item) => ({
+      value: recipientValue({ kind: 'platform_user', id: item.id }),
+      label: `${item.name} · платформа · ${telegramAccountLabel(item.telegramAccount)}`,
+    }));
+  const crmOptions = (crmTelegramLinks?.crmUsers ?? [])
+    .filter((item) => item.telegramAccount?.isActive)
+    .map((item) => ({
+      value: recipientValue({ kind: 'crm_user', id: item.id }),
+      label: `${item.name} · ${item.group?.name ?? 'amoCRM'} · ${telegramAccountLabel(item.telegramAccount)}`,
+    }));
+  return [...platformOptions, ...crmOptions];
+}
+
+function recipientValue(recipient: TelegramTemplateRecipient) {
+  return `${recipient.kind}:${recipient.id}`;
+}
+
+function parseRecipientValue(value: string): TelegramTemplateRecipient | null {
+  const [kind, id] = value.split(':');
+  if ((kind !== 'platform_user' && kind !== 'crm_user') || !id) return null;
+  return { kind, id };
+}
+const planMetricOptions = [
+  { value: 'closed_amount', label: 'Выручка закрытых сделок', unit: 'rub' },
+  { value: 'closed_deal_count', label: 'Закрытые сделки', unit: 'number' },
+  { value: 'deal_amount', label: 'Сумма созданных сделок', unit: 'rub' },
+  { value: 'deal_count', label: 'Созданные сделки', unit: 'number' },
+  { value: 'task_count', label: 'Задачи', unit: 'number' },
+];
+
+function getAlertMetricOptions(template?: ReportTemplate) {
+  const contractMetrics = template?.config?.contract?.metrics ?? [];
+  const metrics = contractMetrics.map((metric) => ({ value: metric.id, label: metric.label }));
+  return [
+    { value: 'summary.count', label: 'Количество' },
+    { value: 'summary.totalAmount', label: 'Сумма' },
+    { value: 'summary.avgAmount', label: 'Средний чек' },
+    ...metrics,
+  ];
+}
+
+function getPlanTargetName(targetType: string, targetId: string, options: Options | null) {
+  if (targetType === 'MANAGER') return options?.managers.find((manager) => manager.id === targetId)?.name ?? null;
+  if (targetType === 'GROUP') return options?.groups.find((group) => group.id === targetId)?.name ?? null;
+  return 'Компания';
+}
+
+function severityLabel(severity: QualityRule['severity']) {
+  if (severity === 'CRITICAL') return 'критично';
+  if (severity === 'WARNING') return 'важно';
+  return 'инфо';
+}
+
+function severityClass(severity: QualityRule['severity']) {
+  if (severity === 'CRITICAL') return 'badge-red';
+  if (severity === 'WARNING') return 'badge-yellow';
+  return 'badge-blue';
+}
+
+function platformAccessLabel(role: UserRole) {
+  return role === 'ADMIN' ? 'админ' : 'пользователь';
+}
+
+function businessRoleLabel(role?: PlatformBusinessRole) {
+  if (role === 'OWNER') return 'Владелец';
+  if (role === 'ROP') return 'РОП';
+  return 'Менеджер';
+}
+
+function crmUserOptionLabel(user: LinkedCrmUser) {
+  return [
+    user.name,
+    user.group?.name ? `группа: ${user.group.name}` : null,
+    user.email,
+  ].filter(Boolean).join(' · ');
+}
+
+function telegramAccountLabel(account?: TelegramAccountSummary | null) {
+  if (!account?.isActive) return 'не подключен';
+  if (account.username) return `@${account.username.replace(/^@/, '')}`;
+  const name = [account.firstName, account.lastName].filter(Boolean).join(' ').trim();
+  return name || 'подключен';
+}
+
+function MiniStat({ label, value, tone }: { label: string; value: string | number; tone: 'green' | 'yellow' | 'red' | 'blue' }) {
+  const toneLabel = tone === 'green' ? 'ок' : tone === 'red' ? 'внимание' : tone === 'yellow' ? 'настройка' : 'активно';
+  return (
+    <div className="card p-4">
+      <div className="text-xs font-bold uppercase text-[var(--pb-text-secondary)]">{label}</div>
+      <div className="mt-2 flex items-center justify-between gap-3">
+        <div className="text-2xl font-bold">{value}</div>
+        <span className={`badge badge-${tone}`}>{toneLabel}</span>
+      </div>
+    </div>
+  );
+}
+
+function CompactTable({ columns, rows, empty }: { columns: string[]; rows: Array<Array<ReactNode>>; empty: string }) {
+  if (!rows.length) return <div className="empty-state">{empty}</div>;
+  return (
+    <div className="overflow-x-auto">
+      <table className="table min-w-full">
+        <thead>
+          <tr>
+            {columns.map((column) => (
+              <th key={column}>{column}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, rowIndex) => (
+            <tr key={rowIndex}>
+              {row.map((cell, cellIndex) => (
+                <td key={`${rowIndex}-${cellIndex}`}>{cell}</td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function IntegrationTab({
   connection,
   onMessage,
@@ -1831,6 +3943,17 @@ function IntegrationTab({
     onMessage(type === 'FULL' ? 'Полная синхронизация запущена' : 'Инкрементальная синхронизация запущена');
   }
 
+  const hasConnection = Boolean(connection?.subdomain);
+  const syncDisabled = !hasConnection || connection?.status === 'SYNCING';
+  const connectionStatusText =
+    connection?.status === 'ACTIVE'
+      ? 'подключено'
+      : connection?.status === 'SYNCING'
+        ? 'синхронизация'
+        : connection?.status === 'ERROR'
+          ? 'ошибка синхронизации'
+          : 'не подключено';
+
   return (
     <>
       <div className="page-row">
@@ -1843,8 +3966,8 @@ function IntegrationTab({
         <section className="card">
           <div className="card-header">
             <div className="card-title">Подключение</div>
-            <span className={`badge ${connection?.status === 'ACTIVE' ? 'badge-green' : 'badge-yellow'}`}>
-              {connection?.status ?? 'не подключено'}
+            <span className={`badge ${connection?.status === 'ACTIVE' || connection?.status === 'SYNCING' ? 'badge-green' : 'badge-yellow'}`}>
+              {connectionStatusText}
             </span>
           </div>
           <div className="card-body grid gap-4">
@@ -1862,7 +3985,7 @@ function IntegrationTab({
                 <PlugZap size={15} />
                 Получить OAuth URL
               </button>
-              <button className="btn" type="button" onClick={() => sync('FULL')} disabled={connection?.status !== 'ACTIVE'}>
+              <button className="btn" type="button" onClick={() => sync('FULL')} disabled={syncDisabled}>
                 <Database size={15} />
                 Полная синхронизация
               </button>
@@ -1891,7 +4014,7 @@ function IntegrationTab({
             <InfoRow label="Последняя полная синхронизация" value={formatDateTime(connection?.lastFullSyncAt)} />
             <InfoRow label="Последняя инкрементальная" value={formatDateTime(connection?.lastIncrementalSyncAt)} />
             <InfoRow label="Webhook URL" value={connection?.webhookUrl ?? '-'} />
-            <button className="btn" type="button" onClick={() => sync('INCREMENTAL')} disabled={connection?.status !== 'ACTIVE'}>
+            <button className="btn" type="button" onClick={() => sync('INCREMENTAL')} disabled={syncDisabled}>
               <RefreshCw size={15} />
               Обновить данные сейчас
             </button>
@@ -2252,66 +4375,105 @@ function FieldCombobox({
   );
 }
 
-function ReportResultDetails({ result, template }: { result: Record<string, any> | null; template: ReportTemplate }) {
+function ReportResultDetails({
+  amoDomain = '',
+  result,
+  template,
+}: {
+  amoDomain?: string;
+  result: Record<string, any> | null;
+  template: ReportTemplate;
+}) {
   if (!result) return <div className="muted text-sm">Нет данных для отображения.</div>;
+
+  if (result.type === 'dealCycle' || result.type === 'dealStageAge') {
+    return <DealCycleReport amoDomain={amoDomain} result={result} />;
+  }
 
   if (result.type === 'contract') {
     const rows = (result.rows ?? []) as Array<Record<string, any>>;
     const metrics = (result.metrics ?? []) as ContractMetricPayload[];
     const conversions = (result.conversions ?? []) as ContractConversionDraft[];
     const durations = (result.durations ?? []) as ContractDurationDraft[];
+    const summaryRows = (result.summaryRows ?? []) as Array<Record<string, any>>;
+    const summary = summaryRows[0];
+    const columns = [
+      ...rows.map((row) => ({ id: String(row.groupId), label: String(row.groupName), row, summary: null as Record<string, any> | null })),
+      ...(summary ? [{ id: String(summary.id), label: String(summary.label), row: null as Record<string, any> | null, summary }] : []),
+    ];
+
+    if (columns.length === 0 || (metrics.length === 0 && conversions.length === 0 && durations.length === 0)) {
+      return <div className="muted text-sm">Нет данных для отображения.</div>;
+    }
+
     return (
-      <div className="grid gap-4">
-        {rows.map((row) => (
-          <div key={String(row.groupId)} className="rounded-[10px] border border-[var(--pb-border)] bg-white p-3">
-            <div className="mb-3 flex items-center justify-between gap-3">
-              <div className="font-semibold">{String(row.groupName)}</div>
-              <span className="badge">{metrics.length} показателей</span>
-            </div>
-            <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
-              {metrics.map((metric) => {
-                const value = (row.metrics as Record<string, any>)?.[metric.id] ?? {};
-                return (
-                  <div key={metric.id} className="rounded-[8px] bg-[var(--pb-bg)] p-3">
-                    <div className="truncate text-xs font-bold uppercase text-[var(--pb-text-secondary)]" title={metric.label}>
-                      {metric.label}
-                    </div>
-                    <div className="mt-2 mono-num text-2xl font-bold">{formatMetricValue(value.value, value.unit)}</div>
-                    {metric.type !== 'conversion' && (
-                      <div className="mt-1 text-xs text-[var(--pb-text-secondary)]">
-                        Сделок в выборке: {formatNumber(value.dealCount ?? 0)}
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-            {(conversions.length > 0 || durations.length > 0) && (
-              <div className="mt-3 grid gap-2 md:grid-cols-2">
-                {conversions.map((conversion) => {
-                  const value = (row.conversions as Record<string, any>)?.[conversion.id] ?? {};
+      <div className="report-matrix-wrap">
+        <table className="report-matrix">
+          <thead>
+            <tr>
+              <th>Показатель</th>
+              {columns.map((column) => (
+                <th key={column.id} className={column.summary ? 'summary-col' : undefined} title={column.label}>
+                  {column.label}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {metrics.map((metric) => (
+              <tr key={metric.id}>
+                <th title={metric.label}>{metric.label}</th>
+                {columns.map((column) => {
+                  const source = column.summary ? column.summary.metrics : column.row?.metrics;
+                  const value = (source as Record<string, any>)?.[metric.id] ?? {};
                   return (
-                    <InfoRow
-                      key={conversion.id}
-                      label={conversion.label}
-                      value={value.conversion == null ? 'нет данных' : `${formatNumber(value.conversion)}%`}
-                    />
+                    <td key={`${column.id}-${metric.id}`} className={column.summary ? 'summary-col mono-num' : 'mono-num'}>
+                      {formatMetricValue(value.value, value.unit ?? metric.display)}
+                    </td>
                   );
                 })}
-                {durations.map((duration) => {
-                  const value = (row.durations as Record<string, any>)?.[duration.id] ?? {};
+              </tr>
+            ))}
+            {conversions.map((conversion) => (
+              <tr key={conversion.id}>
+                <th title={conversion.label}>{conversion.label}</th>
+                {columns.map((column) => {
+                  if (column.summary) return <td key={`${column.id}-${conversion.id}`} className="summary-col muted">-</td>;
+                  const value = (column.row?.conversions as Record<string, any>)?.[conversion.id] ?? {};
                   return (
-                    <InfoRow
-                      key={duration.id}
-                      label={duration.label}
-                      value={value.avgDays == null ? 'нет данных' : `${formatNumber(value.avgDays)} дн.`}
-                    />
+                    <td key={`${column.id}-${conversion.id}`} className="mono-num">
+                      {value.conversion == null ? 'нет данных' : `${formatNumber(value.conversion)}%`}
+                    </td>
                   );
                 })}
-              </div>
+              </tr>
+            ))}
+            {durations.map((duration) => (
+              <tr key={duration.id}>
+                <th title={duration.label}>{duration.label}</th>
+                {columns.map((column) => {
+                  if (column.summary) return <td key={`${column.id}-${duration.id}`} className="summary-col muted">-</td>;
+                  const value = (column.row?.durations as Record<string, any>)?.[duration.id] ?? {};
+                  return (
+                    <td key={`${column.id}-${duration.id}`} className="mono-num">
+                      {formatDurationFromDays(value.avgDays)}
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+            {rows.some((row) => row.rowTotal) && (
+              <tr>
+                <th>Итог по менеджеру</th>
+                {columns.map((column) => (
+                  <td key={`${column.id}-row-total`} className={column.summary ? 'summary-col mono-num' : 'mono-num'}>
+                    {column.row?.rowTotal ? formatNumber(column.row.rowTotal.value) : '-'}
+                  </td>
+                ))}
+              </tr>
             )}
-          </div>
-        ))}
+          </tbody>
+        </table>
       </div>
     );
   }
@@ -2325,6 +4487,10 @@ function ReportResultDetails({ result, template }: { result: Record<string, any>
         <InfoRow label="Плечо отгрузки" value={formatDays(forecast.shippingShoulder?.medianDays ?? forecast.shippingShoulder?.avgDays)} />
       </div>
     );
+  }
+
+  if (result.type === 'revenueProfitForecast') {
+    return <RevenueProfitForecastReport amoDomain={amoDomain} result={result} />;
   }
 
   if (result.type === 'conversion') {
@@ -2393,7 +4559,339 @@ function ReportResultDetails({ result, template }: { result: Record<string, any>
     );
   }
 
-  return <div className="muted text-sm">Сделок в выборке: {(result.summary?.count ?? 0) as number}</div>;
+  return <div className="muted text-sm">Всего сделок: {(result.summary?.count ?? 0) as number}</div>;
+}
+
+type DealCycleStage = {
+  stageId: string;
+  stageName: string;
+  color?: string | null;
+  avgDays: number | null;
+  sampleSize: number;
+  samples?: Array<{ dealId: string; dealExternalId?: string; dealTitle: string; durationDays: number }>;
+};
+
+type DealCycleRow = {
+  managerId: string;
+  managerName: string;
+  totalDeals: number;
+  stages: DealCycleStage[];
+  successCycle?: { avgDays: number | null; sampleSize: number };
+  lostCycle?: { avgDays: number | null; sampleSize: number };
+};
+
+type RevenueForecastDeal = {
+  dealId: string;
+  dealExternalId?: string;
+  title: string;
+  manager: string;
+  stage: string;
+  source: string;
+  probabilityPercent: number;
+  amount: number;
+  revenue: number;
+  profit: number | null;
+  predictedShipAt: string | null;
+};
+
+type RevenueForecastRow = {
+  id: string;
+  label: string;
+  count: number;
+  revenue: number;
+  profit: number | null;
+  deals: RevenueForecastDeal[];
+};
+
+function RevenueProfitForecastReport({ amoDomain, result }: { amoDomain: string; result: Record<string, any> }) {
+  const rows = (result.rows ?? []) as RevenueForecastRow[];
+  const summary = result.summary ?? {};
+  const shippingCycle = result.shippingCycle ?? {};
+  const profitAvailable = Boolean(result.profit?.available);
+  const profitBasis = String(result.profit?.basis ?? '32% от суммы сделки');
+  const warnings = (result.warnings ?? []) as string[];
+  const [expandedRows, setExpandedRows] = useState<Record<string, boolean>>({});
+
+  if (result.ready === false) {
+    return (
+      <div className="grid gap-3">
+        {(warnings.length ? warnings : ['Не удалось найти нужные воронки или этапы для расчёта.']).map((warning) => (
+          <div key={warning} className="badge badge-red justify-start">
+            <AlertCircle size={14} />
+            {warning}
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  return (
+    <div className="revenue-forecast-report">
+      <div className="revenue-forecast-summary">
+        <div className="revenue-forecast-card">
+          <span>До конца месяца</span>
+          <strong className="mono-num">{formatMoney(summary.revenue)}</strong>
+          <small>{formatNumber(summary.count ?? 0)} сделок</small>
+        </div>
+        <div className="revenue-forecast-card">
+          <span>Прибыль</span>
+          <strong className="mono-num">{profitAvailable ? formatMoney(summary.profit) : 'не настроено'}</strong>
+          <small>{profitAvailable ? profitBasis : 'не настроено'}</small>
+        </div>
+        <div className="revenue-forecast-card">
+          <span>Цикл отгрузки</span>
+          <strong className="mono-num">{formatDurationFromDays(shippingCycle.avgDays)}</strong>
+          <small>{formatNumber(shippingCycle.sampleSize ?? 0)} сделок за последние 30 дней</small>
+        </div>
+      </div>
+
+      {warnings.length > 0 && (
+        <div className="revenue-forecast-notes">
+          {warnings.map((warning) => (
+            <span key={warning}>
+              <AlertCircle size={14} />
+              {warning}
+            </span>
+          ))}
+        </div>
+      )}
+
+      <div className="revenue-forecast-table-wrap">
+        <table className="revenue-forecast-table">
+          <thead>
+            <tr>
+              <th>Сценарий</th>
+              <th>Сделок</th>
+              <th>Выручка</th>
+              <th>Прибыль</th>
+              <th>Сделки в расчёте</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row) => {
+              const isExpanded = Boolean(expandedRows[row.id]);
+              const visibleDeals = isExpanded ? row.deals : row.deals.slice(0, 8);
+              const hiddenDealsCount = row.deals.length - visibleDeals.length;
+              return (
+                <tr key={row.id}>
+                  <th>{row.label}</th>
+                  <td className="mono-num">{formatNumber(row.count)}</td>
+                  <td className="mono-num">{formatMoney(row.revenue)}</td>
+                  <td className="mono-num">{profitAvailable ? formatMoney(row.profit) : 'не настроено'}</td>
+                  <td>
+                    {row.deals.length === 0 ? (
+                      <span className="muted">нет сделок</span>
+                    ) : (
+                      <div className="revenue-forecast-deals">
+                        {visibleDeals.map((deal) => {
+                          const dealUrl = buildAmoDealUrl(amoDomain, deal.dealExternalId);
+                          return (
+                            <div key={deal.dealId} className="revenue-forecast-deal">
+                              <div className="min-w-0">
+                                {dealUrl ? (
+                                  <a href={dealUrl} target="_blank" rel="noreferrer" title={deal.title}>
+                                    {deal.title}
+                                  </a>
+                                ) : (
+                                  <span title={deal.title}>{deal.title}</span>
+                                )}
+                                <small>
+                                  {deal.manager} · {deal.stage} · {deal.probabilityPercent}%
+                                </small>
+                              </div>
+                              <div className="mono-num text-right">
+                                <strong>{formatMoney(deal.revenue)}</strong>
+                                <small>{deal.predictedShipAt ? formatMoscowDateTime(deal.predictedShipAt) : 'нет прогноза даты'}</small>
+                              </div>
+                            </div>
+                          );
+                        })}
+                        {row.deals.length > 8 && (
+                          <button
+                            type="button"
+                            className="revenue-forecast-more"
+                            aria-expanded={isExpanded}
+                            onClick={() => setExpandedRows((current) => ({ ...current, [row.id]: !isExpanded }))}
+                          >
+                            {isExpanded ? 'свернуть список' : `и ещё ${formatNumber(hiddenDealsCount)}`}
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+const cyclePalette = [
+  '#466a9f',
+  '#2f7d7a',
+  '#4f7d58',
+  '#8a7242',
+  '#a06044',
+  '#9b4f64',
+  '#6d5a99',
+  '#4f7894',
+  '#6f744c',
+  '#5f6b73',
+];
+
+function DealCycleReport({ amoDomain, result }: { amoDomain: string; result: Record<string, any> }) {
+  const isCurrentStageAge = result.type === 'dealStageAge';
+  const rows = ((result.rows ?? []) as DealCycleRow[]).filter((row) => row.totalDeals > 0 || hasCycleData(row));
+  const summary = result.summary as DealCycleRow | undefined;
+  const stages = ((result.stages ?? []) as Array<{ stageId: string; stageName: string; color?: string | null }>);
+
+  if (rows.length === 0 && !hasCycleData(summary)) {
+    return (
+      <div className="muted text-sm">
+        {isCurrentStageAge ? 'Сейчас нет открытых сделок в выбранной воронке.' : 'За выбранный период нет завершённых переходов по этапам.'}
+      </div>
+    );
+  }
+
+  return (
+    <div className="deal-cycle-report">
+      <div className={`deal-cycle-grid deal-cycle-head${isCurrentStageAge ? ' deal-cycle-grid-current' : ''}`}>
+        <div>Менеджер</div>
+        <div>{isCurrentStageAge ? 'Сейчас в этапах' : 'Этапы сделки'}</div>
+        {!isCurrentStageAge && (
+          <>
+            <div>До успеха</div>
+            <div>До отказа</div>
+          </>
+        )}
+      </div>
+      <div className="deal-cycle-rows">
+        {rows.map((row) => (
+          <DealCycleTimelineRow amoDomain={amoDomain} key={row.managerId} row={row} showFinals={!isCurrentStageAge} />
+        ))}
+        {summary && <DealCycleTimelineRow amoDomain={amoDomain} row={summary} showFinals={!isCurrentStageAge} summary />}
+      </div>
+      {stages.length > 0 && (
+        <div className="deal-cycle-legend">
+          {stages.map((stage, index) => (
+            <span key={stage.stageId} className="deal-cycle-legend-item" title={stage.stageName}>
+              <span style={{ backgroundColor: cycleColor(stage.color, index) }} />
+              {stage.stageName}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DealCycleTimelineRow({
+  amoDomain,
+  row,
+  showFinals,
+  summary = false,
+}: {
+  amoDomain: string;
+  row: DealCycleRow;
+  showFinals: boolean;
+  summary?: boolean;
+}) {
+  const stages = row.stages.filter((stage) => stage.sampleSize > 0 && stage.avgDays !== null);
+  const isCurrentStageAge = !showFinals;
+  const emptyLabel = isCurrentStageAge ? 'нет текущих сделок' : 'нет завершённых переходов';
+  return (
+    <div className={`deal-cycle-grid deal-cycle-row${showFinals ? '' : ' deal-cycle-grid-current'}${summary ? ' deal-cycle-summary' : ''}`}>
+      <div className="deal-cycle-manager" title={row.managerName}>
+        <span>{row.managerName}</span>
+        <small>{formatNumber(row.totalDeals)} сделок</small>
+      </div>
+      <div className="deal-cycle-track" aria-label={`Цикл сделки: ${row.managerName}`}>
+        {stages.length === 0 ? (
+          <div className="deal-cycle-empty">{emptyLabel}</div>
+        ) : (
+          stages.map((stage) => {
+            const label = formatDurationFromDays(stage.avgDays);
+            const stageIndex = row.stages.findIndex((item) => item.stageId === stage.stageId);
+            return (
+              <div
+                key={stage.stageId}
+                className="deal-cycle-segment"
+                tabIndex={0}
+                style={{
+                  backgroundColor: cycleColor(stage.color, stageIndex),
+                  flexGrow: Math.max(Number(stage.avgDays ?? 0), 0.05),
+                }}
+                title={`${stage.stageName}: ${label}, сделок: ${stage.sampleSize}`}
+              >
+                <span>{stage.stageName}</span>
+                <strong>{label}</strong>
+                <div className="deal-cycle-tooltip">
+                  <div className="deal-cycle-tooltip-title">{stage.stageName}</div>
+                  <div className="deal-cycle-tooltip-meta">В расчёте: {formatNumber(stage.sampleSize)} сделок</div>
+                  <div className="deal-cycle-tooltip-list">
+                    {(stage.samples ?? []).map((sample, sampleIndex) => {
+                      const dealUrl = buildAmoDealUrl(amoDomain, sample.dealExternalId);
+                      return (
+                      <div key={`${stage.stageId}-${sample.dealId}-${sampleIndex}`} className="deal-cycle-tooltip-row">
+                        {dealUrl ? (
+                          <a className="deal-cycle-tooltip-link" href={dealUrl} target="_blank" rel="noreferrer" title={sample.dealTitle}>
+                            {sample.dealTitle}
+                          </a>
+                        ) : (
+                          <span title={sample.dealTitle}>{sample.dealTitle}</span>
+                        )}
+                        <strong>{formatDurationFromDays(sample.durationDays)}</strong>
+                      </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+            );
+          })
+        )}
+      </div>
+      {showFinals && (
+        <>
+          <DealCycleValue label="До успеха" value={row.successCycle} />
+          <DealCycleValue label="До отказа" value={row.lostCycle} />
+        </>
+      )}
+    </div>
+  );
+}
+
+function buildAmoDealUrl(domain: string, externalId?: string) {
+  const cleanDomain = domain.trim().replace(/^https?:\/\//, '').replace(/\/$/, '');
+  if (!cleanDomain || !externalId) return '';
+  return `https://${cleanDomain}/leads/detail/${externalId}`;
+}
+
+function DealCycleValue({ label, value }: { label: string; value?: { avgDays: number | null; sampleSize: number } }) {
+  const valueLabel = value?.avgDays == null ? 'нет данных' : formatDurationFromDays(value.avgDays);
+  return (
+    <div className="deal-cycle-value" title={`Сделок: ${value?.sampleSize ?? 0}`}>
+      <span className="deal-cycle-value-label">{label}</span>
+      <strong>{valueLabel}</strong>
+      <span>{formatNumber(value?.sampleSize ?? 0)} сделок</span>
+    </div>
+  );
+}
+
+function hasCycleData(row?: DealCycleRow) {
+  if (!row) return false;
+  return (
+    row.stages?.some((stage) => stage.sampleSize > 0 && stage.avgDays !== null) ||
+    Boolean(row.successCycle?.sampleSize) ||
+    Boolean(row.lostCycle?.sampleSize)
+  );
+}
+
+function cycleColor(_value: string | null | undefined, index: number) {
+  return cyclePalette[index % cyclePalette.length];
 }
 
 function InfoRow({ label, value }: { label: string; value: ReactNode }) {
@@ -2414,16 +4912,17 @@ function normalizeTemplates(items: ReportTemplate[], layout?: DashboardLayout): 
 function normalizeTemplate(item: ReportTemplate, layout?: DashboardLayout['config']): ReportTemplate {
   const layoutItem = layout?.reports?.[item.id];
   const config = (item.config ?? {}) as ReportConfig;
+  const isWideReport = isWideMetric(config.metric);
   return {
     ...item,
     config: {
       ...config,
       filters: config.filters ?? getInitialFilters(),
       metric: config.metric ?? 'count',
-      display: config.display ?? (config.metric === 'forecast' ? 'forecast' : config.metric === 'contract' ? 'table' : 'kpi'),
+      display: config.display ?? defaultDisplayForMetric(config.metric),
       denominator: config.denominator ?? 'previous',
       pinned: Boolean(layoutItem?.pinned ?? config.pinned ?? false),
-      size: layoutItem?.size ?? config.size ?? 'md',
+      size: isWideReport ? undefined : layoutItem?.size ?? config.size ?? 'md',
       order: Number(layoutItem?.order ?? config.order ?? item.position ?? 0),
     },
   };
@@ -2431,6 +4930,12 @@ function normalizeTemplate(item: ReportTemplate, layout?: DashboardLayout['confi
 
 function orderTemplates(items: ReportTemplate[]) {
   return [...items].sort((a, b) => Number(a.config.order ?? 0) - Number(b.config.order ?? 0));
+}
+
+function dashboardSectionKey(template: ReportTemplate) {
+  if (template.config.metric === 'revenue_profit_forecast') return 'forecast';
+  if (template.config.dashboardSection === 'csm' || template.name.trim().toLowerCase().startsWith('csm:')) return 'csm';
+  return 'sales';
 }
 
 function upsertTemplate(items: ReportTemplate[], next: ReportTemplate) {
@@ -2442,14 +4947,14 @@ function upsertTemplate(items: ReportTemplate[], next: ReportTemplate) {
 function buildLayoutConfig(templates: ReportTemplate[]) {
   return {
     reports: Object.fromEntries(
-      templates.map((template, index) => [
-        template.id,
-        {
+      templates.map((template, index) => {
+        const layoutItem: { pinned: boolean; order: number; size?: WidgetSize } = {
           pinned: Boolean(template.config.pinned),
           order: Number(template.config.order ?? index + 1),
-          size: template.config.size ?? 'md',
-        },
-      ]),
+        };
+        if (!isWideMetric(template.config.metric)) layoutItem.size = template.config.size ?? 'md';
+        return [template.id, layoutItem];
+      }),
     ),
   };
 }
@@ -2463,7 +4968,7 @@ function applyOptionDefaults(draft: ReportDraft, options: Options | null): Repor
 function reportToDraft(template: ReportTemplate): ReportDraft {
   const builder = template.config.builder;
   if (builder) {
-    return {
+    const restored = {
       ...getDefaultDraft(),
       ...builder,
       name: template.name,
@@ -2474,6 +4979,13 @@ function reportToDraft(template: ReportTemplate): ReportDraft {
       pinned: Boolean(template.config.pinned),
       size: template.config.size ?? builder.size ?? 'md',
     };
+    return {
+      ...restored,
+      contractMetrics: restored.contractMetrics.map((metric) => ({
+        ...metric,
+        extraFilters: metric.extraFilters ?? restoreContractFilters(metric as unknown as ContractMetricPayload),
+      })),
+    };
   }
   if (template.config.contract) {
     return {
@@ -2481,6 +4993,7 @@ function reportToDraft(template: ReportTemplate): ReportDraft {
       mode: 'contract',
       name: template.name,
       description: template.config.description ?? '',
+      entity: template.config.contract.entity ?? 'deal',
       metric: 'contract',
       display: 'table',
       contractGroupBy: template.config.contract.groupBy ?? 'manager',
@@ -2499,9 +5012,16 @@ function reportToDraft(template: ReportTemplate): ReportDraft {
         valueFieldId: metric.valueFieldId ?? metric.amountFieldId ?? metric.marginFieldId ?? '',
         fromMetricId: metric.fromMetricId ?? '',
         toMetricId: metric.toMetricId ?? '',
+        formula: metric.formula ?? '',
+        extraFilters: restoreContractFilters(metric),
       })),
       contractConversions: template.config.contract.conversions ?? [],
       contractDurations: template.config.contract.durations ?? [],
+      visibleUserIds: template.config.visibleUserIds ?? [],
+      includeRowTotal: Boolean(template.config.contract.includeRowTotal),
+      rowTotalMode: template.config.contract.rowTotalMode ?? 'sum',
+      includeSummaryRow: Boolean(template.config.contract.includeSummaryRow ?? true),
+      summaryRowMode: template.config.contract.summaryRowMode ?? 'sum',
       pinned: Boolean(template.config.pinned),
       size: template.config.size ?? 'lg',
     };
@@ -2516,5 +5036,47 @@ function reportToDraft(template: ReportTemplate): ReportDraft {
     pinned: Boolean(template.config.pinned),
     size: template.config.size ?? 'md',
   };
+}
+
+function restoreContractFilters(metric: ContractMetricPayload): ContractFilterDraft[] {
+  const filters = (metric.extraFilters ?? []).map((filter) => ({
+    id: filter.id ?? makeId('filter'),
+    subject: filter.subject,
+    fieldId: filter.fieldId ?? '',
+    operator: filter.operator,
+    value: String(filter.value ?? ''),
+    amount: filter.amount ?? 1,
+    unit: filter.unit ?? 'days',
+  }));
+
+  const legacyMetric = metric as ContractMetricPayload & {
+    createdWithinAmount?: number;
+    createdWithinUnit?: RelativeUnit;
+    lastNoteOlderThanAmount?: number;
+    lastNoteOlderThanUnit?: RelativeUnit;
+  };
+  if (legacyMetric.createdWithinAmount && legacyMetric.createdWithinAmount > 0) {
+    filters.push({
+      id: makeId('filter'),
+      subject: 'deal_created_at',
+      fieldId: '',
+      operator: 'within_last',
+      value: '',
+      amount: legacyMetric.createdWithinAmount,
+      unit: legacyMetric.createdWithinUnit ?? 'days',
+    });
+  }
+  if (legacyMetric.lastNoteOlderThanAmount && legacyMetric.lastNoteOlderThanAmount > 0) {
+    filters.push({
+      id: makeId('filter'),
+      subject: 'last_note_created_at',
+      fieldId: '',
+      operator: 'older_than',
+      value: '',
+      amount: legacyMetric.lastNoteOlderThanAmount,
+      unit: legacyMetric.lastNoteOlderThanUnit ?? 'hours',
+    });
+  }
+  return filters;
 }
 

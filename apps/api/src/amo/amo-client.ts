@@ -66,14 +66,28 @@ export class AmoClient {
     const url = this.buildUrl(path, params);
     for (let attempt = 0; attempt < 4; attempt += 1) {
       await this.waitForRateLimit();
-      const res = await fetch(url, {
-        method,
-        headers: {
-          Authorization: `Bearer ${this.options.credentials.accessToken}`,
-          'Content-Type': 'application/json',
-        },
-        body: body === undefined ? undefined : JSON.stringify(body),
-      });
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 30_000);
+      let res: Awaited<ReturnType<typeof fetch>>;
+      try {
+        res = await fetch(url, {
+          method,
+          headers: {
+            Authorization: `Bearer ${this.options.credentials.accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: body === undefined ? undefined : JSON.stringify(body),
+          signal: controller.signal,
+        });
+      } catch (error: any) {
+        if (attempt < 3) {
+          await this.sleep(1000 * Math.pow(2, attempt));
+          continue;
+        }
+        throw new Error(`amoCRM API request timed out or failed: ${method} ${path}: ${error.message}`);
+      } finally {
+        clearTimeout(timeout);
+      }
 
       if (res.status === 204) return null as T;
       if (res.status === 401 && attempt === 0) {

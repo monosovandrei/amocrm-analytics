@@ -54,6 +54,7 @@ export class AuthService {
         email: user.email,
         name: user.name,
         role: user.role,
+        businessRole: user.businessRole,
       },
     };
   }
@@ -61,7 +62,7 @@ export class AuthService {
   async me(userId: string) {
     return this.prisma.user.findUnique({
       where: { id: userId },
-      select: { id: true, email: true, name: true, role: true, isActive: true },
+      select: { id: true, email: true, name: true, role: true, businessRole: true, isActive: true },
     });
   }
 
@@ -79,7 +80,7 @@ export class AuthService {
         role: dto.role,
         passwordHash: await bcrypt.hash(dto.password, 12),
       },
-      select: { id: true, email: true, name: true, role: true, isActive: true },
+      select: { id: true, email: true, name: true, role: true, businessRole: true, isActive: true },
     });
 
     await this.audit.record({
@@ -96,7 +97,7 @@ export class AuthService {
   async listUsers() {
     return this.prisma.user.findMany({
       orderBy: { createdAt: 'asc' },
-      select: { id: true, email: true, name: true, role: true, isActive: true },
+      select: { id: true, email: true, name: true, role: true, businessRole: true, isActive: true },
     });
   }
 }

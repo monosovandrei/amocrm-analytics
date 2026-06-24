@@ -8,6 +8,7 @@ export interface AuthUser {
   id: string;
   email: string;
   role: 'ADMIN' | 'ROP';
+  businessRole?: 'OWNER' | 'ROP' | 'MANAGER';
 }
 
 @Injectable()
@@ -25,11 +26,11 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
   async validate(payload: { sub: string }): Promise<AuthUser> {
     const user = await this.prisma.user.findUnique({
       where: { id: payload.sub },
-      select: { id: true, email: true, role: true, isActive: true },
+      select: { id: true, email: true, role: true, businessRole: true, isActive: true },
     });
     if (!user || !user.isActive) {
       throw new UnauthorizedException('Пользователь не найден или отключен');
     }
-    return { id: user.id, email: user.email, role: user.role };
+    return { id: user.id, email: user.email, role: user.role, businessRole: user.businessRole };
   }
 }

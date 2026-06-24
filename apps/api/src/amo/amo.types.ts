@@ -24,4 +24,6 @@ export interface AmoSyncMaps {
   contacts: Map<string, string>;
   companies: Map<string, string>;
   lossReasons: Map<string, string>;
+  customerStatuses: Map<string, string>;
+  customers: Map<string, string>;
 }

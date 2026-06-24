@@ -11,6 +11,8 @@
     "build": "npm run build --workspace=@amocrm-analytics/api && npm run build --workspace=@amocrm-analytics/web",
     "typecheck": "npm run typecheck --workspace=@amocrm-analytics/api && npm run typecheck --workspace=@amocrm-analytics/web",
     "test": "npm test --workspace=@amocrm-analytics/api -- --runInBand",
+    "slop-check": "node scripts/slop-check.mjs",
+    "frontend:gate": "npm run slop-check && npm run typecheck --workspace=@amocrm-analytics/web",
     "db:generate": "prisma generate --schema prisma/schema.prisma",
     "db:migrate": "prisma migrate dev --schema prisma/schema.prisma",
     "db:deploy": "prisma migrate deploy --schema prisma/schema.prisma",

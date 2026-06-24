@@ -31,6 +31,7 @@
 - `prisma/migrations` - миграции базы данных.
 - `docker/` - Docker-сборка API, Web и PostgreSQL.
 - `docs/IT_REVIEW.md` - справка для ИТ/ИБ.
+- `docs/DEPLOYMENT.md` - инструкция выкладки на сервер.
 - `docs/RECHECK_REPORT.md` - отчет по закрытию замечаний перед повторной проверкой.
 - `docs/TZ.md` - техническое задание.
 
@@ -59,8 +60,10 @@ cp .env.example .env
 - `AMOCRM_CLIENT_SECRET` - secret private integration amoCRM.
 - `AMOCRM_REDIRECT_URI` - redirect URI из настроек amoCRM.
 - `WEBHOOK_BASE_URL` - внешний API URL без завершающего slash, например `https://analytics.example.ru/api/v1`.
+- `AMOCRM_SYNC_INTERVAL_MINUTES` - страховочный polling amoCRM в минутах; основной production-режим обновления идет через webhooks.
 - `WEB_ORIGIN` - разрешенный origin фронтенда для CORS.
 - `VITE_API_URL` - публичный URL API для web-приложения.
+- `TELEGRAM_BOT_TOKEN` - токен Telegram-бота для уведомлений.
 - `SEED_ADMIN_EMAIL` и `SEED_ADMIN_PASSWORD` - начальный администратор для `npm run db:seed`.
 
 ## Локальный запуск

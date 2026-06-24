@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { SyncJobType } from '../generated/prisma';
 import { toDateFromAmoTimestamp } from '../common/date.util';
 import { PrismaService } from '../prisma/prisma.service';
@@ -6,19 +7,36 @@ import { AmoClient } from './amo-client';
 import { AmoService } from './amo.service';
 import { AmoSyncMaps } from './amo.types';
 import { AuditService } from '../audit/audit.service';
+import { CrmEventNotificationsService } from '../platform/crm-event-notifications.service';
 
 @Injectable()
 export class AmoSyncService {
+  private static readonly DEFAULT_STALE_SYNC_JOB_MS = 10 * 60 * 1000;
   private readonly logger = new Logger(AmoSyncService.name);
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly amo: AmoService,
     private readonly audit: AuditService,
+    private readonly crmEventNotifications: CrmEventNotificationsService,
+    private readonly config: ConfigService,
   ) {}
 
   async trigger(type: SyncJobType, actorUserId?: string) {
     const connection = await this.amo.getActiveConnectionOrFail();
+    await this.expireStaleJobs(connection.id);
+
+    const runningJob = await this.prisma.syncJob.findFirst({
+      where: {
+        connectionId: connection.id,
+        status: { in: ['QUEUED', 'RUNNING'] },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (runningJob) {
+      return { jobId: runningJob.id, status: runningJob.status, type: runningJob.type };
+    }
+
     const job = await this.prisma.syncJob.create({
       data: { connectionId: connection.id, type, status: 'QUEUED' },
     });
@@ -35,6 +53,47 @@ export class AmoSyncService {
     });
 
     return { jobId: job.id, status: job.status, type: job.type };
+  }
+
+  async expireStaleJobs(connectionId: string) {
+    const cutoff = new Date(Date.now() - this.getStaleSyncJobMs());
+    const expired = await this.prisma.syncJob.updateMany({
+      where: {
+        connectionId,
+        status: { in: ['QUEUED', 'RUNNING'] },
+        OR: [
+          { startedAt: { lt: cutoff } },
+          { startedAt: null, createdAt: { lt: cutoff } },
+        ],
+      },
+      data: {
+        status: 'ERROR',
+        finishedAt: new Date(),
+        error: 'Синхронизация была прервана и закрыта автоматически',
+      },
+    });
+
+    if (expired.count > 0) {
+      await this.prisma.amoConnection.update({
+        where: { id: connectionId },
+        data: { status: 'ACTIVE', lastError: null },
+      });
+      this.logger.warn(`Closed ${expired.count} stale amoCRM sync job(s)`);
+    }
+
+    return expired.count;
+  }
+
+  private getStaleSyncJobMs() {
+    const rawTimeout = this.config.get<string>('AMOCRM_SYNC_JOB_TIMEOUT_MINUTES');
+    if (!rawTimeout) return AmoSyncService.DEFAULT_STALE_SYNC_JOB_MS;
+
+    const parsed = Number(rawTimeout);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      return AmoSyncService.DEFAULT_STALE_SYNC_JOB_MS;
+    }
+
+    return parsed * 60_000;
   }
 
   async getJob(id: string) {
@@ -61,30 +120,49 @@ export class AmoSyncService {
 
     try {
       const client = await this.amo.getClient(job.connection);
+      const syncStartedAt = new Date();
       const updatedSince = this.getUpdatedSince(job.type, job.connection.lastIncrementalSyncAt);
+      const notificationSince = job.connection.lastIncrementalSyncAt
+        ? new Date(job.connection.lastIncrementalSyncAt.getTime() - 5 * 60_000)
+        : syncStartedAt;
 
+      await this.syncAccount(client, stats);
       const maps = await this.syncMetadata(client, stats);
+      await this.syncOptional('sources', stats, () => this.syncSources(client, maps, stats));
+      await this.syncOptional('tags', stats, () => this.syncTags(client, stats));
+      await this.syncOptional('catalogs', stats, () => this.syncCatalogs(client, stats));
+      await this.syncOptional('customersMetadata', stats, () => this.syncCustomerMetadata(client, maps, stats));
       await this.syncCustomFieldDefinitions(client, stats);
-      await this.syncCompanies(client, maps, stats, updatedSince);
-      await this.syncContacts(client, maps, stats, updatedSince);
+      await this.hydrateExistingEntityMaps(maps);
+      this.logger.log(`amoCRM sync job ${jobId}: syncing deals`);
       await this.syncDeals(client, maps, stats, updatedSince);
-      await this.syncTasks(client, maps, stats, updatedSince);
+      await this.reconcileLeadSlaDeals(client, maps, stats);
+      this.logger.log(`amoCRM sync job ${jobId}: syncing notes`);
       await this.syncNotes(client, stats, updatedSince);
+      this.logger.log(`amoCRM sync job ${jobId}: syncing events`);
       await this.syncEvents(client, maps, stats, updatedSince);
+      this.logger.log(`amoCRM sync job ${jobId}: syncing tasks`);
+      await this.syncOptional('tasks', stats, () => this.syncTasks(client, maps, stats, updatedSince));
+      this.logger.log(`amoCRM sync job ${jobId}: syncing contacts and companies`);
+      await this.syncContacts(client, maps, stats, updatedSince);
+      await this.syncCompanies(client, maps, stats, updatedSince);
+      await this.syncOptional('customers', stats, () => this.syncCustomers(client, maps, stats, updatedSince));
+      await this.syncOptional('entityLinks', stats, () => this.syncEntityLinks(client, stats));
       await this.recalculateStageProbabilities();
+      await this.processCrmNotifications(stats, notificationSince, client.domain);
 
-      const now = new Date();
+      const syncFinishedAt = new Date();
       await this.prisma.syncJob.update({
         where: { id: jobId },
-        data: { status: 'SUCCESS', finishedAt: now, stats },
+        data: { status: 'SUCCESS', finishedAt: syncFinishedAt, stats },
       });
       await this.prisma.amoConnection.update({
         where: { id: job.connectionId },
         data: {
           status: 'ACTIVE',
           lastError: null,
-          lastFullSyncAt: job.type === 'FULL' ? now : job.connection.lastFullSyncAt,
-          lastIncrementalSyncAt: now,
+          lastFullSyncAt: job.type === 'FULL' ? syncFinishedAt : job.connection.lastFullSyncAt,
+          lastIncrementalSyncAt: syncStartedAt,
         },
       });
     } catch (error: any) {
@@ -113,7 +191,61 @@ export class AmoSyncService {
       contacts: new Map(),
       companies: new Map(),
       lossReasons: new Map(),
+      customerStatuses: new Map(),
+      customers: new Map(),
     };
+  }
+
+  private async syncOptional(name: string, stats: Record<string, number>, action: () => Promise<void>) {
+    try {
+      await action();
+    } catch (error: any) {
+      stats[`${name}Skipped`] = 1;
+      this.logger.warn(`${name} sync skipped: ${error.message}`);
+    }
+  }
+
+  private async processCrmNotifications(stats: Record<string, number>, since: Date, domain: string) {
+    try {
+      const result = await this.crmEventNotifications.processRecentAmoEvents({ since, domain });
+      stats.notificationsChecked = result.checked;
+      stats.paymentNotifications = result.payment;
+      stats.workAcceptedNotifications = result.workAccepted;
+      stats.assignedLeadNewNotifications = result.assignedLeadNew;
+      stats.assignedLeadReminderNotifications = result.assignedLeadReminder;
+      stats.taskMassMoveNotifications = result.taskMassMove;
+      stats.csmTaskMassMoveNotifications = result.csmTaskMassMove;
+      stats.csmDealMassMoveNotifications = result.csmDealMassMove;
+      stats.csmOverdueTaskNotifications = result.csmOverdueTasks;
+      stats.csmZeroTakenToWorkNotifications = result.csmZeroTakenToWork;
+      stats.csmZeroOfferMadeNotifications = result.csmZeroOfferMade;
+      stats.invoiceNoPaymentNotifications = result.invoiceNoPayment;
+      stats.proposalStaleNotifications = result.proposalStale;
+      stats.notificationSkips = result.skipped;
+    } catch (error: any) {
+      stats.notificationErrors = 1;
+      this.logger.warn(`CRM notifications skipped: ${error.message}`);
+    }
+  }
+
+  private async syncAccount(client: AmoClient, stats: Record<string, number>) {
+    const account = await client.get<any>('/account');
+    const externalId = account?.id ? String(account.id) : client.domain;
+    await this.prisma.amoAccountSnapshot.upsert({
+      where: { externalId },
+      create: {
+        externalId,
+        name: account?.name ?? null,
+        subdomain: account?.subdomain ?? client.domain,
+        raw: account ?? {},
+      },
+      update: {
+        name: account?.name ?? null,
+        subdomain: account?.subdomain ?? client.domain,
+        raw: account ?? {},
+      },
+    });
+    stats.account = 1;
   }
 
   private async syncMetadata(client: AmoClient, stats: Record<string, number>): Promise<AmoSyncMaps> {
@@ -138,29 +270,32 @@ export class AmoSyncService {
       maps.pipelines.set(String(pipeline.id), dbPipeline.id);
 
       for (const status of pipeline._embedded?.statuses ?? []) {
+        const statusExternalId = String(status.id);
+        const isWon = status.type === 'win' || statusExternalId === '142';
+        const isLost = status.type === 'loss' || statusExternalId === '143';
         const dbStage = await this.prisma.pipelineStage.upsert({
           where: {
             pipelineId_externalId: {
               pipelineId: dbPipeline.id,
-              externalId: String(status.id),
+              externalId: statusExternalId,
             },
           },
           create: {
             pipelineId: dbPipeline.id,
-            externalId: String(status.id),
+            externalId: statusExternalId,
             name: status.name,
             position: Number(status.sort ?? 0),
             color: status.color ?? null,
-            isWon: status.type === 'win',
-            isLost: status.type === 'loss',
+            isWon,
+            isLost,
             raw: status,
           },
           update: {
             name: status.name,
             position: Number(status.sort ?? 0),
             color: status.color ?? null,
-            isWon: status.type === 'win',
-            isLost: status.type === 'loss',
+            isWon,
+            isLost,
             raw: status,
           },
         });
@@ -170,19 +305,38 @@ export class AmoSyncService {
       await this.syncLossReasons(client, dbPipeline.id, String(pipeline.id), maps);
     }
 
-    const users = await client.paginate<any>('/users', 'users');
+    const accountWithGroups = await client.get<any>('/account', { with: 'users_groups' });
+    const groupNames = new Map<string, string>();
+    for (const group of accountWithGroups?._embedded?.users_groups ?? []) {
+      const externalId = String(group.id);
+      if (externalId === '0') continue;
+      const dbGroup = await this.prisma.crmGroup.upsert({
+        where: { externalId },
+        create: { externalId, name: group.name || `Group ${externalId}`, raw: group },
+        update: { name: group.name || `Group ${externalId}`, raw: group },
+      });
+      groupNames.set(externalId, dbGroup.name);
+    }
+
+    const users = await client.paginate<any>('/users', 'users', { with: 'group' });
     for (const user of users) {
       const groupExternalId = user.rights?.group_id ? String(user.rights.group_id) : null;
       let groupId: string | null = null;
       if (groupExternalId) {
+        const groupName =
+          groupNames.get(groupExternalId) ??
+          user._embedded?.group?.name ??
+          user.rights?.group_name ??
+          `Group ${groupExternalId}`;
         const group = await this.prisma.crmGroup.upsert({
           where: { externalId: groupExternalId },
-          create: { externalId: groupExternalId, name: user.rights?.group_name ?? `Группа ${groupExternalId}`, raw: user.rights ?? {} },
-          update: { name: user.rights?.group_name ?? `Группа ${groupExternalId}`, raw: user.rights ?? {} },
+          create: { externalId: groupExternalId, name: groupName, raw: user._embedded?.group ?? user.rights ?? {} },
+          update: { name: groupName, raw: user._embedded?.group ?? user.rights ?? {} },
         });
         groupId = group.id;
       }
 
+      const isActive = user.rights?.is_active !== false && user.is_free !== true;
       const dbUser = await this.prisma.crmUser.upsert({
         where: { externalId: String(user.id) },
         create: {
@@ -190,24 +344,210 @@ export class AmoSyncService {
           groupId,
           name: user.name || user.email || `Менеджер ${user.id}`,
           email: user.email ?? null,
-          isActive: !user.is_free,
+          isActive,
           raw: user,
         },
         update: {
           groupId,
           name: user.name || user.email || `Менеджер ${user.id}`,
           email: user.email ?? null,
-          isActive: !user.is_free,
+          isActive,
           raw: user,
         },
       });
       maps.users.set(String(user.id), dbUser.id);
     }
 
+    await this.syncOptional('roles', stats, async () => {
+      const roles = await client.paginate<any>('/roles', 'roles');
+      for (const role of roles) {
+        await this.prisma.crmRole.upsert({
+          where: { externalId: String(role.id) },
+          create: {
+            externalId: String(role.id),
+            name: role.name || `Роль ${role.id}`,
+            raw: role,
+          },
+          update: {
+            name: role.name || `Роль ${role.id}`,
+            raw: role,
+          },
+        });
+      }
+      stats.roles = roles.length;
+    });
+
     stats.pipelines = maps.pipelines.size;
     stats.stages = maps.stages.size;
     stats.users = maps.users.size;
     return maps;
+  }
+
+  private async syncSources(client: AmoClient, maps: AmoSyncMaps, stats: Record<string, number>) {
+    const sources = await client.paginate<any>('/sources', 'sources');
+    for (const source of sources) {
+      await this.prisma.crmSource.upsert({
+        where: { externalId: String(source.id) },
+        create: {
+          externalId: String(source.id),
+          name: source.name || `Источник ${source.id}`,
+          pipelineId: source.pipeline_id ? maps.pipelines.get(String(source.pipeline_id)) ?? null : null,
+          originCode: source.origin_code ?? null,
+          isDefault: Boolean(source.default),
+          raw: source,
+        },
+        update: {
+          name: source.name || `Источник ${source.id}`,
+          pipelineId: source.pipeline_id ? maps.pipelines.get(String(source.pipeline_id)) ?? null : null,
+          originCode: source.origin_code ?? null,
+          isDefault: Boolean(source.default),
+          raw: source,
+        },
+      });
+    }
+    stats.sources = sources.length;
+  }
+
+  private async syncTags(client: AmoClient, stats: Record<string, number>) {
+    const sources: Array<{ entityType: 'LEAD' | 'CONTACT' | 'COMPANY' | 'CUSTOMER'; path: string; key: string }> = [
+      { entityType: 'LEAD', path: '/leads/tags', key: 'tags' },
+      { entityType: 'CONTACT', path: '/contacts/tags', key: 'tags' },
+      { entityType: 'COMPANY', path: '/companies/tags', key: 'tags' },
+      { entityType: 'CUSTOMER', path: '/customers/tags', key: 'tags' },
+    ];
+
+    let count = 0;
+    for (const source of sources) {
+      await this.syncOptional(`${source.entityType.toLowerCase()}Tags`, stats, async () => {
+        const tags = await client.paginate<any>(source.path, source.key);
+        for (const tag of tags) {
+          await this.prisma.crmTag.upsert({
+            where: {
+              entityType_externalId: {
+                entityType: source.entityType,
+                externalId: String(tag.id ?? tag.name),
+              },
+            },
+            create: {
+              entityType: source.entityType,
+              externalId: String(tag.id ?? tag.name),
+              name: tag.name || `Тег ${tag.id}`,
+              color: tag.color ?? null,
+              raw: tag,
+            },
+            update: {
+              name: tag.name || `Тег ${tag.id}`,
+              color: tag.color ?? null,
+              raw: tag,
+            },
+          });
+        }
+        count += tags.length;
+      });
+    }
+    stats.tags = count;
+  }
+
+  private async syncCatalogs(client: AmoClient, stats: Record<string, number>) {
+    const catalogs = await client.paginate<any>('/catalogs', 'catalogs');
+    let elementCount = 0;
+    for (const catalog of catalogs) {
+      const dbCatalog = await this.prisma.catalog.upsert({
+        where: { externalId: String(catalog.id) },
+        create: {
+          externalId: String(catalog.id),
+          name: catalog.name || `Список ${catalog.id}`,
+          type: catalog.type ?? null,
+          sort: Number(catalog.sort ?? 0),
+          canAddElements: Boolean(catalog.can_add_elements),
+          canShowInCards: Boolean(catalog.can_show_in_cards),
+          canLinkMultiple: Boolean(catalog.can_link_multiple),
+          raw: catalog,
+        },
+        update: {
+          name: catalog.name || `Список ${catalog.id}`,
+          type: catalog.type ?? null,
+          sort: Number(catalog.sort ?? 0),
+          canAddElements: Boolean(catalog.can_add_elements),
+          canShowInCards: Boolean(catalog.can_show_in_cards),
+          canLinkMultiple: Boolean(catalog.can_link_multiple),
+          raw: catalog,
+        },
+      });
+
+      const elements = await client.paginate<any>(`/catalogs/${catalog.id}/elements`, 'elements');
+      for (const element of elements) {
+        await this.prisma.catalogElement.upsert({
+          where: {
+            catalogId_externalId: {
+              catalogId: dbCatalog.id,
+              externalId: String(element.id),
+            },
+          },
+          create: {
+            catalogId: dbCatalog.id,
+            externalId: String(element.id),
+            name: element.name || `Элемент ${element.id}`,
+            customFields: this.parseCustomFields(element.custom_fields_values),
+            raw: element,
+            createdAt: toDateFromAmoTimestamp(element.created_at) ?? new Date(),
+          },
+          update: {
+            name: element.name || `Элемент ${element.id}`,
+            customFields: this.parseCustomFields(element.custom_fields_values),
+            raw: element,
+          },
+        });
+      }
+      elementCount += elements.length;
+    }
+    stats.catalogs = catalogs.length;
+    stats.catalogElements = elementCount;
+  }
+
+  private async syncCustomerMetadata(client: AmoClient, maps: AmoSyncMaps, stats: Record<string, number>) {
+    await this.syncOptional('customerStatuses', stats, async () => {
+      const statuses = await client.paginate<any>('/customers/statuses', 'statuses');
+      for (const status of statuses) {
+        const dbStatus = await this.prisma.customerStatus.upsert({
+          where: { externalId: String(status.id) },
+          create: {
+            externalId: String(status.id),
+            name: status.name || `Статус ${status.id}`,
+            sort: Number(status.sort ?? 0),
+            color: status.color ?? null,
+            raw: status,
+          },
+          update: {
+            name: status.name || `Статус ${status.id}`,
+            sort: Number(status.sort ?? 0),
+            color: status.color ?? null,
+            raw: status,
+          },
+        });
+        maps.customerStatuses.set(String(status.id), dbStatus.id);
+      }
+      stats.customerStatuses = statuses.length;
+    });
+
+    await this.syncOptional('customerSegments', stats, async () => {
+      const segments = await client.paginate<any>('/customers/segments', 'segments');
+      for (const segment of segments) {
+        await this.prisma.customerSegment.upsert({
+          where: { externalId: String(segment.id) },
+          create: {
+            externalId: String(segment.id),
+            name: segment.name || `Сегмент ${segment.id}`,
+            raw: segment,
+          },
+          update: {
+            name: segment.name || `Сегмент ${segment.id}`,
+            raw: segment,
+          },
+        });
+      }
+      stats.customerSegments = segments.length;
+    });
   }
 
   private async syncLossReasons(client: AmoClient, pipelineId: string, pipelineExternalId: string, maps: AmoSyncMaps) {
@@ -232,42 +572,45 @@ export class AmoSyncService {
   }
 
   private async syncCustomFieldDefinitions(client: AmoClient, stats: Record<string, number>) {
-    const sources: Array<{ entity: 'LEAD' | 'CONTACT' | 'COMPANY'; path: string; key: string }> = [
+    const sources: Array<{ entity: 'LEAD' | 'CONTACT' | 'COMPANY' | 'CUSTOMER'; path: string; key: string }> = [
       { entity: 'LEAD', path: '/leads/custom_fields', key: 'custom_fields' },
       { entity: 'CONTACT', path: '/contacts/custom_fields', key: 'custom_fields' },
       { entity: 'COMPANY', path: '/companies/custom_fields', key: 'custom_fields' },
+      { entity: 'CUSTOMER', path: '/customers/custom_fields', key: 'custom_fields' },
     ];
 
     let count = 0;
     for (const source of sources) {
-      const fields = await client.paginate<any>(source.path, source.key);
-      for (const field of fields) {
-        await this.prisma.customFieldDefinition.upsert({
-          where: {
-            entityType_externalId: {
+      await this.syncOptional(`${source.entity.toLowerCase()}CustomFields`, stats, async () => {
+        const fields = await client.paginate<any>(source.path, source.key);
+        for (const field of fields) {
+          await this.prisma.customFieldDefinition.upsert({
+            where: {
+              entityType_externalId: {
+                entityType: source.entity,
+                externalId: String(field.id),
+              },
+            },
+            create: {
               entityType: source.entity,
               externalId: String(field.id),
+              code: field.code ?? null,
+              name: field.name,
+              type: field.type,
+              enums: field.enums ?? [],
+              raw: field,
             },
-          },
-          create: {
-            entityType: source.entity,
-            externalId: String(field.id),
-            code: field.code ?? null,
-            name: field.name,
-            type: field.type,
-            enums: field.enums ?? [],
-            raw: field,
-          },
-          update: {
-            code: field.code ?? null,
-            name: field.name,
-            type: field.type,
-            enums: field.enums ?? [],
-            raw: field,
-          },
-        });
-        count += 1;
-      }
+            update: {
+              code: field.code ?? null,
+              name: field.name,
+              type: field.type,
+              enums: field.enums ?? [],
+              raw: field,
+            },
+          });
+        }
+        count += fields.length;
+      });
     }
     stats.customFields = count;
   }
@@ -298,6 +641,15 @@ export class AmoSyncService {
       maps.companies.set(String(company.id), dbCompany.id);
     }
     stats.companies = companies.length;
+  }
+
+  private async hydrateExistingEntityMaps(maps: AmoSyncMaps) {
+    const [contacts, companies] = await Promise.all([
+      this.prisma.contact.findMany({ select: { id: true, externalId: true } }),
+      this.prisma.crmCompany.findMany({ select: { id: true, externalId: true } }),
+    ]);
+    for (const contact of contacts) maps.contacts.set(contact.externalId, contact.id);
+    for (const company of companies) maps.companies.set(company.externalId, company.id);
   }
 
   private async syncContacts(
@@ -348,6 +700,189 @@ export class AmoSyncService {
       await this.upsertDeal(lead, maps);
     }
     stats.deals = leads.length;
+  }
+
+  private async reconcileLeadSlaDeals(client: AmoClient, maps: AmoSyncMaps, stats: Record<string, number>) {
+    const candidates = await this.prisma.deal.findMany({
+      where: {
+        deletedAt: null,
+        pipeline: { isArchived: false, name: { contains: '\u043f\u0440\u043e\u0434\u0430\u0436', mode: 'insensitive' } },
+        stage: { isWon: false, isLost: false, name: { contains: '\u043d\u0430\u0437\u043d\u0430\u0447\u0435\u043d', mode: 'insensitive' } },
+      },
+      include: {
+        pipeline: true,
+        stage: true,
+      },
+      take: 1000,
+    });
+
+    const slaCandidates = candidates.filter((deal) =>
+      this.isSalesPipelineName(deal.pipeline?.name) && this.isAssignedResponsibleStageName(deal.stage?.name),
+    );
+
+    let checked = 0;
+    let removed = 0;
+    let refreshed = 0;
+    for (const deal of slaCandidates) {
+      checked += 1;
+      try {
+        const lead = await client.get<any>(`/leads/${deal.externalId}`, { with: 'contacts,catalog_elements,loss_reason' });
+        if (!lead) {
+          await this.prisma.deal.update({
+            where: { id: deal.id },
+            data: { deletedAt: new Date(), updatedAt: new Date() },
+          });
+          removed += 1;
+          continue;
+        }
+
+        await this.upsertDeal(lead, maps);
+        refreshed += 1;
+      } catch (error: any) {
+        if (String(error?.message ?? '').includes('amoCRM API 404')) {
+          await this.prisma.deal.update({
+            where: { id: deal.id },
+            data: { deletedAt: new Date(), updatedAt: new Date() },
+          });
+          removed += 1;
+        } else {
+          this.logger.warn(`Lead SLA reconcile skipped for ${deal.externalId}: ${error.message}`);
+        }
+      }
+    }
+
+    stats.leadSlaReconcileChecked = checked;
+    stats.leadSlaReconcileRemoved = removed;
+    stats.leadSlaReconcileRefreshed = refreshed;
+  }
+
+  private async syncCustomers(
+    client: AmoClient,
+    maps: AmoSyncMaps,
+    stats: Record<string, number>,
+    updatedSince?: number,
+  ) {
+    const params = updatedSince ? { 'filter[updated_at][from]': updatedSince } : {};
+    const customers = await client.paginate<any>('/customers', 'customers', params);
+    let transactionCount = 0;
+
+    for (const customer of customers) {
+      const statusId = customer.status_id ? maps.customerStatuses.get(String(customer.status_id)) ?? null : null;
+      const dbCustomer = await this.prisma.customer.upsert({
+        where: { externalId: String(customer.id) },
+        create: {
+          externalId: String(customer.id),
+          statusId,
+          name: customer.name || `Покупатель ${customer.id}`,
+          nextPrice: Number(customer.next_price ?? 0),
+          periodicity: customer.periodicity ? Number(customer.periodicity) : null,
+          responsibleId: customer.responsible_user_id ? maps.users.get(String(customer.responsible_user_id)) ?? null : null,
+          customFields: this.parseCustomFields(customer.custom_fields_values),
+          raw: customer,
+          createdAt: toDateFromAmoTimestamp(customer.created_at) ?? new Date(),
+        },
+        update: {
+          statusId,
+          name: customer.name || `Покупатель ${customer.id}`,
+          nextPrice: Number(customer.next_price ?? 0),
+          periodicity: customer.periodicity ? Number(customer.periodicity) : null,
+          responsibleId: customer.responsible_user_id ? maps.users.get(String(customer.responsible_user_id)) ?? null : null,
+          customFields: this.parseCustomFields(customer.custom_fields_values),
+          raw: customer,
+        },
+      });
+      maps.customers.set(String(customer.id), dbCustomer.id);
+
+      transactionCount += await this.syncCustomerTransactions(client, dbCustomer.id, String(customer.id));
+    }
+
+    stats.customers = customers.length;
+    stats.customerTransactions = transactionCount;
+  }
+
+  private isSalesPipelineName(name?: string | null) {
+    return this.normalizeText(name).includes(this.normalizeText('\u043f\u0440\u043e\u0434\u0430\u0436'));
+  }
+
+  private isAssignedResponsibleStageName(name?: string | null) {
+    const normalized = this.normalizeText(name);
+    return normalized.includes(this.normalizeText('\u043d\u0430\u0437\u043d\u0430\u0447\u0435\u043d')) &&
+      normalized.includes(this.normalizeText('\u043e\u0442\u0432\u0435\u0442\u0441\u0442\u0432\u0435\u043d\u043d\u044b\u0439'));
+  }
+
+  private normalizeText(value?: string | null) {
+    return String(value ?? '').trim().toLowerCase().replace(/ё/g, 'е');
+  }
+
+  private async syncCustomerTransactions(client: AmoClient, customerId: string, customerExternalId: string) {
+    const transactions = await client.paginate<any>(`/customers/${customerExternalId}/transactions`, 'transactions');
+    for (const transaction of transactions) {
+      await this.prisma.customerTransaction.upsert({
+        where: { externalId: String(transaction.id) },
+        create: {
+          externalId: String(transaction.id),
+          customerId,
+          amount: Number(transaction.price ?? transaction.amount ?? 0),
+          comment: transaction.comment ?? null,
+          raw: transaction,
+          createdAt: toDateFromAmoTimestamp(transaction.created_at) ?? new Date(),
+        },
+        update: {
+          customerId,
+          amount: Number(transaction.price ?? transaction.amount ?? 0),
+          comment: transaction.comment ?? null,
+          raw: transaction,
+        },
+      });
+    }
+    return transactions.length;
+  }
+
+  private async syncEntityLinks(client: AmoClient, stats: Record<string, number>) {
+    const sources: Array<{ entityType: 'LEAD' | 'CONTACT' | 'COMPANY' | 'CUSTOMER'; path: string; key: string }> = [
+      { entityType: 'LEAD', path: '/leads/links', key: 'links' },
+      { entityType: 'CONTACT', path: '/contacts/links', key: 'links' },
+      { entityType: 'COMPANY', path: '/companies/links', key: 'links' },
+      { entityType: 'CUSTOMER', path: '/customers/links', key: 'links' },
+    ];
+
+    let count = 0;
+    for (const source of sources) {
+      await this.syncOptional(`${source.entityType.toLowerCase()}Links`, stats, async () => {
+        const links = await client.paginate<any>(source.path, source.key);
+        for (const link of links) {
+          const entityExternalId = this.extractLinkEntityId(link);
+          const linkedEntityExternalId = this.extractLinkedEntityId(link);
+          const linkedEntityType = this.extractLinkedEntityType(link);
+          if (!entityExternalId || !linkedEntityExternalId || !linkedEntityType) continue;
+
+          await this.prisma.entityLink.upsert({
+            where: {
+              entityType_entityExternalId_linkedEntityType_linkedEntityExternalId: {
+                entityType: source.entityType,
+                entityExternalId,
+                linkedEntityType,
+                linkedEntityExternalId,
+              },
+            },
+            create: {
+              entityType: source.entityType,
+              entityExternalId,
+              linkedEntityType,
+              linkedEntityExternalId,
+              metadata: link.metadata ?? {},
+              raw: link,
+            },
+            update: {
+              metadata: link.metadata ?? {},
+              raw: link,
+            },
+          });
+          count += 1;
+        }
+      });
+    }
+    stats.entityLinks = count;
   }
 
   private async upsertDeal(lead: any, maps: AmoSyncMaps) {
@@ -450,6 +985,8 @@ export class AmoSyncService {
           dueAt: toDateFromAmoTimestamp(task.complete_till),
           completedAt: task.is_completed ? toDateFromAmoTimestamp(task.updated_at) ?? new Date() : null,
           isCompleted: Boolean(task.is_completed),
+          createdAt: toDateFromAmoTimestamp(task.created_at) ?? new Date(),
+          updatedAt: toDateFromAmoTimestamp(task.updated_at) ?? new Date(),
           raw: task,
         },
         update: {
@@ -461,6 +998,8 @@ export class AmoSyncService {
           dueAt: toDateFromAmoTimestamp(task.complete_till),
           completedAt: task.is_completed ? toDateFromAmoTimestamp(task.updated_at) ?? new Date() : null,
           isCompleted: Boolean(task.is_completed),
+          createdAt: toDateFromAmoTimestamp(task.created_at) ?? undefined,
+          updatedAt: toDateFromAmoTimestamp(task.updated_at) ?? undefined,
           raw: task,
         },
       });
@@ -507,7 +1046,16 @@ export class AmoSyncService {
     const params: Record<string, string | number> = {};
     if (updatedSince) params['filter[created_at][from]'] = updatedSince;
 
-    const events = await client.paginate<any>('/events', 'events', params);
+    const eventsById = new Map<string, any>();
+    const addEvents = (events: any[]) => {
+      for (const event of events) eventsById.set(String(event.id), event);
+    };
+    addEvents(await client.paginate<any>('/events', 'events', params));
+    for (const type of this.extraEventTypes()) {
+      addEvents(await client.paginate<any>('/events', 'events', { ...params, 'filter[type]': type }));
+    }
+
+    const events = [...eventsById.values()];
     for (const event of events) {
       const dealExternalId = this.getEventDealExternalId(event);
       const deal = dealExternalId
@@ -537,6 +1085,60 @@ export class AmoSyncService {
       }
     }
     stats.events = events.length;
+    await this.backfillStageHistoryFromStoredEvents(maps, stats, updatedSince);
+  }
+
+  private extraEventTypes() {
+    const configured = this.config.get<string>('AMOCRM_EXTRA_EVENT_TYPES');
+    const eventTypes = new Set(['custom_field_809047_value_changed']);
+    for (const type of configured?.split(',') ?? []) {
+      const clean = type.trim();
+      if (clean) eventTypes.add(clean);
+    }
+    return [...eventTypes];
+  }
+
+  private async backfillStageHistoryFromStoredEvents(
+    maps: AmoSyncMaps,
+    stats: Record<string, number>,
+    updatedSince?: number,
+  ) {
+    const where: Record<string, any> = {
+      type: 'lead_status_changed',
+      dealId: { not: null },
+    };
+    if (updatedSince) {
+      where.createdAt = { gte: new Date(updatedSince * 1000) };
+    }
+
+    const events = await this.prisma.crmEvent.findMany({
+      where,
+      orderBy: { createdAt: 'asc' },
+      select: {
+        externalId: true,
+        dealId: true,
+        valueBefore: true,
+        valueAfter: true,
+        createdAt: true,
+        raw: true,
+      },
+    });
+
+    for (const event of events) {
+      if (!event.dealId) continue;
+      await this.applyEventToStageHistory(
+        {
+          ...(event.raw as Record<string, any>),
+          id: event.externalId,
+          value_before: event.valueBefore,
+          value_after: event.valueAfter,
+          created_at: Math.floor(event.createdAt.getTime() / 1000),
+        },
+        event.dealId,
+        maps,
+      );
+    }
+    stats.stageHistoryBackfilled = events.length;
   }
 
   private async applyEventToStageHistory(event: any, dealId: string, maps: AmoSyncMaps) {
@@ -693,5 +1295,20 @@ export class AmoSyncService {
     if (!entityId) return null;
     if (String(entityType).includes('lead')) return String(entityId);
     return null;
+  }
+
+  private extractLinkEntityId(link: any): string | null {
+    const value = link.entity_id ?? link.from_entity_id ?? link.from_entity?.id ?? link._embedded?.entity?.id;
+    return value === null || value === undefined ? null : String(value);
+  }
+
+  private extractLinkedEntityId(link: any): string | null {
+    const value = link.to_entity_id ?? link.linked_entity_id ?? link.to_entity?.id ?? link._embedded?.to_entity?.id;
+    return value === null || value === undefined ? null : String(value);
+  }
+
+  private extractLinkedEntityType(link: any): string | null {
+    const value = link.to_entity_type ?? link.linked_entity_type ?? link.to_entity?.type ?? link._embedded?.to_entity?.type;
+    return value === null || value === undefined ? null : String(value);
   }
 }

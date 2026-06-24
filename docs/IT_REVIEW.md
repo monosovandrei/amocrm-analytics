@@ -13,6 +13,7 @@
 - PostgreSQL не должен быть доступен из интернета.
 - В `docker/docker-compose.yml` PostgreSQL публикуется только на `127.0.0.1`.
 - Backend выполняет исходящие HTTPS-запросы к amoCRM API и OAuth endpoints.
+- Backend выполняет исходящие HTTPS-запросы к Telegram Bot API, если включены Telegram-уведомления.
 - Frontend обращается только к собственному API из `VITE_API_URL`.
 
 ## Секреты
@@ -25,6 +26,7 @@
 - `CREDENTIALS_ENCRYPTION_KEY`
 - `AMOCRM_CLIENT_ID`
 - `AMOCRM_CLIENT_SECRET`
+- `TELEGRAM_BOT_TOKEN`
 - `SEED_ADMIN_PASSWORD`
 
 Пример без реальных секретов: `.env.example`.

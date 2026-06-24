@@ -1,5 +1,9 @@
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:4000/api/v1';
 
+export function apiUrl(path: string) {
+  return `${API_URL}${path}`;
+}
+
 export function getToken() {
   if (typeof window === 'undefined') return '';
   return localStorage.getItem('accessToken') || '';
@@ -38,6 +42,23 @@ export async function downloadExcel(path: string, body: unknown) {
   const a = document.createElement('a');
   a.href = url;
   a.download = 'report.xlsx';
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+export async function downloadFile(path: string, fileName: string) {
+  const token = getToken();
+  const res = await fetch(apiUrl(path), {
+    headers: {
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+  });
+  if (!res.ok) throw new Error(await res.text());
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fileName;
   a.click();
   URL.revokeObjectURL(url);
 }

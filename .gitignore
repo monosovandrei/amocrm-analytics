@@ -8,3 +8,5 @@ apps/api/src/generated/prisma/
 *.tsbuildinfo
 *.log
 .codex-run/
+tmp-*
+outputs/

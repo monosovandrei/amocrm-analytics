@@ -22,7 +22,7 @@ export class AmoService {
     const clientId = this.config.getOrThrow<string>('AMOCRM_CLIENT_ID');
     const redirectUri = this.config.getOrThrow<string>('AMOCRM_REDIRECT_URI');
     const state = crypto.randomBytes(16).toString('hex');
-    const url = new URL(`https://${domain}/oauth`);
+    const url = new URL('https://www.amocrm.ru/oauth');
     url.searchParams.set('client_id', clientId);
     url.searchParams.set('state', state);
     url.searchParams.set('mode', 'post_message');
@@ -108,7 +108,7 @@ export class AmoService {
 
   async getActiveConnectionOrFail() {
     const connection = await this.prisma.amoConnection.findFirst({
-      where: { status: { in: ['ACTIVE', 'SYNCING'] } },
+      where: { status: { in: ['ACTIVE', 'SYNCING', 'ERROR'] } },
       orderBy: { createdAt: 'desc' },
     });
     if (!connection) {
@@ -143,7 +143,7 @@ export class AmoService {
   async findByWebhookSecret(secret: string) {
     if (!secret) return null;
     const connections = await this.prisma.amoConnection.findMany({
-      where: { status: 'ACTIVE' },
+      where: { status: { in: ['ACTIVE', 'ERROR'] } },
     });
     const incoming = Buffer.from(secret);
 

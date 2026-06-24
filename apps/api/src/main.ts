@@ -1,16 +1,14 @@
 import 'reflect-metadata';
-import cookieParser from 'cookie-parser';
-import helmet from 'helmet';
+import fastifyHelmet from '@fastify/helmet';
 import { ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
-import { ExpressAdapter } from '@nestjs/platform-express';
+import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify';
 import { AppModule } from './app.module';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule, new ExpressAdapter());
+  const app = await NestFactory.create<NestFastifyApplication>(AppModule, new FastifyAdapter());
   app.setGlobalPrefix('api/v1');
-  app.use(helmet());
-  app.use(cookieParser());
+  await app.register(fastifyHelmet);
   app.enableCors({
     origin: process.env.WEB_ORIGIN?.split(',') ?? ['http://localhost:3000'],
     credentials: true,
@@ -24,7 +22,7 @@ async function bootstrap() {
   );
 
   const port = Number(process.env.PORT || 4000);
-  await app.listen(port);
+  await app.listen(port, '0.0.0.0');
 }
 
 bootstrap();

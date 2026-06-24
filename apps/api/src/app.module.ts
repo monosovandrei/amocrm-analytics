@@ -10,6 +10,7 @@ import { ReportsModule } from './reports/reports.module';
 import { SettingsModule } from './settings/settings.module';
 import { HealthModule } from './health/health.module';
 import { AuditModule } from './audit/audit.module';
+import { PlatformModule } from './platform/platform.module';
 
 @Module({
   imports: [
@@ -23,6 +24,7 @@ import { AuditModule } from './audit/audit.module';
     SettingsModule,
     HealthModule,
     AuditModule,
+    PlatformModule,
   ],
   providers: [
     {
