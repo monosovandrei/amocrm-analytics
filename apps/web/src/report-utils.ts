@@ -391,6 +391,13 @@ export function getMetric(template: Pick<ReportTemplate, 'name' | 'config'>, res
     };
   }
 
+  if (result.type === 'lossReasons') {
+    return {
+      value: formatNumber(result.summary?.total ?? 0),
+      caption: `Причин отказа: ${formatNumber((result.rows ?? []).length)}`,
+    };
+  }
+
   if (result.type === 'forecast') {
     const forecast = result.forecast ?? {};
     return {

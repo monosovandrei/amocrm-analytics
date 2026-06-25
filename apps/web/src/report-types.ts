@@ -11,7 +11,8 @@ export type MetricType =
   | 'contract'
   | 'deal_cycle'
   | 'deal_stage_age'
-  | 'revenue_profit_forecast';
+  | 'revenue_profit_forecast'
+  | 'loss_reasons';
 export type DisplayType = 'kpi' | 'funnel' | 'table' | 'forecast' | 'cycle';
 export type WidgetSize = 'sm' | 'md' | 'lg';
 export type DenominatorType = 'previous' | 'first';

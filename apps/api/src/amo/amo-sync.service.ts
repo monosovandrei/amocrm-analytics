@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { SyncJobType } from '../generated/prisma';
+import { Prisma, SyncJobType } from '../generated/prisma';
 import { toDateFromAmoTimestamp } from '../common/date.util';
 import { PrismaService } from '../prisma/prisma.service';
 import { AmoClient } from './amo-client';
@@ -136,6 +136,7 @@ export class AmoSyncService {
       await this.hydrateExistingEntityMaps(maps);
       this.logger.log(`amoCRM sync job ${jobId}: syncing deals`);
       await this.syncDeals(client, maps, stats, updatedSince);
+      await this.backfillLossReasonsFromRaw(stats);
       await this.reconcileLeadSlaDeals(client, maps, stats);
       this.logger.log(`amoCRM sync job ${jobId}: syncing notes`);
       await this.syncNotes(client, stats, updatedSince);
@@ -214,8 +215,10 @@ export class AmoSyncService {
       stats.assignedLeadNewNotifications = result.assignedLeadNew;
       stats.assignedLeadReminderNotifications = result.assignedLeadReminder;
       stats.taskMassMoveNotifications = result.taskMassMove;
+      stats.dealMassMoveNotifications = result.dealMassMove;
       stats.csmTaskMassMoveNotifications = result.csmTaskMassMove;
       stats.csmDealMassMoveNotifications = result.csmDealMassMove;
+      stats.lossWithoutReasonNotifications = result.lossWithoutReason;
       stats.csmOverdueTaskNotifications = result.csmOverdueTasks;
       stats.csmZeroTakenToWorkNotifications = result.csmZeroTakenToWork;
       stats.csmZeroOfferMadeNotifications = result.csmZeroOfferMade;
@@ -550,24 +553,10 @@ export class AmoSyncService {
     });
   }
 
-  private async syncLossReasons(client: AmoClient, pipelineId: string, pipelineExternalId: string, maps: AmoSyncMaps) {
-    try {
-      const data = await client.get<any>(`/leads/pipelines/${pipelineExternalId}/loss_reasons`);
-      for (const reason of data?._embedded?.loss_reasons ?? []) {
-        const dbReason = await this.prisma.lossReason.upsert({
-          where: {
-            pipelineId_externalId: {
-              pipelineId,
-              externalId: String(reason.id),
-            },
-          },
-          create: { pipelineId, externalId: String(reason.id), name: reason.name, raw: reason },
-          update: { name: reason.name, raw: reason },
-        });
-        maps.lossReasons.set(`${pipelineExternalId}_${reason.id}`, dbReason.id);
-      }
-    } catch (error: any) {
-      this.logger.warn(`Loss reasons sync skipped for pipeline ${pipelineExternalId}: ${error.message}`);
+  private async syncLossReasons(_client: AmoClient, pipelineId: string, pipelineExternalId: string, maps: AmoSyncMaps) {
+    const reasons = await this.prisma.lossReason.findMany({ where: { pipelineId }, select: { id: true, externalId: true } });
+    for (const reason of reasons) {
+      maps.lossReasons.set(`${pipelineExternalId}_${reason.externalId}`, reason.id);
     }
   }
 
@@ -894,7 +883,9 @@ export class AmoSyncService {
     const contactExternalId = lead._embedded?.contacts?.[0]?.id ? String(lead._embedded.contacts[0].id) : null;
     const contactId = contactExternalId ? maps.contacts.get(contactExternalId) ?? null : null;
     const responsibleId = lead.responsible_user_id ? maps.users.get(String(lead.responsible_user_id)) ?? null : null;
-    const lossReasonId = lead.loss_reason_id ? maps.lossReasons.get(`${lead.pipeline_id}_${lead.loss_reason_id}`) ?? null : null;
+    const lossReasonId = lead.loss_reason_id
+      ? await this.resolveLeadLossReasonId(lead, pipelineId, maps)
+      : null;
     const closedAt =
       toDateFromAmoTimestamp(lead.closed_at) ??
       (stage?.isWon ? toDateFromAmoTimestamp(lead.updated_at) : null);
@@ -954,6 +945,113 @@ export class AmoSyncService {
     }
 
     await this.syncDealProducts(deal.id, lead);
+  }
+
+  private async resolveLeadLossReasonId(lead: any, pipelineId: string, maps: AmoSyncMaps) {
+    const externalId = String(lead.loss_reason_id);
+    const mapKey = `${lead.pipeline_id}_${externalId}`;
+    const mapped = maps.lossReasons.get(mapKey);
+    if (mapped) return mapped;
+
+    const embeddedReason = this.extractLeadLossReason(lead);
+    const name = embeddedReason?.name || `Причина ${externalId}`;
+    const dbReason = await this.prisma.lossReason.upsert({
+      where: {
+        pipelineId_externalId: {
+          pipelineId,
+          externalId,
+        },
+      },
+      create: {
+        pipelineId,
+        externalId,
+        name,
+        raw: embeddedReason ?? { id: externalId, name },
+      },
+      update: {
+        name,
+        raw: embeddedReason ?? { id: externalId, name },
+      },
+    });
+    maps.lossReasons.set(mapKey, dbReason.id);
+    return dbReason.id;
+  }
+
+  private extractLeadLossReason(lead: any) {
+    const reason = lead._embedded?.loss_reason;
+    if (Array.isArray(reason)) return reason[0] ?? null;
+    return reason ?? null;
+  }
+
+  private async backfillLossReasonsFromRaw(stats: Record<string, number>) {
+    let total = 0;
+    while (true) {
+      const deals = await this.prisma.deal.findMany({
+        where: {
+          lossReasonId: null,
+          raw: { path: ['loss_reason_id'], not: Prisma.JsonNull } as any,
+        },
+        select: { id: true, pipelineId: true, raw: true },
+        take: 50_000,
+      });
+      if (!deals.length) break;
+
+      const grouped = new Map<
+        string,
+        { pipelineId: string; externalId: string; name: string; raw: any; dealIds: string[] }
+      >();
+      for (const deal of deals) {
+        const raw = deal.raw as any;
+        const externalId = raw?.loss_reason_id ? String(raw.loss_reason_id) : null;
+        if (!externalId) continue;
+        const embeddedReason = this.extractLeadLossReason(raw);
+        const name = embeddedReason?.name || `Причина ${externalId}`;
+        const key = `${deal.pipelineId}_${externalId}`;
+        if (!grouped.has(key)) {
+          grouped.set(key, {
+            pipelineId: deal.pipelineId,
+            externalId,
+            name,
+            raw: embeddedReason ?? { id: externalId, name },
+            dealIds: [],
+          });
+        }
+        grouped.get(key)!.dealIds.push(deal.id);
+      }
+
+      let changed = 0;
+      for (const group of grouped.values()) {
+        const dbReason = await this.prisma.lossReason.upsert({
+          where: {
+            pipelineId_externalId: {
+              pipelineId: group.pipelineId,
+              externalId: group.externalId,
+            },
+          },
+          create: {
+            pipelineId: group.pipelineId,
+            externalId: group.externalId,
+            name: group.name,
+            raw: group.raw,
+          },
+          update: {
+            name: group.name,
+            raw: group.raw,
+          },
+        });
+        const result = await this.prisma.deal.updateMany({
+          where: {
+            id: { in: group.dealIds },
+            lossReasonId: null,
+          },
+          data: { lossReasonId: dbReason.id },
+        });
+        changed += result.count;
+      }
+      total += changed;
+      if (!changed) break;
+    }
+    stats.lossReasonsBackfilled = total;
   }
 
   private async syncTasks(

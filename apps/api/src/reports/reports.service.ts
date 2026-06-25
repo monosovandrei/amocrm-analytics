@@ -3,7 +3,15 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 import { ForbiddenException, Injectable } from '@nestjs/common';
 import { Prisma, ReportSourceType, UserRole } from '../generated/prisma';
-import { endOfMonth, median, startOfMonth, toDateFromAmoTimestamp } from '../common/date.util';
+import {
+  absoluteDurationDays,
+  endOfMonth,
+  median,
+  moscowBusinessDurationDays,
+  moscowWeekdayDurationDays,
+  startOfMonth,
+  toDateFromAmoTimestamp,
+} from '../common/date.util';
 import { AuditService } from '../audit/audit.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { ReportQueryDto, SaveReportTemplateDto } from './dto/report-query.dto';
@@ -175,6 +183,9 @@ export class ReportsService {
     if (config.metric === 'deal_stage_age') {
       return this.computeCurrentStageAgeReport(filters, user.role);
     }
+    if (config.metric === 'loss_reasons') {
+      return this.computeLossReasonsReport(filters, user.role);
+    }
     if (
       config.contract &&
       ((config.contract.metrics?.length ?? 0) > 0 ||
@@ -261,6 +272,11 @@ export class ReportsService {
     }
     if (Array.isArray(report?.rows)) {
       for (const row of report.rows) {
+        if (report.type === 'lossReasons') {
+          const numeric = Number(row.total);
+          if (Number.isFinite(numeric)) result[`Причина отказа: ${row.reasonName}`] = numeric;
+          continue;
+        }
         for (const metric of Object.values(row.metrics ?? {}) as any[]) {
           const numeric = Number(metric?.value);
           if (Number.isFinite(numeric)) result[`${row.groupName}: ${metric.label}`] = numeric;
@@ -528,10 +544,49 @@ export class ReportsService {
       this.findPipelineByName('\u0432\u043e\u0440\u043e\u043d\u043a\u0430 \u043f\u0440\u043e\u0434\u0430\u0436'),
     ]);
 
+    await this.ensureSalesLossReasonsReportTemplate(salesGroup?.id, salesPipeline?.id);
     await this.applyTeamScopeToTemplates('Sales:', salesGroup?.id, salesPipeline ? [salesPipeline.id] : undefined, true);
     await this.applyTeamScopeToTemplates('CSM:', csmGroup?.id, undefined, true);
     await this.applySalesAssignedStageSpeedMode();
     await this.applySalesLeadsReceivedMetric();
+  }
+
+  private async ensureSalesLossReasonsReportTemplate(salesGroupId?: string, salesPipelineId?: string) {
+    const name = 'Sales: причины отказа';
+    const config: ReportConfig = {
+      metric: 'loss_reasons',
+      display: 'table',
+      dashboardSection: 'sales',
+      pinned: true,
+      order: 6,
+      size: 'lg',
+      builtinKey: 'sales_loss_reasons',
+      description: 'Сделки, отправленные в отказ за выбранный период, по причинам отказа',
+      conditionLabel: 'Продажи: вход в отказ за выбранный период, по менеджерам Sales',
+      lockPipelineFilter: true,
+      lockTeamFilter: true,
+      filters: {
+        ...(salesPipelineId ? { pipelineIds: [salesPipelineId] } : {}),
+        ...(salesGroupId ? { groupIds: [salesGroupId] } : {}),
+      },
+    };
+    const data = {
+      userId: null,
+      name,
+      sourceType: 'EVENT' as ReportSourceType,
+      config: config as any,
+      position: config.order ?? 6,
+      isShared: true,
+    };
+    const existing = await this.db.reportTemplate.findFirst({ where: { name } });
+    if (!existing) {
+      await this.db.reportTemplate.create({ data });
+      return;
+    }
+    const existingConfig = existing.config as ReportConfig;
+    if (existingConfig.builtinKey === config.builtinKey) {
+      await this.db.reportTemplate.update({ where: { id: existing.id }, data });
+    }
   }
 
   private async applySalesAssignedStageSpeedMode() {
@@ -723,10 +778,12 @@ export class ReportsService {
     if (Array.isArray((report as any).steps)) {
       sheets.push(this.jsonSheet('Конверсии', (report as any).steps));
     }
-    if (Array.isArray((report as any).rows)) {
+    if ((report as any).type === 'lossReasons') {
+      sheets.push(this.jsonSheet('Причины отказа', (report as any).tableRows ?? []));
+    } else if (Array.isArray((report as any).rows)) {
       sheets.push(this.jsonSheet('Данные', (report as any).rows));
     }
-    if (Array.isArray((report as any).tableRows)) {
+    if ((report as any).type !== 'lossReasons' && Array.isArray((report as any).tableRows)) {
       sheets.push(this.jsonSheet('Data contract', (report as any).tableRows));
     }
     if ((report as any).forecast) {
@@ -951,6 +1008,7 @@ ${sheets}
             label: duration.label,
             avgDays: null,
             sampleSize: 0,
+            samples: [],
           },
         ]),
       );
@@ -1411,7 +1469,13 @@ ${sheets}
   ) {
     const result = new Map<
       string,
-      Map<string, { id: string; label: string; avgDays: number | null; sampleSize: number }>
+      Map<string, {
+        id: string;
+        label: string;
+        avgDays: number | null;
+        sampleSize: number;
+        samples: Array<{ dealId: string; dealExternalId?: string | null; dealTitle: string; durationDays: number }>;
+      }>
     >();
     const stageIds = durations.map((item) => item.stageId).filter(Boolean);
     if (stageIds.length === 0) return result;
@@ -1487,7 +1551,9 @@ ${sheets}
 
     for (const duration of durations) {
       const byGroupValues = new Map<string, number[]>();
+      const byGroupSamples = new Map<string, Array<{ dealId: string; dealExternalId?: string | null; dealTitle: string; durationDays: number }>>();
       byGroupValues.set('all', []);
+      byGroupSamples.set('all', []);
 
       for (const entry of entries.filter((item) => item.toStageId === duration.stageId)) {
         const history = historiesByDeal.get(entry.dealId) ?? [];
@@ -1508,13 +1574,25 @@ ${sheets}
           : { startedAt: entry.movedAt, managerId: entry.deal.responsibleId ?? 'unassigned' };
         if (!start || endAt <= start.startedAt) continue;
 
-        const days = (endAt.getTime() - start.startedAt.getTime()) / 86_400_000;
+        const days = duration.startMode === 'sales_responsible_task'
+          ? this.businessDurationDays(start.startedAt, endAt)
+          : this.durationDays(start.startedAt, endAt);
+        if (days === null) continue;
         const groupId = start.managerId ?? entry.deal.responsibleId ?? 'unassigned';
         const groupName = groups.get(groupId)?.name ?? entry.deal.responsible?.name ?? 'Без менеджера';
+        const sample = {
+          dealId: entry.deal.id,
+          dealExternalId: entry.deal.externalId,
+          dealTitle: entry.deal.title,
+          durationDays: days,
+        };
         groups.set(groupId, { id: groupId, name: groupName });
         byGroupValues.get('all')!.push(days);
+        byGroupSamples.get('all')!.push(sample);
         if (!byGroupValues.has(groupId)) byGroupValues.set(groupId, []);
+        if (!byGroupSamples.has(groupId)) byGroupSamples.set(groupId, []);
         byGroupValues.get(groupId)!.push(days);
+        byGroupSamples.get(groupId)!.push(sample);
       }
 
       result.set(
@@ -1527,6 +1605,7 @@ ${sheets}
               label: duration.label,
               avgDays: values.length ? Number((values.reduce((sum, value) => sum + value, 0) / values.length).toFixed(2)) : null,
               sampleSize: values.length,
+              samples: (byGroupSamples.get(groupId) ?? []).sort((a, b) => b.durationDays - a.durationDays),
             },
           ]),
         ),
@@ -1937,6 +2016,114 @@ ${sheets}
     };
   }
 
+  private async computeLossReasonsReport(filters: ReportFilters, role: UserRole) {
+    const range = this.dateRange(filters);
+    const managers = await this.visibleManagers(role, filters.groupIds, filters.managerIds);
+    const managerIds = new Set(managers.map((manager) => manager.id));
+    const stageRows = await this.db.pipelineStage.findMany({
+      where: this.compactWhere({
+        pipelineId: filters.pipelineIds?.length ? { in: filters.pipelineIds } : undefined,
+        isVisible: true,
+      }),
+      select: {
+        id: true,
+        name: true,
+        isLost: true,
+      },
+    });
+    const lostStageIds = stageRows.filter((stage) => this.isBusinessLostStage(stage)).map((stage) => stage.id);
+    if (!lostStageIds.length) {
+      return {
+        type: 'lossReasons',
+        periodBasis: 'lostStageEntry',
+        managers,
+        rows: [],
+        summary: { total: 0, values: Object.fromEntries(managers.map((manager) => [manager.id, 0])) },
+      };
+    }
+
+    const dealWhere = await this.buildDealWhere(filters, role, { ignoreStage: true });
+    const entries = await this.db.dealStageHistory.findMany({
+      where: this.compactWhere({
+        toStageId: { in: lostStageIds },
+        movedAt: range,
+        deal: dealWhere,
+      }),
+      orderBy: [{ dealId: 'asc' }, { movedAt: 'asc' }],
+      include: {
+        deal: {
+          select: {
+            ...this.dealReportSelect(),
+            lossReason: { select: { id: true, name: true } },
+          },
+        },
+      },
+    });
+
+    const firstEntryByDeal = new Map<string, any>();
+    for (const entry of entries as any[]) {
+      if (firstEntryByDeal.has(entry.dealId)) continue;
+      if (!this.matchesCustomFieldFilters(entry.deal?.customFields as any, filters.customFields)) continue;
+      firstEntryByDeal.set(entry.dealId, entry);
+    }
+
+    const percent = (value: number, denominator: number) =>
+      denominator > 0 ? Number(((value / denominator) * 100).toFixed(2)) : 0;
+    const lossReasonCell = (value: number, denominator: number) => `${value} (${percent(value, denominator)}%)`;
+    const valuesByReason = new Map<string, { reasonId: string; reasonName: string; values: Record<string, number>; total: number }>();
+    const summaryValues: Record<string, number> = Object.fromEntries(managers.map((manager) => [manager.id, 0]));
+    let total = 0;
+
+    for (const entry of firstEntryByDeal.values()) {
+      const deal = entry.deal;
+      const managerId = deal?.responsibleId;
+      if (!managerId || !managerIds.has(managerId)) continue;
+      const reasonId = deal.lossReason?.id ?? deal.lossReasonId ?? 'no_reason';
+      const reasonName = deal.lossReason?.name ?? 'Без причины';
+      if (!valuesByReason.has(reasonId)) {
+        valuesByReason.set(reasonId, {
+          reasonId,
+          reasonName,
+          values: Object.fromEntries(managers.map((manager) => [manager.id, 0])),
+          total: 0,
+        });
+      }
+      const row = valuesByReason.get(reasonId)!;
+      row.values[managerId] = (row.values[managerId] ?? 0) + 1;
+      row.total += 1;
+      summaryValues[managerId] = (summaryValues[managerId] ?? 0) + 1;
+      total += 1;
+    }
+
+    const rows = [...valuesByReason.values()]
+      .map((row) => ({
+        ...row,
+        percentages: Object.fromEntries(managers.map((manager) => [
+          manager.id,
+          percent(row.values[manager.id] ?? 0, summaryValues[manager.id] ?? 0),
+        ])),
+        totalPercent: percent(row.total, total),
+      }))
+      .sort((a, b) => b.total - a.total || a.reasonName.localeCompare(b.reasonName, 'ru'));
+    const tableRows = rows.map((row) => ({
+      'Причина отказа': row.reasonName,
+      ...Object.fromEntries(managers.map((manager) => [
+        manager.name,
+        lossReasonCell(row.values[manager.id] ?? 0, summaryValues[manager.id] ?? 0),
+      ])),
+      Всего: lossReasonCell(row.total, total),
+    }));
+
+    return {
+      type: 'lossReasons',
+      periodBasis: 'lostStageEntry',
+      managers,
+      rows,
+      summary: { total, values: summaryValues },
+      tableRows,
+    };
+  }
+
   private async computeCurrentStageAgeReport(filters: ReportFilters, role: UserRole) {
     const deals = await this.findFilteredDeals(filters, role);
     const pipelineIds = filters.pipelineIds?.length
@@ -2209,7 +2396,7 @@ ${sheets}
     const assemblyEntryByDeal = await this.firstStageEntryByDeal(assemblyDeals.map((deal) => deal.id), shippingStageIds);
     for (const deal of assemblyDeals) {
       const enteredAt = assemblyEntryByDeal.get(deal.id) ?? deal.createdAt;
-      const elapsedDays = this.durationDays(enteredAt, now) ?? 0;
+      const elapsedDays = this.absoluteDurationDays(enteredAt, now) ?? 0;
       const remainingDays = Math.max(shippingDays - elapsedDays, 0);
       const predictedShipAt = this.addDays(now, remainingDays);
       addDeal(predictedShipAt <= monthTo ? 'shippingThisMonth' : 'notThisMonth', deal, 1, 'Сборка', predictedShipAt, null, remainingDays);
@@ -2307,7 +2494,7 @@ ${sheets}
       ready: true,
       month: {
         to: monthTo.toISOString(),
-        daysLeft: Number((this.durationDays(now, monthTo) ?? 0).toFixed(1)),
+        daysLeft: Number((this.absoluteDurationDays(now, monthTo) ?? 0).toFixed(1)),
       },
       shippingCycle: {
         ...shippingCycle,
@@ -2439,7 +2626,7 @@ ${sheets}
       .map(([dealId, successAt]) => {
         const firstAt = firstEntryByDeal.get(dealId);
         if (!firstAt || successAt <= firstAt) return null;
-        return (successAt.getTime() - firstAt.getTime()) / 86_400_000;
+        return this.absoluteDurationDays(firstAt, successAt);
       })
       .filter((value): value is number => value !== null);
 
@@ -2689,7 +2876,7 @@ ${sheets}
       if (targetRange && !this.isDateInRange(targetEntry.movedAt, targetRange)) continue;
       const firstEntry = dealEntries.find((entry) => fromStageIds.includes(entry.toStageId) && entry.movedAt <= targetEntry.movedAt);
       const startedAt = firstEntry?.movedAt ?? targetEntry.deal.createdAt;
-      const duration = this.durationDays(startedAt, targetEntry.movedAt);
+      const duration = this.absoluteDurationDays(startedAt, targetEntry.movedAt);
       if (duration !== null) values.push(duration);
     }
     return {
@@ -2732,7 +2919,7 @@ ${sheets}
           .reverse()
           .find((entry) => entry.toStageId === stageId && entry.movedAt < successEntry.movedAt);
         if (!stageEntry) continue;
-        const duration = this.durationDays(stageEntry.movedAt, successEntry.movedAt);
+        const duration = this.absoluteDurationDays(stageEntry.movedAt, successEntry.movedAt);
         if (duration === null) continue;
         add(`${managerId}:${stageId}`, duration);
         add(`all:${stageId}`, duration);
@@ -2909,6 +3096,7 @@ ${sheets}
       lossReasonId: true,
       pipeline: { select: { id: true, name: true } },
       stage: { select: { id: true, name: true, isWon: true, isLost: true } },
+      lossReason: { select: { id: true, name: true } },
       responsible: {
         select: {
           id: true,
@@ -2937,13 +3125,20 @@ ${sheets}
   }
 
   private durationDays(from: Date, to: Date) {
-    if (to <= from) return null;
-    return (to.getTime() - from.getTime()) / 86_400_000;
+    return moscowWeekdayDurationDays(from, to);
   }
 
   private terminalDurationDays(from: Date, to: Date) {
-    if (to < from) return null;
-    return (to.getTime() - from.getTime()) / 86_400_000;
+    if (to.getTime() === from.getTime()) return 0;
+    return moscowWeekdayDurationDays(from, to);
+  }
+
+  private businessDurationDays(from: Date, to: Date) {
+    return moscowBusinessDurationDays(from, to);
+  }
+
+  private absoluteDurationDays(from: Date, to: Date) {
+    return absoluteDurationDays(from, to);
   }
 
   private terminalCycleAt(

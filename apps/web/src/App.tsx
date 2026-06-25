@@ -135,6 +135,7 @@ const metricLabels: Record<MetricType, string> = {
   contract: 'Контракт данных',
   deal_cycle: 'Цикл сделки',
   deal_stage_age: 'Текущие этапы',
+  loss_reasons: 'Причины отказа',
 };
 
 const displayLabels: Record<DisplayType, string> = {
@@ -313,13 +314,19 @@ const taskStatusLabels: Record<string, string> = {
 };
 
 function isWideMetric(metric?: MetricType) {
-  return metric === 'contract' || metric === 'deal_cycle' || metric === 'deal_stage_age' || metric === 'revenue_profit_forecast';
+  return (
+    metric === 'contract' ||
+    metric === 'deal_cycle' ||
+    metric === 'deal_stage_age' ||
+    metric === 'revenue_profit_forecast' ||
+    metric === 'loss_reasons'
+  );
 }
 
 function defaultDisplayForMetric(metric?: MetricType): DisplayType {
   if (metric === 'forecast' || metric === 'revenue_profit_forecast') return 'forecast';
   if (metric === 'deal_cycle' || metric === 'deal_stage_age') return 'cycle';
-  if (metric === 'contract') return 'table';
+  if (metric === 'contract' || metric === 'loss_reasons') return 'table';
   return 'kpi';
 }
 
@@ -3151,13 +3158,23 @@ function LeadSlaTab() {
 function leadSlaRuntime(card: LeadSlaCard, nowMs: number) {
   const startMs = Date.parse(card.startAt);
   const dueMs = Date.parse(card.dueAt);
-  const totalSeconds = Math.max(1, Math.round((dueMs - startMs) / 1000));
-  const elapsedSeconds = Math.max(0, Math.round((nowMs - startMs) / 1000));
-  const remainingSeconds = Math.max(0, Math.round((dueMs - nowMs) / 1000));
+  if (!Number.isFinite(startMs) || !Number.isFinite(dueMs)) {
+    return {
+      elapsedSeconds: card.elapsedSeconds,
+      progressPercent: card.progressPercent,
+      status: card.status,
+      statusLabel: card.statusLabel,
+      totalSeconds: Math.max(1, card.elapsedSeconds + card.remainingSeconds),
+    };
+  }
+
+  const totalSeconds = Math.max(1, Math.round(moscowBusinessElapsedSeconds(startMs, dueMs)));
+  const elapsedSeconds = Math.max(0, Math.round(moscowBusinessElapsedSeconds(startMs, nowMs)));
+  const remainingSeconds = Math.max(0, totalSeconds - elapsedSeconds);
   const progressPercent = Math.min(100, Math.max(0, Math.round((elapsedSeconds / totalSeconds) * 100)));
   const status = nowMs < startMs
     ? 'waiting'
-    : nowMs >= dueMs
+    : elapsedSeconds >= totalSeconds
       ? 'overdue'
       : remainingSeconds <= 5 * 60
         ? 'warning'
@@ -3170,6 +3187,82 @@ function leadSlaRuntime(card: LeadSlaCard, nowMs: number) {
     statusLabel: leadSlaStatusLabel(status),
     totalSeconds,
   };
+}
+
+const MOSCOW_WORKDAY_START_HOUR = 10;
+const MOSCOW_WORKDAY_END_HOUR = 19;
+
+function moscowBusinessElapsedSeconds(startMs: number, endMs: number) {
+  if (endMs <= startMs) return 0;
+  let cursor = startMs;
+  let total = 0;
+
+  while (cursor < endMs) {
+    const workStart = nextMoscowBusinessStartMs(cursor);
+    if (workStart >= endMs) break;
+
+    const parts = moscowPartsFromMs(workStart);
+    const workEnd = moscowDateMs(parts.year, parts.month, parts.day, MOSCOW_WORKDAY_END_HOUR);
+    const chunkEnd = Math.min(workEnd, endMs);
+    total += Math.max(0, chunkEnd - workStart);
+    cursor = workEnd + 1;
+  }
+
+  return total / 1000;
+}
+
+function nextMoscowBusinessStartMs(value: number) {
+  const parts = moscowPartsFromMs(value);
+  const minutes = parts.hour * 60 + parts.minute;
+
+  if (isMoscowBusinessDay(parts) && minutes < MOSCOW_WORKDAY_START_HOUR * 60) {
+    return moscowDateMs(parts.year, parts.month, parts.day, MOSCOW_WORKDAY_START_HOUR);
+  }
+  if (isMoscowBusinessDay(parts) && minutes < MOSCOW_WORKDAY_END_HOUR * 60) {
+    return value;
+  }
+
+  for (let offset = 1; offset <= 7; offset += 1) {
+    const candidate = moscowPartsFromMs(moscowDateMs(parts.year, parts.month, parts.day + offset, 12));
+    if (isMoscowBusinessDay(candidate)) {
+      return moscowDateMs(candidate.year, candidate.month, candidate.day, MOSCOW_WORKDAY_START_HOUR);
+    }
+  }
+  return moscowDateMs(parts.year, parts.month, parts.day + 1, MOSCOW_WORKDAY_START_HOUR);
+}
+
+function moscowPartsFromMs(value: number) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Moscow',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(new Date(value));
+  const partValue = (type: string) => Number(parts.find((part) => part.type === type)?.value ?? 0);
+  const year = partValue('year');
+  const month = partValue('month');
+  const day = partValue('day');
+  return {
+    year,
+    month,
+    day,
+    hour: partValue('hour'),
+    minute: partValue('minute'),
+    second: partValue('second'),
+    dayOfWeek: new Date(Date.UTC(year, month - 1, day)).getUTCDay(),
+  };
+}
+
+function moscowDateMs(year: number, month: number, day: number, hour: number, minute = 0, second = 0, ms = 0) {
+  return Date.UTC(year, month - 1, day, hour - 3, minute, second, ms);
+}
+
+function isMoscowBusinessDay(parts: { dayOfWeek: number }) {
+  return parts.dayOfWeek >= 1 && parts.dayOfWeek <= 5;
 }
 
 function leadSlaStatusLabel(status: string) {
@@ -4453,10 +4546,10 @@ function ReportResultDetails({
                 <th title={duration.label}>{duration.label}</th>
                 {columns.map((column) => {
                   if (column.summary) return <td key={`${column.id}-${duration.id}`} className="summary-col muted">-</td>;
-                  const value = (column.row?.durations as Record<string, any>)?.[duration.id] ?? {};
+                  const value = ((column.row?.durations as Record<string, ContractDurationValue>)?.[duration.id] ?? {}) as ContractDurationValue;
                   return (
-                    <td key={`${column.id}-${duration.id}`} className="mono-num">
-                      {formatDurationFromDays(value.avgDays)}
+                    <td key={`${column.id}-${duration.id}`} className="duration-popover-cell mono-num">
+                      <ContractDurationCell amoDomain={amoDomain} value={value} />
                     </td>
                   );
                 })}
@@ -4476,6 +4569,10 @@ function ReportResultDetails({
         </table>
       </div>
     );
+  }
+
+  if (result.type === 'lossReasons') {
+    return <LossReasonsReport result={result} />;
   }
 
   if (result.type === 'forecast') {
@@ -4560,6 +4657,124 @@ function ReportResultDetails({
   }
 
   return <div className="muted text-sm">Всего сделок: {(result.summary?.count ?? 0) as number}</div>;
+}
+
+type ContractDurationSample = {
+  dealId: string;
+  dealExternalId?: string;
+  dealTitle: string;
+  durationDays: number;
+};
+
+type ContractDurationValue = {
+  avgDays?: number | null;
+  sampleSize?: number;
+  samples?: ContractDurationSample[];
+};
+
+function ContractDurationCell({ amoDomain, value }: { amoDomain: string; value: ContractDurationValue }) {
+  const samples = value.samples ?? [];
+  const label = formatDurationFromDays(value.avgDays);
+  if (!samples.length) return <>{label}</>;
+
+  return (
+    <span className="duration-popover-trigger" tabIndex={0}>
+      {label}
+      <span className="duration-popover">
+        <span className="deal-cycle-tooltip-title">Сделки в расчёте</span>
+        <span className="deal-cycle-tooltip-meta">В расчёте: {formatNumber(value.sampleSize ?? samples.length)} сделок</span>
+        <span className="deal-cycle-tooltip-list">
+          {samples.map((sample, index) => {
+            const dealUrl = buildAmoDealUrl(amoDomain, sample.dealExternalId);
+            return (
+              <span key={`${sample.dealId}-${index}`} className="deal-cycle-tooltip-row">
+                {dealUrl ? (
+                  <a className="deal-cycle-tooltip-link" href={dealUrl} target="_blank" rel="noreferrer" title={sample.dealTitle}>
+                    {sample.dealTitle}
+                  </a>
+                ) : (
+                  <span title={sample.dealTitle}>{sample.dealTitle}</span>
+                )}
+                <strong>{formatDurationFromDays(sample.durationDays)}</strong>
+              </span>
+            );
+          })}
+        </span>
+      </span>
+    </span>
+  );
+}
+
+type LossReasonManager = {
+  id: string;
+  name: string;
+};
+
+type LossReasonRow = {
+  reasonId: string;
+  reasonName: string;
+  values: Record<string, number>;
+  percentages?: Record<string, number>;
+  total: number;
+  totalPercent?: number;
+};
+
+function LossReasonsReport({ result }: { result: Record<string, any> }) {
+  const managers = (result.managers ?? []) as LossReasonManager[];
+  const rows = (result.rows ?? []) as LossReasonRow[];
+  const summary = (result.summary ?? {}) as { total?: number; values?: Record<string, number> };
+
+  if (!rows.length) {
+    return <div className="muted text-sm">За выбранный период отказов не найдено.</div>;
+  }
+
+  const percent = (count: number, denominator: number) =>
+    denominator > 0 ? Number(((count / denominator) * 100).toFixed(2)) : 0;
+  const cellValue = (count: number, percentValue: number) => `${formatNumber(count)} (${formatPercent(percentValue)})`;
+
+  return (
+    <div className="report-matrix-wrap">
+      <table className="report-matrix">
+        <thead>
+          <tr>
+            <th>Причина отказа</th>
+            {managers.map((manager) => (
+              <th key={manager.id} title={manager.name}>
+                {manager.name}
+              </th>
+            ))}
+            <th className="summary-col">Всего</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={row.reasonId}>
+              <th title={row.reasonName}>{row.reasonName}</th>
+              {managers.map((manager) => {
+                const value = row.values?.[manager.id] ?? 0;
+                const managerTotal = summary.values?.[manager.id] ?? 0;
+                return (
+                  <td key={`${row.reasonId}-${manager.id}`} className="mono-num">
+                    {cellValue(value, row.percentages?.[manager.id] ?? percent(value, managerTotal))}
+                  </td>
+                );
+              })}
+              <td className="summary-col mono-num">{cellValue(row.total, row.totalPercent ?? percent(row.total, summary.total ?? 0))}</td>
+            </tr>
+          ))}
+          <tr>
+            <th>Всего</th>
+            {managers.map((manager) => (
+              <td key={`summary-${manager.id}`} className="mono-num">
+                {formatNumber(summary.values?.[manager.id] ?? 0)}
+              </td>
+            ))}
+            <td className="summary-col mono-num">{formatNumber(summary.total ?? 0)}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  );
 }
 
 type DealCycleStage = {

@@ -11,9 +11,13 @@ const stages = {
   lost: { id: 'stage-lost', name: 'Отказ', pipelineId: 'pipe-sales', isWon: false, isLost: true },
 };
 
+const lossReasons = {
+  price: { id: 'loss-price', pipelineId: 'pipe-sales', externalId: '1', name: 'Дорого' },
+};
+
 const managers = {
-  first: { id: 'manager-1', name: 'Иван', groupId: 'group-1', isVisible: true, group: { id: 'group-1', name: 'Отдел А' } },
-  second: { id: 'manager-2', name: 'Ольга', groupId: 'group-1', isVisible: true, group: { id: 'group-1', name: 'Отдел А' } },
+  first: { id: 'manager-1', name: 'Иван', groupId: 'group-1', isActive: true, isVisible: true, group: { id: 'group-1', name: 'Отдел А' } },
+  second: { id: 'manager-2', name: 'Ольга', groupId: 'group-1', isActive: true, isVisible: true, group: { id: 'group-1', name: 'Отдел А' } },
 };
 
 const deals = [
@@ -27,6 +31,8 @@ const deals = [
     responsible: managers.first,
     pipeline: { id: 'pipe-sales', name: 'Продажи' },
     stage: stages.paid,
+    lossReasonId: null,
+    lossReason: null,
     customFields: { sla: { value: 15 }, margin: { value: 300 }, source: { value: 'Принят' }, marketing: { value: 'Принято' } },
     createdAt: new Date('2026-01-02T10:00:00.000Z'),
     updatedAt: new Date('2026-01-08T10:00:00.000Z'),
@@ -42,6 +48,8 @@ const deals = [
     responsible: managers.first,
     pipeline: { id: 'pipe-sales', name: 'Продажи' },
     stage: stages.invoice,
+    lossReasonId: null,
+    lossReason: null,
     customFields: { sla: { value: 30 }, margin: { value: 500 }, source: { value: 'Принят' }, marketing: { value: 'Принято' } },
     createdAt: new Date('2026-01-03T10:00:00.000Z'),
     updatedAt: new Date('2026-01-09T10:00:00.000Z'),
@@ -57,6 +65,8 @@ const deals = [
     responsible: managers.second,
     pipeline: { id: 'pipe-sales', name: 'Продажи' },
     stage: stages.kp,
+    lossReasonId: null,
+    lossReason: null,
     customFields: { sla: { value: 10 }, margin: { value: 1000 }, source: { value: 'Реклама' }, marketing: { value: 'Не принято' } },
     createdAt: new Date('2026-01-04T10:00:00.000Z'),
     updatedAt: new Date('2026-01-12T10:00:00.000Z'),
@@ -72,6 +82,8 @@ const deals = [
     responsible: managers.second,
     pipeline: { id: 'pipe-sales', name: 'Продажи' },
     stage: stages.kp,
+    lossReasonId: null,
+    lossReason: null,
     customFields: { sla: { value: 5 }, margin: { value: 2000 }, source: { value: 'Принят' }, marketing: { value: 'Принято' } },
     createdAt: new Date('2026-02-01T10:00:00.000Z'),
     updatedAt: new Date('2026-02-02T10:00:00.000Z'),
@@ -87,6 +99,8 @@ const deals = [
     responsible: managers.second,
     pipeline: { id: 'pipe-sales', name: 'Продажи' },
     stage: stages.lost,
+    lossReasonId: lossReasons.price.id,
+    lossReason: lossReasons.price,
     customFields: { sla: { value: 40 }, margin: { value: 1500 }, source: { value: 'Принят' } },
     createdAt: new Date('2026-03-01T10:00:00.000Z'),
     updatedAt: new Date('2026-03-05T10:00:00.000Z'),
@@ -103,6 +117,8 @@ const deals = [
     responsible: managers.first,
     pipeline: { id: 'pipe-sales', name: 'Продажи' },
     stage: stages.kp,
+    lossReasonId: null,
+    lossReason: null,
     customFields: { sla: { value: 20 }, margin: { value: 1200 }, source: { value: 'Принят' } },
     createdAt: new Date('2026-02-28T10:00:00.000Z'),
     updatedAt: new Date('2026-03-02T10:00:00.000Z'),
@@ -238,7 +254,7 @@ describe('ReportsService data contract', () => {
     expect(row.metrics.invoiceAmount).toMatchObject({ value: 500, unit: 'money', dealCount: 1 });
     expect(row.metrics.avgMargin).toMatchObject({ value: 600, unit: 'money', dealCount: 3 });
     expect(row.metrics.conversion).toMatchObject({ value: 66.67, unit: 'percent', dealCount: 2 });
-    expect(row.durations.kpDuration).toMatchObject({ avgDays: 1.5, sampleSize: 2 });
+    expect(row.durations.kpDuration).toMatchObject({ avgDays: 0.77, sampleSize: 2 });
   });
 
   it('counts received leads by creation date and current Marketing = accepted field', async () => {
@@ -407,10 +423,49 @@ describe('ReportsService data contract', () => {
     expect(result).toMatchObject({ type: 'dealCycle' });
     expect(qualified).toMatchObject({ avgDays: 1, sampleSize: 1 });
     expect(kp).toMatchObject({ avgDays: 2, sampleSize: 1 });
-    expect(qualifiedFromPreviousPeriodDeal).toMatchObject({ avgDays: 2, sampleSize: 1 });
+    expect(qualifiedFromPreviousPeriodDeal).toMatchObject({ avgDays: 0.54, sampleSize: 1 });
     expect(previousPeriodCreatedRow.totalDeals).toBe(1);
-    expect(row.lostCycle).toMatchObject({ avgDays: 4, sampleSize: 1 });
-    expect((result as any).summary.lostCycle).toMatchObject({ avgDays: 4, sampleSize: 1 });
+    expect(row.lostCycle).toMatchObject({ avgDays: 3.54, sampleSize: 1 });
+    expect((result as any).summary.lostCycle).toMatchObject({ avgDays: 3.54, sampleSize: 1 });
+  });
+
+  it('segments deals sent to lost by loss reason and sales manager', async () => {
+    const result = await service.compute(
+      {
+        sourceType: 'EVENT' as any,
+        filters: {
+          dateFrom: '2026-03-01T00:00:00.000Z',
+          dateTo: '2026-03-31T23:59:59.999Z',
+          pipelineIds: ['pipe-sales'],
+          groupIds: ['group-1'],
+        },
+        config: { metric: 'loss_reasons', display: 'table' },
+      } as any,
+      { id: 'user-1', role: 'ADMIN' as any },
+    );
+
+    expect(result).toMatchObject({
+      type: 'lossReasons',
+      summary: { total: 1, values: { [managers.first.id]: 0, [managers.second.id]: 1 } },
+    });
+    expect((result as any).rows).toEqual([
+      {
+        reasonId: lossReasons.price.id,
+        reasonName: lossReasons.price.name,
+        total: 1,
+        totalPercent: 100,
+        values: { [managers.first.id]: 0, [managers.second.id]: 1 },
+        percentages: { [managers.first.id]: 0, [managers.second.id]: 100 },
+      },
+    ]);
+    expect((result as any).tableRows).toEqual([
+      {
+        'Причина отказа': lossReasons.price.name,
+        [managers.first.name]: '0 (0%)',
+        [managers.second.name]: '1 (100%)',
+        Всего: '1 (100%)',
+      },
+    ]);
   });
 
   it('computes assigned-stage speed from sales responsibility and manager task to stage exit', async () => {
@@ -446,7 +501,17 @@ describe('ReportsService data contract', () => {
     const row = (result as any).rows.find((item: any) => item.groupId === managers.second.id);
     const emptyRow = (result as any).rows.find((item: any) => item.groupId === managers.first.id);
 
-    expect(row.durations.assigned_stage_speed).toMatchObject({ avgDays: 0.5, sampleSize: 1 });
+    expect(row.durations.assigned_stage_speed).toMatchObject({
+      avgDays: 0.13,
+      sampleSize: 1,
+      samples: [
+        {
+          dealId: 'deal-5',
+          dealTitle: 'Отказ',
+          durationDays: 0.125,
+        },
+      ],
+    });
     expect(emptyRow.durations.assigned_stage_speed).toMatchObject({ avgDays: null, sampleSize: 0 });
   });
 });
@@ -485,6 +550,14 @@ function createPrismaMock() {
         return Promise.resolve(template);
       }),
       findUnique: jest.fn(({ where }: any) => Promise.resolve(templates.find((template) => template.id === where.id) ?? null)),
+      findFirst: jest.fn(({ where }: any = {}) =>
+        Promise.resolve(
+          templates.find((template) => {
+            if (where?.name && template.name !== where.name) return false;
+            return true;
+          }) ?? null,
+        ),
+      ),
       findMany: jest.fn(() => Promise.resolve(templates)),
     },
     deal: {
@@ -547,9 +620,20 @@ function createPrismaMock() {
       }),
     },
     crmUser: {
-      findMany: jest.fn(() => Promise.resolve(Object.values(managers).map((manager) => ({ id: manager.id, name: manager.name })))),
+      findMany: jest.fn(({ where, select }: any = {}) => {
+        const rows = Object.values(managers).filter((manager) => matchesCrmUserWhere(manager, where ?? {}));
+        return Promise.resolve(rows.map((manager) => (select ? selectShape(manager, select) : manager)));
+      }),
     },
   };
+}
+
+function matchesCrmUserWhere(manager: (typeof managers)[keyof typeof managers], where: Where) {
+  if (where.isActive !== undefined && manager.isActive !== where.isActive) return false;
+  if (where.isVisible !== undefined && manager.isVisible !== where.isVisible) return false;
+  if (where.groupId && !matchesValue(manager.groupId, where.groupId)) return false;
+  if (where.id && !matchesValue(manager.id, where.id)) return false;
+  return true;
 }
 
 function matchesResponsibleHistoryWhere(entry: (typeof responsibleHistory)[number], where: Where) {
@@ -588,6 +672,7 @@ function matchesDealWhere(deal: (typeof deals)[number], where: Where) {
   if (where.pipelineId && !matchesValue(deal.pipelineId, where.pipelineId)) return false;
   if (where.stageId && !matchesValue(deal.stageId, where.stageId)) return false;
   if (where.responsibleId && !matchesValue(deal.responsibleId, where.responsibleId)) return false;
+  if (where.lossReasonId && !matchesValue(deal.lossReasonId, where.lossReasonId)) return false;
   if (where.createdAt && !matchesDate(deal.createdAt, where.createdAt)) return false;
   return true;
 }

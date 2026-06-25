@@ -139,7 +139,8 @@ export interface ReportConfig {
     | 'contract'
     | 'deal_cycle'
     | 'deal_stage_age'
-    | 'revenue_profit_forecast';
+    | 'revenue_profit_forecast'
+    | 'loss_reasons';
   denominator?: 'previous' | 'first';
   steps?: ConversionStep[];
   contract?: DataContractConfig;

@@ -2,6 +2,17 @@ import { Injectable, Logger } from '@nestjs/common';
 import { DeliveryStatus, PlatformBusinessRole, Prisma, UserRole } from '../generated/prisma';
 import { PrismaService } from '../prisma/prisma.service';
 import { TelegramService } from './telegram.service';
+import {
+  addMoscowBusinessTime,
+  isMoscowBusinessDay,
+  isMoscowWorkingTime,
+  MOSCOW_WORKDAY_LABEL,
+  moscowBusinessElapsedMs,
+  moscowDate,
+  moscowParts,
+  moscowWeekdayElapsedMs,
+  nextMoscowBusinessStart,
+} from '../common/date.util';
 
 type AppUser = {
   id: string;
@@ -33,8 +44,6 @@ type TelegramTemplateRecipient = {
 export class CrmEventNotificationsService {
   private readonly logger = new Logger(CrmEventNotificationsService.name);
   private readonly workSlaMinutes = 20;
-  private readonly workDayStartHour = 10;
-  private readonly workDayEndHour = 19;
   private readonly assignedLeadReminderMinutes = 10;
   private readonly offHoursFirstPingHour = 10;
   private readonly offHoursFirstPingMinute = 30;
@@ -55,7 +64,7 @@ export class CrmEventNotificationsService {
     const eventTypes = ['lead_status_changed', 'task_deadline_changed'];
     if (workField) eventTypes.push(`custom_field_${workField.externalId}_value_changed`);
 
-    const [events, paidStages, users] = await Promise.all([
+    const [events, paidStages, lostStages, users] = await Promise.all([
       this.prisma.crmEvent.findMany({
         where: {
           createdAt: { gte: since },
@@ -67,6 +76,7 @@ export class CrmEventNotificationsService {
               responsible: { include: { group: true } },
               pipeline: true,
               stage: true,
+              lossReason: true,
             },
           },
         },
@@ -74,6 +84,7 @@ export class CrmEventNotificationsService {
         take: 500,
       }),
       this.resolvePaymentStages(),
+      this.resolveLostStages(),
       this.prisma.user.findMany({
         where: { isActive: true },
         select: {
@@ -98,8 +109,10 @@ export class CrmEventNotificationsService {
       assignedLeadNew: 0,
       assignedLeadReminder: 0,
       taskMassMove: 0,
+      dealMassMove: 0,
       csmTaskMassMove: 0,
       csmDealMassMove: 0,
+      lossWithoutReason: 0,
       csmOverdueTasks: 0,
       csmZeroTakenToWork: 0,
       csmZeroOfferMade: 0,
@@ -112,11 +125,21 @@ export class CrmEventNotificationsService {
     for (const event of events) {
       try {
         if (event.type === 'lead_status_changed') {
-          const stage = this.stageFromStatusEvent(event.valueAfter, paidStages);
-          if (!stage || !event.deal) continue;
-          const sent = await this.notifyPayment(event, stage, users, domain);
-          if (sent) result.payment += 1;
-          else result.skipped += 1;
+          if (!event.deal) continue;
+          const paidStage = this.stageFromStatusEvent(event.valueAfter, paidStages);
+          if (paidStage) {
+            const sent = await this.notifyPayment(event, paidStage, users, domain);
+            if (sent) result.payment += 1;
+            else result.skipped += 1;
+            continue;
+          }
+
+          const lostStage = this.stageFromStatusEvent(event.valueAfter, lostStages);
+          if (lostStage) {
+            const sent = await this.notifyLossWithoutReason(event, lostStage, leaders, domain);
+            if (sent === true) result.lossWithoutReason += 1;
+            else if (sent === false) result.skipped += 1;
+          }
           continue;
         }
 
@@ -147,7 +170,11 @@ export class CrmEventNotificationsService {
     result.csmTaskMassMove += csmTaskMassMove.sent;
     result.skipped += csmTaskMassMove.skipped;
 
-    const csmDealMassMove = await this.notifyMassDealStageChanges(events, csmLeaders);
+    const dealMassMove = await this.notifyMassDealStageChanges(events, leaders, 'sales', 'amo_deal_mass_move');
+    result.dealMassMove += dealMassMove.sent;
+    result.skipped += dealMassMove.skipped;
+
+    const csmDealMassMove = await this.notifyMassDealStageChanges(events, csmLeaders, 'csm', 'amo_csm_deal_mass_move');
     result.csmDealMassMove += csmDealMassMove.sent;
     result.skipped += csmDealMassMove.skipped;
 
@@ -204,6 +231,53 @@ export class CrmEventNotificationsService {
 
     const delivery = await this.telegram.sendDirectMessageToCrmUser(deal.responsibleId, message, payload, undefined, eventKey);
     return delivery.status === 'SENT';
+  }
+
+  private async notifyLossWithoutReason(event: any, stage: StageWithPipeline, leaders: AppUser[], domain: string) {
+    const deal = event.deal;
+    if (!this.isSalesPipeline(stage.pipeline.name)) return null;
+    if (!this.dealHasNoLossReason(deal)) return null;
+
+    const reason = deal.lossReason?.name ?? 'Без причины';
+    const payload = {
+      type: 'amo_loss_without_reason',
+      eventId: event.externalId,
+      dealId: deal.id,
+      dealExternalId: deal.externalId,
+      managerCrmUserId: deal.responsibleId,
+      stageId: stage.id,
+      reason,
+    };
+    const message = await this.renderNotification('amo_loss_without_reason', payload.type, {
+      amount: this.formatMoney(deal.amount),
+      deal: deal.title,
+      dealUrl: this.dealUrl(domain, deal.externalId),
+      group: deal.responsible?.group?.name ?? '-',
+      manager: deal.responsible?.name ?? '-',
+      pipeline: stage.pipeline.name,
+      reason,
+      stage: stage.name,
+    });
+    const eventKey = `amo:loss-without-reason:${event.externalId}:${deal.id}`;
+    const configuredDeliveries = await this.sendConfiguredNotification('amo_loss_without_reason', message, payload, eventKey);
+    if (configuredDeliveries) return configuredDeliveries.some((delivery) => delivery?.status === 'SENT');
+
+    if (!leaders.length) {
+      await this.recordSkipped(`${eventKey}:no-leader`, message, {
+        ...payload,
+        reason: 'Нет активного РОПа Sales в платформе',
+      });
+      return false;
+    }
+
+    const deliveries = await this.telegram.sendDirectMessageToUsers(
+      leaders.map((leader) => leader.id),
+      message,
+      payload,
+      undefined,
+      eventKey,
+    );
+    return deliveries.some((delivery) => delivery?.status === 'SENT');
   }
 
   private async notifyWorkAccepted(event: any, leaders: AppUser[], domain: string) {
@@ -324,7 +398,12 @@ export class CrmEventNotificationsService {
     return { sent, skipped };
   }
 
-  private async notifyMassDealStageChanges(events: any[], leaders: AppUser[]) {
+  private async notifyMassDealStageChanges(
+    events: any[],
+    leaders: AppUser[],
+    team: 'sales' | 'csm',
+    eventType: 'amo_deal_mass_move' | 'amo_csm_deal_mass_move',
+  ) {
     if (!leaders.length) return { sent: 0, skipped: 0 };
     const stageEvents = events.filter((event) => event.type === 'lead_status_changed');
     if (!stageEvents.length) return { sent: 0, skipped: 0 };
@@ -353,18 +432,18 @@ export class CrmEventNotificationsService {
     let skipped = 0;
     for (const group of groups.values()) {
       const managerRecord = managersByExternalId.get(group.createdBy);
-      if (!this.isTeamGroup(managerRecord?.group?.name, 'csm')) continue;
+      if (!this.isTeamGroup(managerRecord?.group?.name, team)) continue;
       const dealCount = group.dealIds.size;
       if (dealCount < this.massTaskMoveThreshold) continue;
       const manager = managerRecord?.name ?? `amoCRM user ${group.createdBy}`;
-      const eventKey = `amo:csm-deal-mass-move:${group.createdBy}:${group.bucket}`;
-      const message = await this.renderNotification('amo_csm_deal_mass_move', 'amo_csm_deal_mass_move', {
+      const eventKey = `amo:deal-mass-move:${team}:${group.createdBy}:${group.bucket}`;
+      const message = await this.renderNotification(eventType, eventType, {
         manager,
         dealCount: String(dealCount),
       });
-      const configuredDeliveries = await this.sendConfiguredNotification('amo_csm_deal_mass_move', message, {
-        type: 'amo_csm_deal_mass_move',
-        team: 'csm',
+      const configuredDeliveries = await this.sendConfiguredNotification(eventType, message, {
+        type: eventType,
+        team,
         manager,
         managerExternalId: group.createdBy,
         dealCount,
@@ -378,8 +457,8 @@ export class CrmEventNotificationsService {
         leaders.map((leader) => leader.id),
         message,
         {
-          type: 'amo_csm_deal_mass_move',
-          team: 'csm',
+          type: eventType,
+          team,
           manager,
           managerExternalId: group.createdBy,
           dealCount,
@@ -686,7 +765,7 @@ export class CrmEventNotificationsService {
   private async notifyInvoiceNoPayment(deal: any, leaders: AppUser[], domain: string, now: Date) {
     if (!leaders.length) return { sent: 0, skipped: 0 };
     const enteredAt = this.currentStageEnteredAt(deal);
-    if (now.getTime() - enteredAt.getTime() < 3 * 24 * 60 * 60_000) return { sent: 0, skipped: 0 };
+    if (moscowWeekdayElapsedMs(enteredAt, now) < 3 * 24 * 60 * 60_000) return { sent: 0, skipped: 0 };
 
     const eventKey = `amo:invoice-no-payment-3d:${deal.id}:${deal.stageId}`;
     const message = await this.renderNotification('amo_invoice_no_payment_3d', 'amo_invoice_no_payment_3d', {
@@ -713,7 +792,7 @@ export class CrmEventNotificationsService {
   private async notifyProposalStale(deal: any, leaders: AppUser[], domain: string, now: Date) {
     if (!leaders.length) return { sent: 0, skipped: 0 };
     const enteredAt = this.currentStageEnteredAt(deal);
-    if (this.weekdayElapsedMs(enteredAt, now) < 24 * 60 * 60_000) return { sent: 0, skipped: 0 };
+    if (moscowWeekdayElapsedMs(enteredAt, now) < 24 * 60 * 60_000) return { sent: 0, skipped: 0 };
 
     const eventKey = `amo:proposal-stale-24h:${deal.id}:${deal.stageId}`;
     const message = await this.renderNotification('amo_proposal_stale_24h', 'amo_proposal_stale_24h', {
@@ -823,7 +902,7 @@ export class CrmEventNotificationsService {
   private assignedLeadPingSchedule(triggerAt: Date) {
     if (this.isMoscowWorkingTime(triggerAt)) {
       const firstPingAt = triggerAt;
-      const reminderPingAt = new Date(firstPingAt.getTime() + this.assignedLeadReminderMinutes * 60_000);
+      const reminderPingAt = addMoscowBusinessTime(firstPingAt, this.assignedLeadReminderMinutes * 60_000);
       return { firstPingAt, reminderPingAt };
     }
 
@@ -843,11 +922,7 @@ export class CrmEventNotificationsService {
   }
 
   private isMoscowWorkingTime(date: Date) {
-    const parts = this.moscowParts(date);
-    const minutes = parts.hour * 60 + parts.minute;
-    return this.isMoscowBusinessDay(parts) &&
-      minutes >= this.workDayStartHour * 60 &&
-      minutes < this.workDayEndHour * 60;
+    return isMoscowWorkingTime(date);
   }
 
   private currentStageEnteredAt(deal: any) {
@@ -864,22 +939,6 @@ export class CrmEventNotificationsService {
       if (!Number.isNaN(rawDate.getTime())) return rawDate;
     }
     return task.createdAt;
-  }
-
-  private weekdayElapsedMs(start: Date, end: Date) {
-    if (end <= start) return 0;
-    let cursor = start;
-    let total = 0;
-    while (cursor < end) {
-      const parts = this.moscowParts(cursor);
-      const nextDay = this.moscowDate(parts.year, parts.month, parts.day + 1, 0, 0, 0, 0);
-      const chunkEnd = nextDay < end ? nextDay : end;
-      if (this.isMoscowBusinessDay(parts)) {
-        total += Math.max(0, chunkEnd.getTime() - cursor.getTime());
-      }
-      cursor = chunkEnd;
-    }
-    return total;
   }
 
   private salesLeaderUsers(users: AppUser[]) {
@@ -1073,7 +1132,7 @@ export class CrmEventNotificationsService {
       now: now.toISOString(),
       timezone: 'Europe/Moscow',
       slaMinutes: this.workSlaMinutes,
-      workTime: 'Пн-пт 10:00-19:00 МСК',
+      workTime: MOSCOW_WORKDAY_LABEL,
       summary: {
         total: cards.length,
         waiting: cards.filter((card) => card.status === 'waiting').length,
@@ -1090,7 +1149,7 @@ export class CrmEventNotificationsService {
       now: new Date().toISOString(),
       timezone: 'Europe/Moscow',
       slaMinutes: this.workSlaMinutes,
-      workTime: 'Пн-пт 10:00-19:00 МСК',
+      workTime: MOSCOW_WORKDAY_LABEL,
       warning,
       summary: { total: 0, waiting: 0, active: 0, warning: 0, overdue: 0 },
       cards: [],
@@ -1100,8 +1159,12 @@ export class CrmEventNotificationsService {
 
   private leadSlaCard(deal: any, now: Date, domain: string) {
     const schedule = this.workSlaSchedule(deal.createdAt);
-    const elapsedSeconds = this.clampSeconds((now.getTime() - schedule.startAt.getTime()) / 1000, 0, Number.POSITIVE_INFINITY);
-    const remainingSeconds = this.clampSeconds((schedule.dueAt.getTime() - now.getTime()) / 1000, 0, schedule.allowedSeconds);
+    const elapsedSeconds = this.clampSeconds(
+      moscowBusinessElapsedMs(schedule.startAt, now) / 1000,
+      0,
+      Number.POSITIVE_INFINITY,
+    );
+    const remainingSeconds = this.clampSeconds(schedule.allowedSeconds - elapsedSeconds, 0, schedule.allowedSeconds);
     const progressPercent = schedule.allowedSeconds > 0
       ? Math.min(100, Math.round((elapsedSeconds / schedule.allowedSeconds) * 100))
       : 100;
@@ -1129,11 +1192,12 @@ export class CrmEventNotificationsService {
     };
   }
 
-  private leadSlaStatus(now: Date, schedule: { startAt: Date; dueAt: Date }) {
+  private leadSlaStatus(now: Date, schedule: { startAt: Date; dueAt: Date; allowedSeconds: number }) {
     if (now < schedule.startAt) return 'waiting';
-    if (now >= schedule.dueAt) return 'overdue';
-    const remainingMs = schedule.dueAt.getTime() - now.getTime();
-    if (remainingMs <= 5 * 60_000) return 'warning';
+    const elapsedSeconds = moscowBusinessElapsedMs(schedule.startAt, now) / 1000;
+    const remainingSeconds = schedule.allowedSeconds - elapsedSeconds;
+    if (remainingSeconds <= 0) return 'overdue';
+    if (remainingSeconds <= 5 * 60) return 'warning';
     return 'active';
   }
 
@@ -1147,7 +1211,8 @@ export class CrmEventNotificationsService {
   private workSlaIsDue(deal: any, now: Date) {
     if (!this.isSalesPipeline(deal.pipeline?.name)) return false;
     if (!this.isAssignedResponsibleStage(deal.stage?.name)) return false;
-    return now >= this.workSlaDueAt(deal.createdAt);
+    const schedule = this.workSlaSchedule(deal.createdAt);
+    return moscowBusinessElapsedMs(schedule.startAt, now) >= schedule.allowedSeconds * 1000;
   }
 
   private workSlaDueAt(createdAt: Date) {
@@ -1156,66 +1221,21 @@ export class CrmEventNotificationsService {
 
   private workSlaSchedule(createdAt: Date) {
     const startAt = this.workSlaStartAt(createdAt);
-    const startParts = this.moscowParts(startAt);
-    const dayEnd = this.moscowDate(startParts.year, startParts.month, startParts.day, this.workDayEndHour, 0, 0, 0);
-    const normalDueAt = new Date(startAt.getTime() + this.workSlaMinutes * 60_000);
-    const dueAt = normalDueAt > dayEnd ? dayEnd : normalDueAt;
-    const allowedSeconds = Math.max(0, Math.round((dueAt.getTime() - startAt.getTime()) / 1000));
+    const dueAt = addMoscowBusinessTime(startAt, this.workSlaMinutes * 60_000);
+    const allowedSeconds = this.workSlaMinutes * 60;
     return { startAt, dueAt, allowedSeconds };
   }
 
   private workSlaStartAt(createdAt: Date) {
-    const parts = this.moscowParts(createdAt);
-    const minutes = parts.hour * 60 + parts.minute;
-
-    if (!this.isMoscowBusinessDay(parts) || minutes >= this.workDayEndHour * 60) {
-      return this.nextMoscowBusinessStart(parts);
-    }
-    if (minutes < this.workDayStartHour * 60) {
-      return this.moscowDate(parts.year, parts.month, parts.day, this.workDayStartHour, 0, 0, 0);
-    }
-    return createdAt;
+    return nextMoscowBusinessStart(createdAt);
   }
 
   private isMoscowBusinessDay(parts: { dayOfWeek: number }) {
-    return parts.dayOfWeek >= 1 && parts.dayOfWeek <= 5;
-  }
-
-  private nextMoscowBusinessStart(parts: { year: number; month: number; day: number }) {
-    for (let offset = 1; offset <= 7; offset += 1) {
-      const candidate = this.moscowParts(this.moscowDate(parts.year, parts.month, parts.day + offset, 12, 0, 0, 0));
-      if (this.isMoscowBusinessDay(candidate)) {
-        return this.moscowDate(candidate.year, candidate.month, candidate.day, this.workDayStartHour, 0, 0, 0);
-      }
-    }
-    return this.moscowDate(parts.year, parts.month, parts.day + 1, this.workDayStartHour, 0, 0, 0);
+    return isMoscowBusinessDay(parts);
   }
 
   private moscowParts(date: Date) {
-    const parts = new Intl.DateTimeFormat('en-CA', {
-      timeZone: 'Europe/Moscow',
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-      hourCycle: 'h23',
-    }).formatToParts(date);
-    const value = (type: string) => Number(parts.find((part) => part.type === type)?.value ?? 0);
-    const year = value('year');
-    const month = value('month');
-    const day = value('day');
-    const dayOfWeek = new Date(Date.UTC(year, month - 1, day)).getUTCDay();
-    return {
-      year,
-      month,
-      day,
-      hour: value('hour'),
-      minute: value('minute'),
-      second: value('second'),
-      dayOfWeek,
-    };
+    return moscowParts(date);
   }
 
   private moscowDateKey(date: Date) {
@@ -1224,7 +1244,7 @@ export class CrmEventNotificationsService {
   }
 
   private moscowDate(year: number, month: number, day: number, hour: number, minute: number, second: number, ms: number) {
-    return new Date(Date.UTC(year, month - 1, day, hour - 3, minute, second, ms));
+    return moscowDate(year, month, day, hour, minute, second, ms);
   }
 
   private clampSeconds(value: number, min: number, max: number) {
@@ -1318,6 +1338,12 @@ export class CrmEventNotificationsService {
     if (type === 'amo_task_mass_reschedule') {
       return '{manager} \u043f\u0435\u0440\u0435\u043d\u0435\u0441 {taskCount} \u0437\u0430\u0434\u0430\u0447, \u043f\u0440\u043e\u0432\u0435\u0440\u044c.';
     }
+    if (type === 'amo_deal_mass_move') {
+      return '{manager} \u043f\u0435\u0440\u0435\u043d\u0435\u0441 {dealCount} \u0441\u0434\u0435\u043b\u043e\u043a, \u043f\u0440\u043e\u0432\u0435\u0440\u044c.';
+    }
+    if (type === 'amo_loss_without_reason') {
+      return '\u0421\u0434\u0435\u043b\u043a\u0430 \u0437\u0430\u043a\u0440\u044b\u0442\u0430 \u0432 \u043e\u0442\u043a\u0430\u0437 \u0431\u0435\u0437 \u043f\u0440\u0438\u0447\u0438\u043d\u044b.\n\u0421\u0434\u0435\u043b\u043a\u0430: {deal}\n\u041c\u0435\u043d\u0435\u0434\u0436\u0435\u0440: {manager}\n\u0421\u0443\u043c\u043c\u0430: {amount}\n\u0421\u0441\u044b\u043b\u043a\u0430: {dealUrl}';
+    }
     if (type === 'amo_csm_task_mass_reschedule') {
       return '{manager} \u043f\u0435\u0440\u0435\u043d\u0435\u0441 {taskCount} \u0437\u0430\u0434\u0430\u0447, \u043f\u0440\u043e\u0432\u0435\u0440\u044c.';
     }
@@ -1351,6 +1377,14 @@ export class CrmEventNotificationsService {
     });
     const paidStages = stages.filter((stage) => this.isPaymentStage(stage.name));
     return new Map(paidStages.map((stage) => [`${stage.pipeline.externalId}_${stage.externalId}`, stage]));
+  }
+
+  private async resolveLostStages() {
+    const stages = await this.prisma.pipelineStage.findMany({
+      include: { pipeline: true },
+    });
+    const lostStages = stages.filter((stage) => stage.isLost || this.isLostStage(stage.name));
+    return new Map(lostStages.map((stage) => [`${stage.pipeline.externalId}_${stage.externalId}`, stage]));
   }
 
   private async resolveLeadCustomFieldByName(name: string) {
@@ -1408,6 +1442,19 @@ export class CrmEventNotificationsService {
       normalized === 'paid' ||
       normalized === 'paid!' ||
       normalized.includes(this.normalizeText('\u043e\u043f\u043b\u0430\u0447\u0435\u043d\u043e'));
+  }
+
+  private isLostStage(name: string) {
+    const normalized = this.normalizeText(name);
+    return normalized.includes(this.normalizeText('\u043e\u0442\u043a\u0430\u0437')) ||
+      normalized.includes(this.normalizeText('\u043d\u0435 \u0440\u0435\u0430\u043b\u0438\u0437\u043e\u0432\u0430\u043d\u043e')) ||
+      normalized.includes(this.normalizeText('\u043d\u0435\u0440\u0435\u0430\u043b\u0438\u0437\u043e\u0432\u0430\u043d\u043e')) ||
+      normalized === 'lost';
+  }
+
+  private dealHasNoLossReason(deal: any) {
+    const reasonName = this.normalizeText(deal?.lossReason?.name ?? '');
+    return !deal?.lossReasonId || reasonName === this.normalizeText('\u0411\u0435\u0437 \u043f\u0440\u0438\u0447\u0438\u043d\u044b');
   }
 
   private async salesPipelineIds() {

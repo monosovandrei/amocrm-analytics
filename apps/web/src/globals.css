@@ -1143,7 +1143,7 @@ button:disabled {
 
 .report-matrix-wrap {
   max-width: 100%;
-  overflow: hidden;
+  overflow: visible;
   border: 1px solid var(--pb-border);
   border-radius: 8px;
   background: #fff;
@@ -1215,6 +1215,56 @@ button:disabled {
 .report-matrix .summary-col {
   background: #edf5ff;
   font-weight: 800;
+}
+
+.report-matrix td.duration-popover-cell {
+  overflow: visible;
+  position: relative;
+}
+
+.duration-popover-trigger {
+  position: relative;
+  display: inline-flex;
+  cursor: default;
+  outline: none;
+}
+
+.duration-popover-trigger:focus {
+  outline: 2px solid var(--pb-primary);
+  outline-offset: 2px;
+}
+
+.duration-popover {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 30;
+  display: grid;
+  width: min(380px, calc(100vw - 56px));
+  max-height: 300px;
+  gap: 8px;
+  overflow: hidden;
+  border: 1px solid var(--pb-border);
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 16px 38px rgba(15, 23, 42, 0.18);
+  color: var(--pb-text-primary);
+  opacity: 0;
+  padding: 12px;
+  pointer-events: none;
+  text-align: left;
+  transform: translateY(-4px);
+  transition:
+    opacity 120ms ease,
+    transform 120ms ease;
+}
+
+.duration-popover-trigger:hover .duration-popover,
+.duration-popover-trigger:focus .duration-popover,
+.duration-popover-trigger:focus-within .duration-popover {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0);
 }
 
 .revenue-forecast-report {
