@@ -411,6 +411,62 @@ export interface PlanFactRow {
   completionPercent?: number | null;
 }
 
+export interface PlanFactMetric {
+  key: string;
+  label: string;
+  unit: 'number' | 'money' | 'percent';
+  team: 'sales' | 'csm';
+  kind: 'additive' | 'conversion';
+}
+
+export interface PlanFactCell {
+  plan?: number | null;
+  upToDatePlan?: number | null;
+  factMonth?: number | null;
+  monthDelta?: number | null;
+  monthCompletionPercent?: number | null;
+  todayPlan?: number | null;
+  factToday?: number | null;
+  todayDelta?: number | null;
+  unit: 'number' | 'money' | 'percent';
+}
+
+export interface PlanFactTargetRow {
+  targetType: 'MANAGER' | 'GROUP';
+  targetId: string;
+  targetName: string;
+  values: Record<string, PlanFactCell>;
+}
+
+export interface PlanFactTeam {
+  key: 'sales' | 'csm';
+  name: string;
+  groupId: string;
+  metrics: PlanFactMetric[];
+  rows: PlanFactTargetRow[];
+  total: PlanFactTargetRow;
+}
+
+export interface PlanFactReport {
+  planSet?: PlanSet | null;
+  month: string;
+  generatedAt: string;
+  calendar: {
+    monthStart: string;
+    monthEnd: string;
+    todayStart: string;
+    todayEnd: string;
+    workdaysInMonth: number;
+    workedDays: number;
+    remainingWorkdaysIncludingToday: number;
+    isCurrentMonth: boolean;
+    isTodayWorkday: boolean;
+  };
+  metrics: PlanFactMetric[];
+  warnings: string[];
+  teams: PlanFactTeam[];
+}
+
 export interface QualityRule {
   id: string;
   code: string;

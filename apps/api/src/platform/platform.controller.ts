@@ -35,6 +35,16 @@ export class PlatformController {
     return this.platform.leadSlaCards();
   }
 
+  @Get('email-threads/pending')
+  pendingEmailThreads(@Req() req: AuthRequest) {
+    return this.platform.pendingEmailThreads(req.user);
+  }
+
+  @Post('email-threads/dismiss')
+  dismissEmailThread(@Req() req: AuthRequest, @Body() body: Record<string, any>) {
+    return this.platform.dismissEmailThread(req.user, body);
+  }
+
   @Post('telegram/link-code')
   createTelegramLinkCode(@Req() req: AuthRequest) {
     return this.platform.createTelegramLinkCode(req.user.id);
@@ -135,8 +145,13 @@ export class PlatformController {
   }
 
   @Get('plans/fact')
-  planFact(@Query('planSetId') planSetId?: string) {
-    return this.platform.planFact(planSetId);
+  planFact(@Req() req: AuthRequest, @Query('planSetId') planSetId?: string, @Query('month') month?: string) {
+    return this.platform.planFact(req.user, planSetId, month);
+  }
+
+  @Patch('plans/fact')
+  updatePlanFact(@Req() req: AuthRequest, @Body() body: Record<string, any>) {
+    return this.platform.updatePlanFact(req.user, body);
   }
 
   @Get('quality/rules')

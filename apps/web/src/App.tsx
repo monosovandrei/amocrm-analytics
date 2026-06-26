@@ -28,6 +28,7 @@ import {
   GripVertical,
   LayoutDashboard,
   LogOut,
+  Mail,
   Maximize2,
   Minimize2,
   Pin,
@@ -67,6 +68,11 @@ import type {
   MetricType,
   Options,
   AlertRule,
+  PlanFactCell,
+  PlanFactMetric,
+  PlanFactReport,
+  PlanFactTeam,
+  PlanFactTargetRow,
   PlanFactRow,
   PlanSet,
   PeriodMode,
@@ -107,11 +113,13 @@ import {
   validateDraft,
 } from './report-utils';
 
-type AppTab = Tab | 'leadSla';
+type AppTab = Tab | 'leadSla' | 'planFact' | 'emailThreads';
 
 const navItems: Array<{ id: AppTab; label: string; icon: ReactNode }> = [
   { id: 'workspace', label: 'Отчёты', icon: <LayoutDashboard size={17} /> },
+  { id: 'planFact', label: 'План-факт', icon: <BarChart3 size={17} /> },
   { id: 'leadSla', label: 'SLA лидов', icon: <Clock3 size={17} /> },
+  { id: 'emailThreads', label: 'Почта', icon: <Mail size={17} /> },
   { id: 'platform', label: 'Telegram', icon: <Activity size={17} /> },
 ];
 
@@ -186,6 +194,71 @@ type LeadSlaResponse = {
     overdue: number;
   };
   cards: LeadSlaCard[];
+};
+
+type PendingEmailMessage = {
+  id: string;
+  direction: 'incoming' | 'outgoing';
+  createdAt: string;
+  subject?: string | null;
+  summary?: string | null;
+  body?: string | null;
+  from?: string | null;
+  to?: string | null;
+  attachCount: number;
+  deliveryStatus?: string | null;
+  source: 'note' | 'event';
+};
+
+type EmailPipelineKey = 'sales' | 'base' | 'assignedCompanies';
+
+type PendingEmailThread = {
+  id: string;
+  pipelineKey: EmailPipelineKey;
+  dealId: string;
+  dealExternalId: string;
+  title: string;
+  amount: number;
+  managerName: string;
+  groupName: string;
+  pipelineName: string;
+  stageName: string;
+  contactName?: string | null;
+  contactEmail?: string | null;
+  threadId: string;
+  lastIncomingNoteExternalId: string;
+  lastIncomingAt: string;
+  waitingSeconds: number;
+  subject?: string | null;
+  summary?: string | null;
+  attachCount: number;
+  dealUrl: string;
+  messages: PendingEmailMessage[];
+};
+
+type PendingEmailThreadGroup = {
+  key: EmailPipelineKey;
+  label: string;
+  summary: {
+    total: number;
+    olderThan1h: number;
+    olderThan4h: number;
+    olderThan24h: number;
+  };
+  threads: PendingEmailThread[];
+};
+
+type PendingEmailThreadsResponse = {
+  now: string;
+  timezone: string;
+  summary: {
+    total: number;
+    olderThan1h: number;
+    olderThan4h: number;
+    olderThan24h: number;
+  };
+  groups?: PendingEmailThreadGroup[];
+  threads: PendingEmailThread[];
 };
 
 type LinkedCrmUser = {
@@ -525,7 +598,6 @@ export default function HomePage() {
   const [preview, setPreview] = useState<Record<string, any> | null>(null);
   const [message, setMessage] = useState('');
   const [refreshStamp, setRefreshStamp] = useState(0);
-  const [amoSyncState, setAmoSyncState] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
   const lastAmoSyncSeenRef = useRef<string | null>(null);
 
   const loadData = useCallback(async () => {
@@ -573,7 +645,7 @@ export default function HomePage() {
   const amoConnected = amoHasConnection && connection?.status !== 'INACTIVE';
   const lastAmoSyncAt = connection?.lastIncrementalSyncAt ?? connection?.lastFullSyncAt;
   const amoConnectionHealthy = amoConnected;
-  const amoStatusText = 'amoCRM подключена';
+  const amoStatusText = amoConnectionHealthy ? 'Синхронизация работает' : 'Синхронизация не работает';
 
   useEffect(() => {
     if (!user) return;
@@ -611,28 +683,6 @@ export default function HomePage() {
       window.clearInterval(timer);
     };
   }, [amoHasConnection, user]);
-
-  async function triggerAmoSync() {
-    if (!amoConnected) {
-      setMessage('amoCRM не подключена');
-      return;
-    }
-
-    setAmoSyncState('running');
-    try {
-      await api('/amo/sync', {
-        method: 'POST',
-        body: JSON.stringify({ type: 'INCREMENTAL' }),
-      });
-      await loadData();
-      setRefreshStamp((value) => value + 1);
-      setAmoSyncState('done');
-      setMessage('Синхронизация amoCRM запущена');
-    } catch (error) {
-      setAmoSyncState('error');
-      setMessage(error instanceof Error ? error.message : 'Синхронизация amoCRM не запущена');
-    }
-  }
 
   async function handleLogin(nextUser: User) {
     setUser(nextUser);
@@ -790,23 +840,8 @@ export default function HomePage() {
             <div className={`sync-panel ${amoConnectionHealthy ? 'sync-panel-ok' : 'sync-panel-warn'}`}>
               {amoConnectionHealthy ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}
               <div className="min-w-0">
-                <div className="sync-panel-title">{amoConnected ? amoStatusText : 'amoCRM не подключена'}</div>
-                <div className="sync-panel-meta">
-                  {amoConnected ? `Обновлено: ${formatMoscowDateTime(lastAmoSyncAt)} МСК` : 'Данные не обновляются'}
-                </div>
+                <div className="sync-panel-title">{amoStatusText}</div>
               </div>
-            </div>
-            {amoSyncState === 'error' && <span className="badge badge-red">Ошибка синхронизации</span>}
-            <div className="topbar-buttons">
-              <button
-                className="btn btn-primary"
-                type="button"
-                disabled={!amoConnected || amoSyncState === 'running'}
-                onClick={() => void triggerAmoSync()}
-              >
-                <RefreshCw size={15} />
-                {amoSyncState === 'running' ? 'Синхронизация...' : 'Синхронизировать'}
-              </button>
             </div>
             <div className="topbar-user">
                 <div className="avatar">{user.name.slice(0, 1).toUpperCase()}</div>
@@ -849,8 +884,16 @@ export default function HomePage() {
               />
             )}
 
+            {tab === 'planFact' && (
+              <PlanFactTab refreshStamp={refreshStamp} />
+            )}
+
             {tab === 'leadSla' && (
               <LeadSlaTab />
+            )}
+
+            {tab === 'emailThreads' && (
+              <EmailThreadsTab onMessage={setMessage} />
             )}
 
             {tab === 'platform' && (
@@ -3063,6 +3106,427 @@ function RuleBuilder({
   );
 }
 
+function PlanFactTab({ refreshStamp }: { refreshStamp: number }) {
+  const [month, setMonth] = useState(currentMonthInput());
+  const [report, setReport] = useState<PlanFactReport | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [editorOpen, setEditorOpen] = useState(false);
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [saveState, setSaveState] = useState<'idle' | 'dirty' | 'saving' | 'saved' | 'error'>('idle');
+  const [saveError, setSaveError] = useState('');
+  const [dirtyCount, setDirtyCount] = useState(0);
+  const dirtyKeysRef = useRef<Set<string>>(new Set());
+  const reportRef = useRef<PlanFactReport | null>(null);
+
+  const load = useCallback(async (preserveDrafts = false) => {
+    setLoading(true);
+    setError('');
+    try {
+      const next = await api<PlanFactReport>(`/platform/plans/fact?month=${encodeURIComponent(month)}`);
+      setReport(next);
+      reportRef.current = next;
+      const nextDrafts = planFactDrafts(next);
+      setDrafts((current) => {
+        if (!preserveDrafts || dirtyKeysRef.current.size === 0) return nextDrafts;
+        const merged = { ...nextDrafts };
+        for (const key of dirtyKeysRef.current) {
+          if (current[key] !== undefined) merged[key] = current[key];
+        }
+        return merged;
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Не удалось загрузить план-факт');
+    } finally {
+      setLoading(false);
+    }
+  }, [month]);
+
+  useEffect(() => {
+    dirtyKeysRef.current = new Set();
+    setDirtyCount(0);
+    setSaveState('idle');
+    setSaveError('');
+    void load(false);
+  }, [load]);
+
+  useEffect(() => {
+    if (!reportRef.current) return;
+    void load(true);
+  }, [refreshStamp, load]);
+
+  function updatePlanDraft(key: string, value: string) {
+    dirtyKeysRef.current.add(key);
+    setDirtyCount(dirtyKeysRef.current.size);
+    setDrafts((current) => ({ ...current, [key]: value }));
+    setSaveState('dirty');
+    setSaveError('');
+  }
+
+  async function savePlanChanges() {
+    const currentReport = reportRef.current ?? report;
+    const dirtyKeys = Array.from(dirtyKeysRef.current);
+    if (!currentReport || dirtyKeys.length === 0) return;
+
+    const entries = resolvePlanFactSaveEntries(currentReport, dirtyKeys, drafts);
+    if (!entries.length) return;
+
+    setSaveState('saving');
+    setSaveError('');
+    try {
+      for (const entry of entries) {
+        await api('/platform/plans/fact', {
+          method: 'PATCH',
+          body: JSON.stringify({
+            month,
+            planSetId: currentReport.planSet?.id,
+            teamKey: entry.teamKey,
+            metricKey: entry.metricKey,
+            targetType: entry.targetType,
+            targetId: entry.targetId,
+            value: entry.value,
+          }),
+        });
+      }
+      dirtyKeysRef.current = new Set();
+      setDirtyCount(0);
+      setSaveState('saved');
+      await load(false);
+    } catch (err) {
+      setSaveState('error');
+      setSaveError(readApiError(err, 'Планы не сохранены'));
+    }
+  }
+
+  return (
+    <>
+      <div className="page-row">
+        <div>
+          <h1 className="page-title">План-факт</h1>
+          <p className="page-description">
+            План к дате считается по рабочим дням месяца. Дневной план повышается при отставании и не снижается при перевыполнении.
+          </p>
+        </div>
+        <div className="plan-fact-actions">
+          <label className="plan-fact-month">
+            <span className="label">Месяц</span>
+            <input className="field" type="month" value={month} onChange={(event) => setMonth(event.target.value)} />
+          </label>
+          <button className="btn btn-secondary" type="button" onClick={() => setEditorOpen((current) => !current)}>
+            {editorOpen ? 'Скрыть планы' : 'Планы'}
+          </button>
+        </div>
+      </div>
+
+      {error && (
+        <div className="alert alert-red">
+          <AlertCircle size={17} />
+          <span>{error}</span>
+        </div>
+      )}
+
+      {report?.warnings?.length ? (
+        <div className="alert alert-yellow">
+          <AlertCircle size={17} />
+          <span>{report.warnings.join(' ')}</span>
+        </div>
+      ) : null}
+
+      {editorOpen && report && (
+        <section className="card plan-fact-editor">
+          <div className="plan-fact-editor-head">
+            <div>
+              <div className="card-title">Планы на месяц</div>
+              <p className="m-0 text-sm text-[var(--pb-text-secondary)]">
+                Пустое поле удаляет план по этой метрике.
+              </p>
+            </div>
+            <div className="plan-fact-editor-actions">
+              {saveState !== 'idle' && <span className={`plan-fact-save ${saveState}`}>{planFactSaveLabel(saveState)}</span>}
+              <button
+                className="btn btn-primary"
+                type="button"
+                disabled={saveState === 'saving' || dirtyCount === 0}
+                onClick={() => void savePlanChanges()}
+              >
+                <Save size={15} />
+                Сохранить
+              </button>
+            </div>
+          </div>
+          {saveError && (
+            <div className="alert alert-red">
+              <AlertCircle size={17} />
+              <span>{saveError}</span>
+            </div>
+          )}
+          {report.teams.map((team) => (
+            <PlanFactPlanEditor
+              key={team.key}
+              drafts={drafts}
+              team={team}
+              onDraftChange={updatePlanDraft}
+            />
+          ))}
+        </section>
+      )}
+
+      {loading && !report ? (
+        <div className="card p-5 text-sm text-[var(--pb-text-secondary)]">Считаю план-факт...</div>
+      ) : report?.teams.length ? (
+        <div className="dashboard-sections">
+          <PlanFactReportGroup
+            mode="day"
+            title="План-факт за день"
+            description="Факт сегодня против плана на сегодня"
+            teams={report.teams}
+          />
+          <PlanFactReportGroup
+            mode="uptodate"
+            title="Up-to-date"
+            description="Факт с начала месяца против плана к текущей дате"
+            teams={report.teams}
+          />
+        </div>
+      ) : (
+        <div className="empty-state">
+          <div>
+            <h2 className="mt-0 text-lg font-bold">Нет данных для план-факта</h2>
+            <p className="mt-2 text-sm text-[var(--pb-text-secondary)]">
+              Проверь группы продаж и CSM, а также этапы в amoCRM.
+            </p>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+type PlanFactViewMode = 'day' | 'uptodate';
+
+function PlanFactReportGroup({
+  description,
+  mode,
+  teams,
+  title,
+}: {
+  description: string;
+  mode: PlanFactViewMode;
+  teams: PlanFactTeam[];
+  title: string;
+}) {
+  return (
+    <section className="plan-fact-report-group">
+      <div className="dashboard-section-header static">
+        <span className="dashboard-section-title">{title}</span>
+        <span className="dashboard-section-count">{description}</span>
+      </div>
+      {teams.map((team) => (
+        <PlanFactTeamSection key={`${mode}-${team.key}`} mode={mode} team={team} />
+      ))}
+    </section>
+  );
+}
+
+function PlanFactTeamSection({ mode, team }: { mode: PlanFactViewMode; team: PlanFactTeam }) {
+  const columns = [team.total, ...team.rows];
+  return (
+    <section className="dashboard-section">
+      <div className="dashboard-section-header static">
+        <span className="dashboard-section-title">{team.name}</span>
+        <span className="dashboard-section-count">{formatNumber(team.rows.length)} менеджеров</span>
+      </div>
+      <div className="plan-fact-table-wrap">
+        <table className="plan-fact-table">
+          <thead>
+            <tr>
+              <th>Метрика</th>
+              {columns.map((row) => (
+                <th key={`${row.targetType}-${row.targetId}`}>{row.targetName}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {team.metrics.map((metric) => (
+              <tr key={metric.key}>
+                <th>{metric.label}</th>
+                {columns.map((row) => (
+                  <td key={`${row.targetType}-${row.targetId}-${metric.key}`}>
+                    <PlanFactCellView cell={row.values[metric.key]} metric={metric} mode={mode} />
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+function PlanFactCellView({ cell, metric, mode }: { cell?: PlanFactCell; metric: PlanFactMetric; mode: PlanFactViewMode }) {
+  if (!cell) return <span className="muted">-</span>;
+  const fact = mode === 'day' ? cell.factToday : cell.factMonth;
+  const plan = mode === 'day' ? cell.todayPlan : cell.upToDatePlan;
+  const delta = mode === 'day' ? cell.todayDelta : cell.monthDelta;
+  const periodLabel = mode === 'day' ? 'Сегодня' : 'К дате';
+  const tone = delta == null ? 'neutral' : delta >= 0 ? 'positive' : 'negative';
+  const title = [
+    `${periodLabel}. Факт: ${formatPlanFactValue(fact, metric.unit)}`,
+    plan == null ? `${periodLabel}. План не задан` : `${periodLabel}. План: ${formatPlanFactValue(plan, metric.unit)}`,
+    cell.plan == null ? null : `План месяца: ${formatPlanFactValue(cell.plan, metric.unit)}`,
+  ].filter(Boolean).join('\n');
+  return (
+    <div className={`plan-fact-cell ${tone}`} title={title}>
+      <div className="plan-fact-delta">{formatPlanFactDelta(delta, metric.unit)}</div>
+      <div className="plan-fact-main">
+        <span>Факт</span>
+        <strong>{formatPlanFactValue(fact, metric.unit)}</strong>
+        {plan == null ? null : <span>из {formatPlanFactValue(plan, metric.unit)}</span>}
+      </div>
+    </div>
+  );
+}
+
+function PlanFactPlanEditor({
+  drafts,
+  onDraftChange,
+  team,
+}: {
+  drafts: Record<string, string>;
+  onDraftChange: (key: string, value: string) => void;
+  team: PlanFactTeam;
+}) {
+  const columns = [team.total, ...team.rows];
+  return (
+    <div className="plan-fact-editor-team">
+      <div className="section-subtitle">{team.name}</div>
+      <div className="plan-fact-table-wrap">
+        <table className="plan-fact-plan-table">
+          <thead>
+            <tr>
+              <th>Метрика</th>
+              {columns.map((row) => (
+                <th key={`${team.key}-${row.targetType}-${row.targetId}`}>{row.targetName}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {team.metrics.map((metric) => (
+              <tr key={`${team.key}-${metric.key}`}>
+                <th>{metric.label}</th>
+                {columns.map((row) => {
+                  const key = planFactInputKey(team.key, row, metric.key);
+                  const isSharedConversionCell = metric.kind === 'conversion' && row.targetType !== 'GROUP';
+                  return (
+                    <td key={key}>
+                      {isSharedConversionCell ? (
+                        <span className="plan-fact-shared-plan">как в отделе</span>
+                      ) : (
+                        <input
+                          className="field plan-fact-plan-input"
+                          inputMode={metric.unit === 'number' ? 'numeric' : 'decimal'}
+                          value={drafts[key] ?? ''}
+                          onChange={(event) => onDraftChange(key, event.target.value)}
+                        />
+                      )}
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function planFactDrafts(report: PlanFactReport) {
+  const result: Record<string, string> = {};
+  for (const team of report.teams) {
+    for (const row of [team.total, ...team.rows]) {
+      for (const metric of team.metrics) {
+        const key = planFactInputKey(team.key, row, metric.key);
+        const value = row.values[metric.key]?.plan;
+        result[key] = value == null ? '' : String(value);
+      }
+    }
+  }
+  return result;
+}
+
+function planFactInputKey(teamKey: string, row: PlanFactTargetRow, metricKey: string) {
+  return `${teamKey}:${row.targetType}:${row.targetId}:${metricKey}`;
+}
+
+function readApiError(err: unknown, fallback: string) {
+  const text = err instanceof Error ? err.message : String(err ?? '');
+  if (!text) return fallback;
+  try {
+    const parsed = JSON.parse(text) as { message?: string | string[]; error?: string };
+    if (Array.isArray(parsed.message)) return parsed.message.join(' ');
+    return parsed.message || parsed.error || fallback;
+  } catch {
+    return text;
+  }
+}
+
+function resolvePlanFactSaveEntries(report: PlanFactReport, keys: string[], drafts: Record<string, string>) {
+  const entries: Array<{
+    key: string;
+    teamKey: PlanFactTeam['key'];
+    metricKey: string;
+    targetType: PlanFactTargetRow['targetType'];
+    targetId: string;
+    value: string;
+  }> = [];
+  for (const team of report.teams) {
+    const rows = [team.total, ...team.rows];
+    for (const row of rows) {
+      for (const metric of team.metrics) {
+        const key = planFactInputKey(team.key, row, metric.key);
+        if (!keys.includes(key)) continue;
+        if (metric.kind === 'conversion' && row.targetType !== 'GROUP') continue;
+        entries.push({
+          key,
+          teamKey: team.key,
+          metricKey: metric.key,
+          targetType: row.targetType,
+          targetId: row.targetId,
+          value: drafts[key] ?? '',
+        });
+      }
+    }
+  }
+  return entries;
+}
+
+function formatPlanFactDelta(value: number | null | undefined, unit: PlanFactMetric['unit']) {
+  if (value === null || value === undefined) return 'план не задан';
+  const prefix = value > 0 ? '+' : '';
+  if (unit === 'percent') return `${prefix}${formatNumber(value)} п.п.`;
+  return `${prefix}${formatPlanFactValue(value, unit)}`;
+}
+
+function formatPlanFactValue(value: number | null | undefined, unit: PlanFactMetric['unit']) {
+  if (value === null || value === undefined) return '-';
+  if (unit === 'number') return formatNumber(Math.ceil(Number(value)));
+  return formatMetricValue(value, unit);
+}
+
+function planFactSaveLabel(state: 'dirty' | 'saving' | 'saved' | 'error') {
+  if (state === 'dirty') return 'есть несохранённые изменения';
+  if (state === 'saving') return 'сохраняю';
+  if (state === 'saved') return 'сохранено';
+  return 'ошибка';
+}
+
+function currentMonthInput() {
+  const date = new Date();
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+}
+
 function LeadSlaTab() {
   const [data, setData] = useState<LeadSlaResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -3153,6 +3617,251 @@ function LeadSlaTab() {
       )}
     </section>
   );
+}
+
+function EmailThreadsTab({ onMessage }: { onMessage: (message: string) => void }) {
+  const [data, setData] = useState<PendingEmailThreadsResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [activeGroupKey, setActiveGroupKey] = useState<EmailPipelineKey>('sales');
+  const [selectedThreadId, setSelectedThreadId] = useState('');
+  const [closingId, setClosingId] = useState('');
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  const load = useCallback(async () => {
+    try {
+      const next = await api<PendingEmailThreadsResponse>('/platform/email-threads/pending');
+      setData(next);
+      setError('');
+    } catch (err) {
+      setError(readApiError(err, 'Не удалось загрузить письма'));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+    const timer = window.setInterval(() => void load(), 30_000);
+    return () => window.clearInterval(timer);
+  }, [load]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNowMs(Date.now()), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const groups = useMemo(() => (data ? normalizeEmailThreadGroups(data) : []), [data]);
+  const activeGroup = groups.find((group) => group.key === activeGroupKey) ?? groups[0] ?? null;
+  const threads = activeGroup?.threads ?? [];
+  const selectedThread = useMemo(
+    () => threads.find((thread) => thread.id === selectedThreadId) ?? threads[0] ?? null,
+    [threads, selectedThreadId],
+  );
+
+  useEffect(() => {
+    if (!threads.length) {
+      if (selectedThreadId) setSelectedThreadId('');
+      return;
+    }
+    if (!threads.some((thread) => thread.id === selectedThreadId)) {
+      setSelectedThreadId(threads[0].id);
+    }
+  }, [threads, selectedThreadId]);
+
+  async function dismissThread(thread: PendingEmailThread) {
+    setClosingId(thread.id);
+    try {
+      await api('/platform/email-threads/dismiss', {
+        method: 'POST',
+        body: JSON.stringify({
+          dealId: thread.dealId,
+          threadId: thread.threadId,
+          lastIncomingNoteExternalId: thread.lastIncomingNoteExternalId,
+        }),
+      });
+      onMessage('Письмо скрыто: ответ не нужен');
+      await load();
+    } catch (err) {
+      setError(readApiError(err, 'Не удалось скрыть письмо'));
+    } finally {
+      setClosingId('');
+    }
+  }
+
+  return (
+    <section className="grid gap-4">
+      <div className="page-row">
+        <div>
+          <h1 className="page-title">Письма без ответа</h1>
+        </div>
+        <button className="btn" type="button" onClick={() => void load()} disabled={loading}>
+          <RefreshCw size={15} />
+          Обновить
+        </button>
+      </div>
+
+      {error && <div className="alert alert-error"><AlertCircle size={17} />{error}</div>}
+
+      {data && (
+        <div className="email-watch-tabs" role="tablist" aria-label="Воронка писем">
+          {groups.map((group) => (
+            <button
+              key={group.key}
+              className={`email-watch-tab ${group.key === activeGroup?.key ? 'active' : ''}`}
+              type="button"
+              role="tab"
+              aria-selected={group.key === activeGroup?.key}
+              onClick={() => setActiveGroupKey(group.key)}
+            >
+              <span>{group.label}</span>
+              <strong>{group.summary.total}</strong>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {loading && !data ? (
+        <div className="card p-5 text-sm text-[var(--pb-text-secondary)]">Загрузка писем...</div>
+      ) : threads.length === 0 ? (
+        <div className="empty-state">
+          <Mail size={24} />
+          <div>
+            <strong>В этой воронке нет писем без ответа</strong>
+            <span>Входящие письма закрыты ответом или пометкой РОПа.</span>
+          </div>
+        </div>
+      ) : (
+        <div className="email-watch-layout">
+          <aside className="email-watch-list" aria-label="Письма без ответа">
+            {threads.map((thread) => {
+              const waitingSeconds = emailWaitingSeconds(thread, nowMs);
+              return (
+                <button
+                  key={thread.id}
+                  className={`email-watch-item ${selectedThread?.id === thread.id ? 'active' : ''}`}
+                  type="button"
+                  onClick={() => setSelectedThreadId(thread.id)}
+                >
+                  <span className="email-watch-item-head">
+                    <strong>{thread.title}</strong>
+                    <span>{formatEmailWait(waitingSeconds)}</span>
+                  </span>
+                  <span className="email-watch-item-meta">{thread.managerName} · {thread.stageName}</span>
+                  <span className="email-watch-item-subject">{thread.subject || 'Без темы'}</span>
+                </button>
+              );
+            })}
+          </aside>
+
+          {selectedThread && (
+            <article className="email-thread-panel">
+              <div className="email-thread-head">
+                <div className="min-w-0">
+                  <a className="email-thread-title" href={selectedThread.dealUrl} target="_blank" rel="noreferrer">
+                    {selectedThread.title}
+                  </a>
+                  <div className="email-thread-meta">{selectedThread.pipelineName} · {selectedThread.stageName}</div>
+                </div>
+                <div className="email-thread-actions">
+                  <a className="btn" href={selectedThread.dealUrl} target="_blank" rel="noreferrer">
+                    Открыть amoCRM
+                  </a>
+                  <button
+                    className="btn btn-primary"
+                    type="button"
+                    disabled={closingId === selectedThread.id}
+                    onClick={() => void dismissThread(selectedThread)}
+                  >
+                    <CheckCircle2 size={15} />
+                    Ответ не нужен
+                  </button>
+                </div>
+              </div>
+
+              <div className="email-thread-info">
+                <InfoRow label="Без ответа" value={formatEmailWait(emailWaitingSeconds(selectedThread, nowMs))} />
+                <InfoRow label="Последнее письмо" value={formatMoscowDateTime(selectedThread.lastIncomingAt)} />
+                <InfoRow label="Менеджер" value={selectedThread.managerName} />
+                <InfoRow label="Контакт" value={selectedThread.contactEmail || selectedThread.contactName || '-'} />
+              </div>
+
+              <div className="email-thread-messages">
+                {selectedThread.messages.map((message) => (
+                  <EmailMessageRow key={message.id} message={message} />
+                ))}
+              </div>
+            </article>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+const EMAIL_THREAD_GROUPS: Array<{ key: EmailPipelineKey; label: string }> = [
+  { key: 'sales', label: 'Продажи' },
+  { key: 'base', label: 'База' },
+  { key: 'assignedCompanies', label: 'Закреплённые компании' },
+];
+
+function normalizeEmailThreadGroups(data: PendingEmailThreadsResponse): PendingEmailThreadGroup[] {
+  const serverGroups = new Map((data.groups ?? []).map((group) => [group.key, group]));
+  return EMAIL_THREAD_GROUPS.map((group) => {
+    const serverGroup = serverGroups.get(group.key);
+    const threads = serverGroup?.threads ?? data.threads.filter((thread) => thread.pipelineKey === group.key);
+    return {
+      key: group.key,
+      label: serverGroup?.label ?? group.label,
+      summary: serverGroup?.summary ?? buildEmailThreadSummary(threads),
+      threads,
+    };
+  });
+}
+
+function buildEmailThreadSummary(threads: PendingEmailThread[]) {
+  return {
+    total: threads.length,
+    olderThan1h: threads.filter((thread) => thread.waitingSeconds >= 60 * 60).length,
+    olderThan4h: threads.filter((thread) => thread.waitingSeconds >= 4 * 60 * 60).length,
+    olderThan24h: threads.filter((thread) => thread.waitingSeconds >= 24 * 60 * 60).length,
+  };
+}
+
+function EmailMessageRow({ message }: { message: PendingEmailMessage }) {
+  const incoming = message.direction === 'incoming';
+  const text = message.body || message.summary;
+  return (
+    <div className={`email-message-row ${incoming ? 'incoming' : 'outgoing'}`}>
+      <div className="email-message-head">
+        <strong>{incoming ? 'Клиент' : 'Менеджер'}</strong>
+        <span>{formatMoscowDateTime(message.createdAt)}</span>
+      </div>
+      {message.subject && <div className="email-message-subject">{message.subject}</div>}
+      {text && <p>{text}</p>}
+      <div className="email-message-meta">
+        {message.from && <span>От: {message.from}</span>}
+        {message.to && <span>Кому: {message.to}</span>}
+        {message.attachCount > 0 && <span>Вложения: {message.attachCount}</span>}
+      </div>
+    </div>
+  );
+}
+
+function emailWaitingSeconds(thread: PendingEmailThread, nowMs: number) {
+  const startedAt = Date.parse(thread.lastIncomingAt);
+  if (!Number.isFinite(startedAt)) return thread.waitingSeconds;
+  return Math.max(0, Math.floor((nowMs - startedAt) / 1000));
+}
+
+function formatEmailWait(seconds: number) {
+  const safeSeconds = Math.max(0, Math.round(Number(seconds) || 0));
+  const days = Math.floor(safeSeconds / 86400);
+  const hours = Math.floor((safeSeconds % 86400) / 3600);
+  const minutes = Math.floor((safeSeconds % 3600) / 60);
+  if (days > 0) return `${days} д ${hours} ч`;
+  if (hours > 0) return `${hours} ч ${minutes} мин`;
+  return `${minutes} мин`;
 }
 
 function leadSlaRuntime(card: LeadSlaCard, nowMs: number) {

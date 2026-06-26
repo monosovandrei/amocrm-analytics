@@ -11,6 +11,8 @@ async function bootstrap() {
   await app.register(fastifyHelmet);
   app.enableCors({
     origin: process.env.WEB_ORIGIN?.split(',') ?? ['http://localhost:3000'],
+    methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: true,
   });
   app.useGlobalPipes(

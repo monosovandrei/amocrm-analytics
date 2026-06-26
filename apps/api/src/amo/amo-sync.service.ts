@@ -1109,30 +1109,43 @@ export class AmoSyncService {
     const params: Record<string, string | number> = {};
     if (updatedSince) params['filter[updated_at][from]'] = updatedSince;
 
-    const notes = await client.paginate<any>('/leads/notes', 'notes', params);
-    for (const note of notes) {
-      const deal = note.entity_id
-        ? await this.prisma.deal.findUnique({ where: { externalId: String(note.entity_id) }, select: { id: true } })
-        : null;
-      await this.prisma.note.upsert({
-        where: { externalId: String(note.id) },
-        create: {
-          externalId: String(note.id),
-          dealId: deal?.id ?? null,
-          type: note.note_type ?? 'unknown',
-          text: note.params?.text ?? null,
-          createdAt: toDateFromAmoTimestamp(note.created_at) ?? new Date(),
-          raw: note,
-        },
-        update: {
-          dealId: deal?.id ?? null,
-          type: note.note_type ?? 'unknown',
-          text: note.params?.text ?? null,
-          raw: note,
-        },
-      });
+    let total = 0;
+    for (const source of ['leads', 'contacts', 'companies']) {
+      let notes: any[] = [];
+      try {
+        notes = await client.paginate<any>(`/${source}/notes`, 'notes', params);
+      } catch (error: any) {
+        if (source === 'leads') throw error;
+        stats[`${source}NotesSkipped`] = 1;
+        this.logger.warn(`${source} notes sync skipped: ${error.message}`);
+        continue;
+      }
+
+      for (const note of notes) {
+        const deal = source === 'leads' && note.entity_id
+          ? await this.prisma.deal.findUnique({ where: { externalId: String(note.entity_id) }, select: { id: true } })
+          : null;
+        await this.prisma.note.upsert({
+          where: { externalId: String(note.id) },
+          create: {
+            externalId: String(note.id),
+            dealId: deal?.id ?? null,
+            type: note.note_type ?? 'unknown',
+            text: note.params?.text ?? null,
+            createdAt: toDateFromAmoTimestamp(note.created_at) ?? new Date(),
+            raw: note,
+          },
+          update: {
+            dealId: deal?.id ?? null,
+            type: note.note_type ?? 'unknown',
+            text: note.params?.text ?? null,
+            raw: note,
+          },
+        });
+      }
+      total += notes.length;
     }
-    stats.notes = notes.length;
+    stats.notes = total;
   }
 
   private async syncEvents(

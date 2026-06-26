@@ -13,10 +13,85 @@ import {
 } from '../generated/prisma';
 import { AuthUser } from '../auth/jwt.strategy';
 import { AuditService } from '../audit/audit.service';
+import { isMoscowBusinessDay, moscowDate, moscowParts } from '../common/date.util';
 import { PrismaService } from '../prisma/prisma.service';
 import { ReportsService } from '../reports/reports.service';
+import { DataContractMetric, ReportConfig, ReportFilters } from '../reports/report-types';
 import { TelegramService } from './telegram.service';
 import { CrmEventNotificationsService } from './crm-event-notifications.service';
+
+type PlanFactTeamKey = 'sales' | 'csm';
+type PlanFactMetricUnit = 'number' | 'money' | 'percent';
+type PlanFactMetric = {
+  key: string;
+  label: string;
+  unit: PlanFactMetricUnit;
+  team: PlanFactTeamKey;
+  kind: 'additive' | 'conversion';
+};
+
+type EmailDirection = 'incoming' | 'outgoing';
+type EmailPipelineKey = 'sales' | 'base' | 'assignedCompanies';
+
+type EmailMessageItem = {
+  id: string;
+  noteExternalId?: string | null;
+  direction: EmailDirection;
+  createdAt: Date;
+  subject: string | null;
+  summary: string | null;
+  body: string | null;
+  from: string | null;
+  to: string | null;
+  attachCount: number;
+  deliveryStatus: string | null;
+  source: 'note' | 'event';
+};
+
+type EmailThreadDraft = {
+  deal: {
+    id: string;
+    externalId: string;
+    title: string;
+    amount: unknown;
+    contactId: string | null;
+    pipeline: { name: string } | null;
+    stage: { name: string } | null;
+    responsible: { name: string; group: { name: string } | null } | null;
+    contact: { externalId: string; name: string; email: string | null } | null;
+  };
+  threadId: string;
+  messages: EmailMessageItem[];
+};
+
+const EMAIL_PIPELINE_GROUPS: Array<{ key: EmailPipelineKey; label: string }> = [
+  { key: 'sales', label: 'Продажи' },
+  { key: 'base', label: 'База' },
+  { key: 'assignedCompanies', label: 'Закреплённые компании' },
+];
+
+const PLAN_FACT_METRICS: PlanFactMetric[] = [
+  { key: 'sales_qualified_leads', label: 'Квал лиды', unit: 'number', team: 'sales', kind: 'additive' },
+  { key: 'sales_conv_lead_to_kp', label: 'Конверсия лиды -> КП', unit: 'percent', team: 'sales', kind: 'conversion' },
+  { key: 'sales_kp_count', label: 'КП', unit: 'number', team: 'sales', kind: 'additive' },
+  { key: 'sales_conv_kp_to_invoice', label: 'Конверсия КП -> счёт', unit: 'percent', team: 'sales', kind: 'conversion' },
+  { key: 'sales_invoice_count', label: 'Счета', unit: 'number', team: 'sales', kind: 'additive' },
+  { key: 'sales_conv_invoice_to_paid', label: 'Конверсия счёт -> оплата', unit: 'percent', team: 'sales', kind: 'conversion' },
+  { key: 'sales_paid_count', label: 'Оплаты', unit: 'number', team: 'sales', kind: 'additive' },
+  { key: 'sales_paid_amount', label: 'Сумма оплат', unit: 'money', team: 'sales', kind: 'additive' },
+  { key: 'sales_shipped_count', label: 'Отгрузки', unit: 'number', team: 'sales', kind: 'additive' },
+  { key: 'sales_shipped_amount', label: 'Сумма отгрузок', unit: 'money', team: 'sales', kind: 'additive' },
+  { key: 'csm_taken_to_work_count', label: 'Взяты в работу', unit: 'number', team: 'csm', kind: 'additive' },
+  { key: 'csm_conv_work_to_kp', label: 'Конверсия в работу -> КП', unit: 'percent', team: 'csm', kind: 'conversion' },
+  { key: 'csm_kp_count', label: 'КП', unit: 'number', team: 'csm', kind: 'additive' },
+  { key: 'csm_conv_kp_to_invoice', label: 'Конверсия КП -> счёт', unit: 'percent', team: 'csm', kind: 'conversion' },
+  { key: 'csm_invoice_count', label: 'Счета', unit: 'number', team: 'csm', kind: 'additive' },
+  { key: 'csm_conv_invoice_to_paid', label: 'Конверсия счёт -> оплата', unit: 'percent', team: 'csm', kind: 'conversion' },
+  { key: 'csm_paid_count', label: 'Оплаты', unit: 'number', team: 'csm', kind: 'additive' },
+  { key: 'csm_paid_amount', label: 'Сумма оплат', unit: 'money', team: 'csm', kind: 'additive' },
+  { key: 'csm_shipped_count', label: 'Отгрузки', unit: 'number', team: 'csm', kind: 'additive' },
+  { key: 'csm_shipped_amount', label: 'Сумма отгрузок', unit: 'money', team: 'csm', kind: 'additive' },
+];
 
 @Injectable()
 export class PlatformService {
@@ -240,6 +315,133 @@ export class PlatformService {
 
   leadSlaCards() {
     return this.crmEventNotifications.leadSlaCards();
+  }
+
+  async pendingEmailThreads(actor: AuthUser) {
+    this.ensureEmailThreadAccess(actor);
+
+    const now = new Date();
+    const domain = await this.resolveAmoDomain();
+    const drafts = await this.buildEmailThreadDrafts();
+    const dealIds = [...new Set(drafts.map((draft) => draft.deal.id))];
+    const dismissals = dealIds.length
+      ? await this.prisma.emailThreadDismissal.findMany({
+        where: { dealId: { in: dealIds } },
+        select: { dealId: true, threadId: true, lastIncomingNoteExternalId: true },
+      })
+      : [];
+    const dismissedKeys = new Set(
+      dismissals.map((item) => this.emailDismissalKey(item.dealId, item.threadId, item.lastIncomingNoteExternalId)),
+    );
+
+    const threads = drafts
+      .map((draft) => this.serializePendingEmailThread(draft, now, domain, dismissedKeys))
+      .filter((thread): thread is NonNullable<typeof thread> => Boolean(thread))
+      .sort((a, b) => a.lastIncomingAt.localeCompare(b.lastIncomingAt));
+
+    const groups = EMAIL_PIPELINE_GROUPS.map((group) => {
+      const groupThreads = threads.filter((thread) => thread.pipelineKey === group.key).slice(0, 200);
+      return {
+        key: group.key,
+        label: group.label,
+        summary: this.emailThreadSummary(groupThreads),
+        threads: groupThreads,
+      };
+    });
+    const visibleThreads = groups.flatMap((group) => group.threads);
+
+    return {
+      now: now.toISOString(),
+      timezone: 'Europe/Moscow',
+      summary: this.emailThreadSummary(visibleThreads),
+      groups,
+      threads: visibleThreads,
+    };
+  }
+
+  async dismissEmailThread(actor: AuthUser, body: Record<string, any>) {
+    this.ensureEmailThreadAccess(actor);
+
+    const dealId = String(body.dealId ?? '').trim();
+    const threadId = String(body.threadId ?? '').trim();
+    const lastIncomingNoteExternalId = String(body.lastIncomingNoteExternalId ?? '').trim();
+    const reason = String(body.reason ?? '').trim() || null;
+
+    if (!dealId || !threadId || !lastIncomingNoteExternalId) {
+      throw new BadRequestException('Не хватает данных треда');
+    }
+
+    const note = await this.prisma.note.findFirst({
+      where: {
+        externalId: lastIncomingNoteExternalId,
+        dealId,
+        type: 'amomail_message',
+      },
+      select: {
+        externalId: true,
+        createdAt: true,
+        raw: true,
+      },
+    });
+    const params = this.emailNoteParams(note?.raw);
+    let lastIncomingAt = note?.createdAt ?? null;
+    let eventFound = false;
+
+    if (note && params.threadId === threadId && params.income === true) {
+      lastIncomingAt = note.createdAt;
+    } else if (lastIncomingNoteExternalId.startsWith('event:')) {
+      const eventExternalId = lastIncomingNoteExternalId.slice('event:'.length);
+      const event = await this.prisma.crmEvent.findFirst({
+        where: { externalId: eventExternalId, type: 'incoming_mail' },
+        select: { createdAt: true, raw: true },
+      });
+      if (event) {
+        const entity = this.emailEventEntity(event.raw);
+        const deal = await this.prisma.deal.findUnique({
+          where: { id: dealId },
+          select: { externalId: true },
+        });
+        eventFound = this.emailEventThreadId(entity, deal?.externalId) === threadId;
+        if (eventFound) lastIncomingAt = event.createdAt;
+      }
+    }
+
+    if (!lastIncomingAt || (!note && !eventFound)) {
+      throw new NotFoundException('Входящее письмо не найдено');
+    }
+
+    const dismissal = await this.prisma.emailThreadDismissal.upsert({
+      where: {
+        dealId_threadId_lastIncomingNoteExternalId: {
+          dealId,
+          threadId,
+          lastIncomingNoteExternalId,
+        },
+      },
+      create: {
+        dealId,
+        threadId,
+        lastIncomingNoteExternalId,
+        lastIncomingAt,
+        dismissedById: actor.id,
+        reason,
+      },
+      update: {
+        dismissedById: actor.id,
+        reason,
+        lastIncomingAt,
+      },
+    });
+
+    await this.audit.record({
+      userId: actor.id,
+      action: 'platform.email_thread.dismiss',
+      entity: 'EmailThreadDismissal',
+      entityId: dismissal.id,
+      metadata: { dealId, threadId, lastIncomingNoteExternalId },
+    });
+
+    return { ok: true };
   }
 
   async listTelegramTemplates() {
@@ -552,32 +754,642 @@ export class PlatformService {
     ].join('\n');
   }
 
-  async planFact(planSetId?: string) {
+  async planFact(user: AuthUser, planSetId?: string, monthInput?: string) {
+    const month = this.parsePlanFactMonth(monthInput);
+    const calendar = this.planFactCalendar(month);
     const planSet = planSetId
       ? await this.prisma.planSet.findUnique({ where: { id: planSetId }, include: { items: true } })
       : await this.prisma.planSet.findFirst({ where: { isActive: true }, orderBy: { updatedAt: 'desc' }, include: { items: true } });
-    if (!planSet) return { planSet: null, rows: [] };
 
-    const rows = [];
-    for (const item of planSet.items) {
-      const fact = await this.computePlanFact(item);
-      const plan = Number(item.value);
-      rows.push({
-        id: item.id,
-        periodStart: item.periodStart,
-        periodEnd: item.periodEnd,
-        targetType: item.targetType,
-        targetId: item.targetId,
-        targetName: item.targetName,
-        metricKey: item.metricKey,
-        metricName: item.metricName,
-        plan,
-        fact,
-        delta: fact == null ? null : Number((fact - plan).toFixed(2)),
-        completionPercent: fact == null || plan === 0 ? null : Number(((fact / plan) * 100).toFixed(2)),
-      });
+    const refs = await this.resolvePlanFactRefs();
+    const monthItems = (planSet?.items ?? []).filter((item) =>
+      item.periodStart <= calendar.monthEnd && item.periodEnd >= calendar.monthStart,
+    );
+    const [sales, csm] = await Promise.all([
+      refs.sales ? this.buildPlanFactTeam('sales', refs.sales, refs.shipping, monthItems, calendar, user) : null,
+      refs.csm ? this.buildPlanFactTeam('csm', refs.csm, refs.shipping, monthItems, calendar, user) : null,
+    ]);
+
+    return {
+      planSet: planSet
+        ? {
+          id: planSet.id,
+          name: planSet.name,
+          year: planSet.year,
+          isActive: planSet.isActive,
+          version: planSet.version,
+        }
+        : null,
+      month: calendar.monthKey,
+      generatedAt: new Date(),
+      calendar: {
+        monthStart: calendar.monthStart,
+        monthEnd: calendar.monthEnd,
+        todayStart: calendar.todayStart,
+        todayEnd: calendar.todayEnd,
+        workdaysInMonth: calendar.workdaysInMonth,
+        workedDays: calendar.workedDays,
+        remainingWorkdaysIncludingToday: calendar.remainingWorkdaysIncludingToday,
+        isCurrentMonth: calendar.isCurrentMonth,
+        isTodayWorkday: calendar.isTodayWorkday,
+      },
+      metrics: PLAN_FACT_METRICS,
+      warnings: refs.warnings,
+      teams: [sales, csm].filter(Boolean),
+    };
+  }
+
+  async updatePlanFact(actor: AuthUser, body: Record<string, any>) {
+    this.ensureAdmin(actor);
+    const month = this.parsePlanFactMonth(String(body.month ?? ''));
+    const calendar = this.planFactCalendar(month);
+    const metric = PLAN_FACT_METRICS.find((item) => item.key === String(body.metricKey ?? ''));
+    if (!metric) throw new BadRequestException('Неизвестная метрика плана');
+    const targetType = this.parsePlanTargetType(body.targetType);
+    if (targetType === 'COMPANY') throw new BadRequestException('Для план-факта нужен менеджер или отдел');
+    if (metric.kind === 'conversion' && targetType !== 'GROUP') {
+      throw new BadRequestException('План конверсии задаётся один раз на отдел');
     }
-    return { planSet, rows };
+    const targetId = this.optionalString(body.targetId);
+    if (!targetId) throw new BadRequestException('Не выбран получатель плана');
+    const shouldClear = body.value === undefined || body.value === null || body.value === '';
+    const parsedValue = shouldClear ? null : this.optionalDecimal(body.value);
+    const value = parsedValue ? this.normalizePlanFactPlanValue(metric, parsedValue) : null;
+
+    const planSet = body.planSetId
+      ? await this.prisma.planSet.findUnique({ where: { id: String(body.planSetId) } })
+      : shouldClear
+        ? await this.prisma.planSet.findFirst({ where: { year: calendar.year, isActive: true }, orderBy: { updatedAt: 'desc' } })
+        : await this.ensurePlanFactPlanSet(actor.id, calendar.year);
+    if (!planSet) {
+      if (shouldClear) return { ok: true, deleted: false };
+      throw new NotFoundException('План не найден');
+    }
+
+    const targetName = await this.resolvePlanTargetName(targetType, targetId);
+    const existing = await this.prisma.planItem.findFirst({
+      where: {
+        planSetId: planSet.id,
+        metricKey: metric.key,
+        targetType,
+        targetId,
+        periodStart: calendar.monthStart,
+        periodEnd: calendar.monthEnd,
+      },
+    });
+
+    if (shouldClear) {
+      if (existing) {
+        await this.prisma.planItem.delete({ where: { id: existing.id } });
+        return { ok: true, deleted: true };
+      }
+      return { ok: true, deleted: false };
+    }
+    if (!value) throw new BadRequestException('Не указано значение плана');
+
+    const data = {
+      planSetId: planSet.id,
+      periodType: 'MONTH' as PlanPeriodType,
+      periodStart: calendar.monthStart,
+      periodEnd: calendar.monthEnd,
+      targetType,
+      targetId,
+      targetName,
+      metricKey: metric.key,
+      metricName: metric.label,
+      value,
+      unit: metric.unit,
+    };
+
+    const item = existing
+      ? await this.prisma.planItem.update({ where: { id: existing.id }, data })
+      : await this.prisma.planItem.create({ data });
+
+    await this.audit.record({
+      userId: actor.id,
+      action: 'platform.plan_fact.update',
+      entity: 'PlanItem',
+      entityId: item.id,
+      metadata: { month: calendar.monthKey, metricKey: metric.key, targetType, targetId },
+    });
+    return { ok: true, item, planSet };
+  }
+
+  private async ensurePlanFactPlanSet(userId: string, year: number) {
+    const existing = await this.prisma.planSet.findFirst({
+      where: { year, isActive: true },
+      orderBy: { updatedAt: 'desc' },
+    });
+    if (existing) return existing;
+    return this.prisma.planSet.create({
+      data: {
+        name: `Планы ${year}`,
+        year,
+        isActive: true,
+        createdById: userId,
+      },
+    });
+  }
+
+  private async resolvePlanTargetName(targetType: PlanTargetType, targetId: string) {
+    if (targetType === 'MANAGER') {
+      const manager = await this.prisma.crmUser.findUnique({ where: { id: targetId }, select: { name: true } });
+      return manager?.name ?? null;
+    }
+    if (targetType === 'GROUP') {
+      const group = await this.prisma.crmGroup.findUnique({ where: { id: targetId }, select: { name: true } });
+      return group?.name ?? null;
+    }
+    return null;
+  }
+
+  private parsePlanFactMonth(input?: string) {
+    const now = new Date();
+    const current = moscowParts(now);
+    const match = String(input ?? '').match(/^(\d{4})-(\d{2})$/);
+    const year = match ? Number(match[1]) : current.year;
+    const month = match ? Number(match[2]) : current.month;
+    return moscowDate(year, Math.min(Math.max(month, 1), 12), 1, 0);
+  }
+
+  private planFactCalendar(month: Date) {
+    const monthParts = moscowParts(month);
+    const monthStart = moscowDate(monthParts.year, monthParts.month, 1, 0);
+    const monthEnd = moscowDate(monthParts.year, monthParts.month + 1, 0, 23, 59, 59, 999);
+    const nowParts = moscowParts(new Date());
+    const todayStart = moscowDate(nowParts.year, nowParts.month, nowParts.day, 0);
+    const todayEnd = moscowDate(nowParts.year, nowParts.month, nowParts.day, 23, 59, 59, 999);
+    const monthKey = `${monthParts.year}-${String(monthParts.month).padStart(2, '0')}`;
+    const currentMonthKey = `${nowParts.year}-${String(nowParts.month).padStart(2, '0')}`;
+    const isCurrentMonth = monthKey === currentMonthKey;
+    const isTodayWorkday = isMoscowBusinessDay(nowParts);
+    const workedUntil = todayEnd < monthStart ? new Date(monthStart.getTime() - 1) : todayEnd < monthEnd ? todayEnd : monthEnd;
+    return {
+      year: monthParts.year,
+      month: monthParts.month,
+      monthKey,
+      monthStart,
+      monthEnd,
+      todayStart,
+      todayEnd,
+      isCurrentMonth,
+      isTodayWorkday,
+      workdaysInMonth: this.countMoscowWorkdays(monthStart, monthEnd),
+      workedDays: workedUntil >= monthStart ? this.countMoscowWorkdays(monthStart, workedUntil) : 0,
+      remainingWorkdaysIncludingToday: isCurrentMonth ? this.countMoscowWorkdays(todayStart, monthEnd) : 0,
+    };
+  }
+
+  private countMoscowWorkdays(start: Date, end: Date) {
+    if (end < start) return 0;
+    let count = 0;
+    const startParts = moscowParts(start);
+    const endParts = moscowParts(end);
+    let cursor = moscowDate(startParts.year, startParts.month, startParts.day, 12);
+    const last = moscowDate(endParts.year, endParts.month, endParts.day, 12);
+    while (cursor <= last) {
+      if (isMoscowBusinessDay(moscowParts(cursor))) count += 1;
+      const parts = moscowParts(cursor);
+      cursor = moscowDate(parts.year, parts.month, parts.day + 1, 12);
+    }
+    return count;
+  }
+
+  private async resolvePlanFactRefs() {
+    const [pipelines, salesGroup, csmGroup, marketingFieldId] = await Promise.all([
+      this.prisma.pipeline.findMany({ include: { stages: { orderBy: { position: 'asc' } } } }),
+      this.findPlanFactGroup('Sales'),
+      this.findPlanFactGroup('CSM'),
+      this.resolvePlanFactFieldExternalId('маркетинг'),
+    ]);
+    const pipelineByName = (needles: string[]) =>
+      pipelines.find((pipeline) => this.nameIncludesAll(pipeline.name, needles)) ?? null;
+    const salesPipeline = pipelineByName(['продаж']);
+    const assemblyPipeline = pipelineByName(['сбор']);
+    const basePipeline = pipelines.find((pipeline) => this.normalizeName(pipeline.name) === this.normalizeName('База')) ?? null;
+    const assignedPipeline = pipelineByName(['закреп']);
+    const warnings: string[] = [];
+
+    const sales = salesPipeline && salesGroup
+      ? {
+        key: 'sales' as const,
+        name: 'Продажи',
+        group: salesGroup,
+        pipelineIds: [salesPipeline.id],
+        stages: {
+          kp: this.findStage(salesPipeline.stages, [['кп', 'презент'], ['кп', 'отправ'], ['предлож']]),
+          invoice: this.findStage(salesPipeline.stages, [['счет', 'отправ'], ['счёт', 'отправ']]),
+          paid: this.findPaidStage(salesPipeline.stages),
+        },
+        marketingFieldId,
+      }
+      : null;
+    const csmStages = basePipeline && assignedPipeline
+      ? {
+        base: this.resolveCsmPlanFactStages(basePipeline.stages),
+        assigned: this.resolveCsmPlanFactStages(assignedPipeline.stages),
+      }
+      : null;
+    const csm = basePipeline && assignedPipeline && csmGroup && csmStages?.base && csmStages.assigned
+      ? {
+        key: 'csm' as const,
+        name: 'CSM',
+        group: csmGroup,
+        pipelineIds: [basePipeline.id, assignedPipeline.id],
+        stages: csmStages,
+      }
+      : null;
+    const shipping = assemblyPipeline
+      ? {
+        pipeline: assemblyPipeline,
+        shippedStage: this.findStage(assemblyPipeline.stages, [['отгруж']]) ?? assemblyPipeline.stages.find((stage) => stage.isWon) ?? null,
+      }
+      : null;
+
+    if (!salesGroup) warnings.push('Не найдена группа Sales.');
+    if (!csmGroup) warnings.push('Не найдена группа CSM.');
+    if (!salesPipeline) warnings.push('Не найдена воронка продаж.');
+    if (!basePipeline) warnings.push('Не найдена воронка База.');
+    if (!assignedPipeline) warnings.push('Не найдена воронка Закрепленные компании.');
+    if (!assemblyPipeline) warnings.push('Не найдена воронка Сборка.');
+    if (sales && (!sales.stages.kp || !sales.stages.invoice || !sales.stages.paid)) warnings.push('Не найдены все этапы Sales для план-факта.');
+    if (csm && (!csm.stages.base || !csm.stages.assigned)) warnings.push('Не найдены все этапы CSM для план-факта.');
+    if (!shipping?.shippedStage) warnings.push('Не найден этап отгружено.');
+
+    return { sales, csm, shipping, warnings };
+  }
+
+  private async buildPlanFactTeam(
+    team: PlanFactTeamKey,
+    refs: any,
+    shipping: any,
+    planItems: any[],
+    calendar: ReturnType<PlatformService['planFactCalendar']>,
+    user: AuthUser,
+  ) {
+    const metrics = PLAN_FACT_METRICS.filter((metric) => metric.team === team);
+    const managers = await this.prisma.crmUser.findMany({
+      where: { isActive: true, isVisible: true, groupId: refs.group.id },
+      orderBy: { name: 'asc' },
+      select: { id: true, name: true },
+    });
+    const [monthReport, todayReport, beforeTodayReport] = await Promise.all([
+      this.computePlanFactContract(team, refs, shipping, calendar.monthStart, calendar.todayEnd < calendar.monthEnd ? calendar.todayEnd : calendar.monthEnd, user),
+      calendar.isCurrentMonth
+        ? this.computePlanFactContract(team, refs, shipping, calendar.todayStart, calendar.todayEnd, user)
+        : Promise.resolve(null),
+      calendar.isCurrentMonth
+        ? this.computePlanFactContract(team, refs, shipping, calendar.monthStart, new Date(calendar.todayStart.getTime() - 1), user)
+        : Promise.resolve(null),
+    ]);
+
+    const rows = managers.map((manager) => this.buildPlanFactTargetRow({
+      targetType: 'MANAGER',
+      targetId: manager.id,
+      targetName: manager.name,
+      groupTarget: { targetId: refs.group.id, targetName: refs.name },
+      metrics,
+      planItems,
+      calendar,
+      monthReport,
+      todayReport,
+      beforeTodayReport,
+    }));
+    const total = this.buildPlanFactTargetRow({
+      targetType: 'GROUP',
+      targetId: refs.group.id,
+      targetName: `Итого ${refs.name}`,
+      groupTarget: { targetId: refs.group.id, targetName: refs.name },
+      metrics,
+      planItems,
+      calendar,
+      monthReport,
+      todayReport,
+      beforeTodayReport,
+      managerRows: rows,
+    });
+    return {
+      key: team,
+      name: refs.name,
+      groupId: refs.group.id,
+      metrics,
+      rows,
+      total,
+    };
+  }
+
+  private buildPlanFactTargetRow(input: {
+    targetType: 'MANAGER' | 'GROUP';
+    targetId: string;
+    targetName: string;
+    groupTarget?: { targetId: string; targetName: string };
+    metrics: PlanFactMetric[];
+    planItems: any[];
+    calendar: ReturnType<PlatformService['planFactCalendar']>;
+    monthReport: any;
+    todayReport: any;
+    beforeTodayReport: any;
+    managerRows?: any[];
+  }) {
+    const values = Object.fromEntries(input.metrics.map((metric) => {
+      const plan = this.findPlanValue(
+        input.planItems,
+        metric,
+        input.targetType,
+        input.targetId,
+        input.targetName,
+        input.managerRows,
+        input.groupTarget,
+      );
+      const factMonth = this.reportMetricValue(input.monthReport, input.targetId, input.targetType, metric.key);
+      const factToday = input.todayReport ? this.reportMetricValue(input.todayReport, input.targetId, input.targetType, metric.key) : null;
+      const factBeforeToday = input.beforeTodayReport
+        ? this.reportMetricValue(input.beforeTodayReport, input.targetId, input.targetType, metric.key)
+        : Math.max((factMonth ?? 0) - (factToday ?? 0), 0);
+      const pace = this.planFactPace(metric, plan, factMonth, factToday, factBeforeToday, input.calendar);
+      return [metric.key, pace];
+    }));
+    return {
+      targetType: input.targetType,
+      targetId: input.targetId,
+      targetName: input.targetName,
+      values,
+    };
+  }
+
+  private planFactPace(
+    metric: PlanFactMetric,
+    plan: number | null,
+    factMonth: number | null,
+    factToday: number | null,
+    factBeforeToday: number | null,
+    calendar: ReturnType<PlatformService['planFactCalendar']>,
+  ) {
+    if (plan == null || plan === 0) {
+      return {
+        plan: null,
+        upToDatePlan: null,
+        factMonth,
+        monthDelta: null,
+        monthCompletionPercent: null,
+        todayPlan: null,
+        factToday,
+        todayDelta: null,
+        unit: metric.unit,
+      };
+    }
+    if (metric.kind === 'conversion') {
+      const sharedPlan = this.roundPlanFactValue(metric, plan);
+      return {
+        plan: sharedPlan,
+        upToDatePlan: sharedPlan,
+        factMonth,
+        monthDelta: factMonth == null ? null : this.roundPlanFactDelta(metric, factMonth - sharedPlan),
+        monthCompletionPercent: factMonth == null ? null : this.roundMetric((factMonth / sharedPlan) * 100),
+        todayPlan: calendar.isCurrentMonth ? sharedPlan : null,
+        factToday,
+        todayDelta: factToday == null || !calendar.isCurrentMonth ? null : this.roundPlanFactDelta(metric, factToday - sharedPlan),
+        unit: metric.unit,
+      };
+    }
+    const baseDailyPlan = plan / Math.max(calendar.workdaysInMonth, 1);
+    const upToDatePlanRaw = baseDailyPlan * calendar.workedDays;
+    const todayPlanRaw = calendar.isCurrentMonth && calendar.isTodayWorkday
+      ? Math.max(baseDailyPlan, (plan - (factBeforeToday ?? 0)) / Math.max(calendar.remainingWorkdaysIncludingToday, 1))
+      : null;
+    const monthlyPlan = this.roundPlanFactValue(metric, plan);
+    const upToDatePlan = this.roundPlanFactValue(metric, upToDatePlanRaw);
+    const todayPlan = todayPlanRaw == null ? null : this.roundPlanFactValue(metric, todayPlanRaw);
+    return {
+      plan: monthlyPlan,
+      upToDatePlan,
+      factMonth,
+      monthDelta: factMonth == null ? null : this.roundPlanFactDelta(metric, factMonth - upToDatePlan),
+      monthCompletionPercent: upToDatePlan > 0 && factMonth != null ? this.roundMetric((factMonth / upToDatePlan) * 100) : null,
+      todayPlan,
+      factToday,
+      todayDelta: todayPlan == null || factToday == null ? null : this.roundPlanFactDelta(metric, factToday - todayPlan),
+      unit: metric.unit,
+    };
+  }
+
+  private async computePlanFactContract(
+    team: PlanFactTeamKey,
+    refs: any,
+    shipping: any,
+    dateFrom: Date,
+    dateTo: Date,
+    user: AuthUser,
+  ) {
+    if (dateTo < dateFrom) return null;
+    const contractMetrics = this.planFactContractMetrics(team, refs, shipping);
+    const filters: ReportFilters = {
+      dateFrom: dateFrom.toISOString(),
+      dateTo: dateTo.toISOString(),
+      groupIds: [refs.group.id],
+      pipelineIds: refs.pipelineIds,
+    };
+    const config: ReportConfig = {
+      metric: 'contract',
+      display: 'table',
+      filters,
+      contract: {
+        entity: 'deal',
+        groupBy: 'manager',
+        metrics: contractMetrics,
+        conversions: [],
+        includeSummaryRow: true,
+        summaryRowMode: 'sum',
+      },
+    };
+    return this.reports.compute({
+      name: `plan-fact-${team}-${dateFrom.toISOString()}-${dateTo.toISOString()}`,
+      sourceType: 'EVENT',
+      filters,
+      config,
+    }, user);
+  }
+
+  private planFactContractMetrics(team: PlanFactTeamKey, refs: any, shipping: any): DataContractMetric[] {
+    const metric = (id: string, label: string, stageIds: string[], measure: 'deal_count' | 'field_sum' = 'deal_count'): DataContractMetric => ({
+      id,
+      label,
+      type: 'stage_reached',
+      measure,
+      display: measure === 'field_sum' ? 'money' : 'number',
+      stageIds,
+    });
+    const conversion = (id: string, label: string, fromMetricId: string, toMetricId: string): DataContractMetric => ({
+      id,
+      label,
+      type: 'conversion',
+      display: 'percent',
+      fromMetricId,
+      toMetricId,
+    });
+    const shippedStageIds = shipping?.shippedStage ? [shipping.shippedStage.id] : [];
+
+    if (team === 'sales') {
+      return [
+        {
+          id: 'sales_qualified_leads',
+          label: 'Квал лиды',
+          type: 'created_deals',
+          measure: 'deal_count',
+          display: 'number',
+          pipelineId: refs.pipelineIds[0],
+          extraFilters: refs.marketingFieldId
+            ? [{ id: 'marketing_accepted', subject: 'deal_field', fieldId: refs.marketingFieldId, operator: 'equals', value: 'Принято' }]
+            : [],
+        },
+        conversion('sales_conv_lead_to_kp', 'Конверсия лиды -> КП', 'sales_qualified_leads', 'sales_kp_count'),
+        metric('sales_kp_count', 'КП', refs.stages.kp ? [refs.stages.kp.id] : []),
+        conversion('sales_conv_kp_to_invoice', 'Конверсия КП -> счёт', 'sales_kp_count', 'sales_invoice_count'),
+        metric('sales_invoice_count', 'Счета', refs.stages.invoice ? [refs.stages.invoice.id] : []),
+        conversion('sales_conv_invoice_to_paid', 'Конверсия счёт -> оплата', 'sales_invoice_count', 'sales_paid_count'),
+        metric('sales_paid_count', 'Оплаты', refs.stages.paid ? [refs.stages.paid.id] : []),
+        metric('sales_paid_amount', 'Сумма оплат', refs.stages.paid ? [refs.stages.paid.id] : [], 'field_sum'),
+        metric('sales_shipped_count', 'Отгрузки', shippedStageIds),
+        metric('sales_shipped_amount', 'Сумма отгрузок', shippedStageIds, 'field_sum'),
+      ];
+    }
+
+    const workStageIds = [refs.stages.base.work.id, refs.stages.assigned.work.id];
+    const offerStageIds = [refs.stages.base.offer.id, refs.stages.assigned.offer.id];
+    const invoiceStageIds = [refs.stages.base.invoice.id, refs.stages.assigned.invoice.id];
+    const paidStageIds = [refs.stages.base.paid.id, refs.stages.assigned.paid.id];
+    return [
+      metric('csm_taken_to_work_count', 'Взяты в работу', workStageIds),
+      conversion('csm_conv_work_to_kp', 'Конверсия в работу -> КП', 'csm_taken_to_work_count', 'csm_kp_count'),
+      metric('csm_kp_count', 'КП', offerStageIds),
+      conversion('csm_conv_kp_to_invoice', 'Конверсия КП -> счёт', 'csm_kp_count', 'csm_invoice_count'),
+      metric('csm_invoice_count', 'Счета', invoiceStageIds),
+      conversion('csm_conv_invoice_to_paid', 'Конверсия счёт -> оплата', 'csm_invoice_count', 'csm_paid_count'),
+      metric('csm_paid_count', 'Оплаты', paidStageIds),
+      metric('csm_paid_amount', 'Сумма оплат', paidStageIds, 'field_sum'),
+      metric('csm_shipped_count', 'Отгрузки', shippedStageIds),
+      metric('csm_shipped_amount', 'Сумма отгрузок', shippedStageIds, 'field_sum'),
+    ];
+  }
+
+  private findPlanValue(
+    planItems: any[],
+    metric: PlanFactMetric,
+    targetType: 'MANAGER' | 'GROUP',
+    targetId: string,
+    targetName: string,
+    managerRows?: any[],
+    groupTarget?: { targetId: string; targetName: string },
+  ) {
+    if (metric.kind === 'conversion' && targetType === 'MANAGER' && groupTarget) {
+      const shared = planItems.find((item) =>
+        item.metricKey === metric.key &&
+        item.targetType === 'GROUP' &&
+        (item.targetId === groupTarget.targetId ||
+          this.normalizeName(item.targetName ?? '') === this.normalizeName(groupTarget.targetName)),
+      );
+      return shared ? Number(shared.value) : null;
+    }
+
+    const direct = planItems.find((item) =>
+      item.metricKey === metric.key &&
+      item.targetType === targetType &&
+      (item.targetId === targetId || this.normalizeName(item.targetName ?? '') === this.normalizeName(targetName)),
+    );
+    if (direct) return Number(direct.value);
+    if (targetType === 'GROUP' && managerRows?.length) {
+      const values = managerRows
+        .map((row) => row.values?.[metric.key]?.plan)
+        .filter((value: unknown): value is number => Number.isFinite(Number(value)))
+        .map(Number);
+      if (!values.length) return null;
+      return this.roundMetric(values.reduce((sum, value) => sum + value, 0));
+    }
+    return null;
+  }
+
+  private reportMetricValue(report: any, targetId: string, targetType: 'MANAGER' | 'GROUP', metricKey: string) {
+    if (!report) return null;
+    const source = targetType === 'GROUP'
+      ? report.summaryRows?.[0]?.metrics?.[metricKey]
+      : report.rows?.find((row: any) => row.groupId === targetId)?.metrics?.[metricKey];
+    const value = Number(source?.value);
+    return Number.isFinite(value) ? this.roundMetric(value) : null;
+  }
+
+  private async findPlanFactGroup(name: string) {
+    const groups = await this.prisma.crmGroup.findMany({ select: { id: true, name: true } });
+    const normalized = this.normalizeName(name);
+    return groups.find((group) => this.normalizeName(group.name) === normalized) ?? null;
+  }
+
+  private async resolvePlanFactFieldExternalId(name: string) {
+    const fields = await this.prisma.customFieldDefinition.findMany({
+      where: { entityType: 'LEAD' as any, isVisible: true },
+      select: { externalId: true, name: true },
+    });
+    const normalized = this.normalizeName(name);
+    return fields.find((field) => this.normalizeName(field.name) === normalized)?.externalId ??
+      fields.find((field) => this.normalizeName(field.name).includes(normalized))?.externalId ??
+      null;
+  }
+
+  private resolveCsmPlanFactStages(stages: Array<{ id: string; name: string; isWon?: boolean; isLost?: boolean }>) {
+    const work = this.findStage(stages, [['взят', 'работ']]);
+    const offer = this.findStage(stages, [['сделано', 'предлож'], ['кп']]);
+    const invoice = this.findStage(stages, [['счет', 'отправ'], ['счёт', 'отправ']]);
+    const paid = this.findStage(stages, [['счет', 'оплачен'], ['счёт', 'оплачен'], ['оплачен']]) ?? this.findPaidStage(stages);
+    if (!work || !offer || !invoice || !paid) return null;
+    return { work, offer, invoice, paid };
+  }
+
+  private findStage(
+    stages: Array<{ id: string; name: string; isWon?: boolean; isLost?: boolean }>,
+    alternatives: string[][],
+  ) {
+    return stages.find((stage) => alternatives.some((needles) => this.nameIncludesAll(stage.name, needles))) ?? null;
+  }
+
+  private findPaidStage(stages: Array<{ id: string; name: string; isWon?: boolean; isLost?: boolean }>) {
+    return stages.find((stage) => {
+      const name = this.normalizeName(stage.name);
+      if (name.includes('not fully paid')) return false;
+      return name.includes('оплат') || name === 'paid' || name === 'paid!' || Boolean(stage.isWon);
+    }) ?? null;
+  }
+
+  private nameIncludesAll(value: string, needles: string[]) {
+    const normalized = this.normalizeName(value);
+    return needles.every((needle) => normalized.includes(this.normalizeName(needle)));
+  }
+
+  private normalizeName(value: string) {
+    return String(value ?? '')
+      .toLowerCase()
+      .replace(/ё/g, 'е')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  private roundMetric(value: number) {
+    return Number(Number(value).toFixed(2));
+  }
+
+  private normalizePlanFactPlanValue(metric: PlanFactMetric, value: Prisma.Decimal) {
+    if (metric.unit === 'number') {
+      return new Prisma.Decimal(Math.ceil(Number(value.toString())));
+    }
+    return value;
+  }
+
+  private roundPlanFactValue(metric: PlanFactMetric, value: number) {
+    if (metric.unit === 'number') return Math.ceil(value);
+    return this.roundMetric(value);
+  }
+
+  private roundPlanFactDelta(metric: PlanFactMetric, value: number) {
+    if (metric.unit === 'number') return Math.round(value);
+    return this.roundMetric(value);
   }
 
   async listQualityRules() {
@@ -1111,6 +1923,364 @@ export class PlatformService {
     return next;
   }
 
+  private async buildEmailThreadDrafts() {
+    const openDeals = await this.prisma.deal.findMany({
+      where: {
+        deletedAt: null,
+        stage: { isWon: false, isLost: false },
+      },
+      select: {
+        id: true,
+        externalId: true,
+        title: true,
+        amount: true,
+        contactId: true,
+        pipeline: { select: { name: true } },
+        stage: { select: { name: true } },
+        responsible: { select: { name: true, group: { select: { name: true } } } },
+        contact: { select: { externalId: true, name: true, email: true } },
+      },
+    });
+
+    const notes = await this.prisma.note.findMany({
+      where: {
+        type: 'amomail_message',
+        dealId: { not: null },
+      },
+      orderBy: { createdAt: 'asc' },
+      select: {
+        externalId: true,
+        dealId: true,
+        createdAt: true,
+        text: true,
+        raw: true,
+        deal: {
+          select: {
+            id: true,
+            externalId: true,
+            title: true,
+            amount: true,
+            contactId: true,
+            deletedAt: true,
+            pipeline: { select: { name: true } },
+            stage: { select: { name: true, isWon: true, isLost: true } },
+            responsible: { select: { name: true, group: { select: { name: true } } } },
+            contact: { select: { externalId: true, name: true, email: true } },
+          },
+        },
+      },
+    });
+
+    const drafts = new Map<string, EmailThreadDraft>();
+    const storedNoteIds = new Set<string>();
+    const openDealsById = new Map(openDeals.map((deal) => [deal.id, deal]));
+    const leadExternalToDealId = new Map<string, string>();
+    const contactExternalToDealIds = new Map<string, Set<string>>();
+    const draftsByDealId = new Map<string, EmailThreadDraft[]>();
+
+    for (const deal of openDeals) {
+      leadExternalToDealId.set(deal.externalId, deal.id);
+      if (!deal.contact?.externalId) continue;
+      if (!contactExternalToDealIds.has(deal.contact.externalId)) {
+        contactExternalToDealIds.set(deal.contact.externalId, new Set());
+      }
+      contactExternalToDealIds.get(deal.contact.externalId)?.add(deal.id);
+    }
+
+    const ensureDraft = (deal: EmailThreadDraft['deal'], threadId: string) => {
+      const key = `${deal.id}:${threadId}`;
+      let draft = drafts.get(key);
+      if (!draft) {
+        draft = {
+          deal,
+          threadId,
+          messages: [],
+        };
+        drafts.set(key, draft);
+        if (!draftsByDealId.has(deal.id)) draftsByDealId.set(deal.id, []);
+        draftsByDealId.get(deal.id)?.push(draft);
+      }
+      return draft;
+    };
+
+    for (const note of notes) {
+      if (!note.deal || note.deal.deletedAt || note.deal.stage?.isWon || note.deal.stage?.isLost) continue;
+
+      const params = this.emailNoteParams(note.raw, note.text);
+      const threadId = params.threadId || `note:${note.externalId}`;
+      const draft = ensureDraft(note.deal, threadId);
+
+      storedNoteIds.add(note.externalId);
+
+      draft.messages.push({
+        id: `note:${note.externalId}`,
+        noteExternalId: note.externalId,
+        direction: params.income === false ? 'outgoing' : 'incoming',
+        createdAt: note.createdAt,
+        subject: params.subject,
+        summary: params.summary,
+        body: params.body,
+        from: params.from,
+        to: params.to,
+        attachCount: params.attachCount,
+        deliveryStatus: params.deliveryStatus,
+        source: 'note',
+      });
+    }
+
+    const mailEvents = await this.prisma.crmEvent.findMany({
+      where: { type: { in: ['incoming_mail', 'outgoing_mail'] } },
+      orderBy: { createdAt: 'asc' },
+      select: {
+        externalId: true,
+        type: true,
+        createdAt: true,
+        raw: true,
+      },
+    });
+    const eventNoteIds = [...new Set(mailEvents.map((event) => this.emailEventNoteId(event.raw)).filter(Boolean))] as string[];
+    const eventNotes = eventNoteIds.length
+      ? await this.prisma.note.findMany({
+        where: { externalId: { in: eventNoteIds } },
+        select: { externalId: true, raw: true, text: true },
+      })
+      : [];
+    const eventNotesByExternalId = new Map(eventNotes.map((note) => [note.externalId, note]));
+
+    for (const event of mailEvents) {
+      const noteExternalId = this.emailEventNoteId(event.raw);
+      if (noteExternalId && storedNoteIds.has(noteExternalId)) continue;
+      const eventNote = noteExternalId ? eventNotesByExternalId.get(noteExternalId) : null;
+      const eventParams = this.emailNoteParams(eventNote?.raw, eventNote?.text);
+
+      const entity = this.emailEventEntity(event.raw);
+      const dealIds = new Set<string>();
+      if (entity.type === 'lead') {
+        const dealId = leadExternalToDealId.get(entity.id);
+        if (dealId) dealIds.add(dealId);
+      }
+      if (entity.type === 'contact') {
+        for (const dealId of contactExternalToDealIds.get(entity.id) ?? []) dealIds.add(dealId);
+      }
+
+      for (const dealId of dealIds) {
+        const deal = openDealsById.get(dealId);
+        if (!deal) continue;
+
+        const direction: EmailDirection = event.type === 'incoming_mail' ? 'incoming' : 'outgoing';
+        const threadId = this.emailEventThreadId(entity, deal.externalId);
+        const targetDrafts = direction === 'incoming'
+          ? [ensureDraft(deal, threadId)]
+          : (draftsByDealId.get(dealId)?.length ? draftsByDealId.get(dealId) ?? [] : [ensureDraft(deal, threadId)]);
+
+        for (const draft of targetDrafts) {
+          if (direction === 'outgoing') {
+            const firstMessage = draft.messages[0];
+            if (firstMessage && event.createdAt < firstMessage.createdAt) continue;
+          }
+          draft.messages.push({
+            id: `event:${event.externalId}:${dealId}`,
+            noteExternalId: direction === 'incoming' ? `event:${event.externalId}` : noteExternalId,
+            direction,
+            createdAt: event.createdAt,
+            subject: eventParams.subject,
+            summary: eventParams.summary ?? (direction === 'incoming' ? 'Входящее письмо в amoCRM' : 'Исходящее письмо в amoCRM'),
+            body: eventParams.body,
+            from: eventParams.from,
+            to: eventParams.to,
+            attachCount: eventParams.attachCount,
+            deliveryStatus: eventParams.deliveryStatus,
+            source: 'event',
+          });
+        }
+      }
+    }
+
+    for (const draft of drafts.values()) {
+      draft.messages.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+    }
+
+    return [...drafts.values()];
+  }
+
+  private serializePendingEmailThread(
+    draft: EmailThreadDraft,
+    now: Date,
+    domain: string,
+    dismissedKeys: Set<string>,
+  ) {
+    const incomingMessages = draft.messages.filter((message) => message.direction === 'incoming');
+    const outgoingMessages = draft.messages.filter((message) => message.direction === 'outgoing');
+    const lastIncoming = incomingMessages[incomingMessages.length - 1];
+    if (!lastIncoming?.noteExternalId) return null;
+
+    const lastOutgoing = outgoingMessages[outgoingMessages.length - 1];
+    if (lastOutgoing && lastOutgoing.createdAt > lastIncoming.createdAt) return null;
+
+    const dismissalKey = this.emailDismissalKey(draft.deal.id, draft.threadId, lastIncoming.noteExternalId);
+    if (dismissedKeys.has(dismissalKey)) return null;
+
+    const pipelineKey = this.emailPipelineKey(draft.deal.pipeline?.name);
+    if (!pipelineKey) return null;
+
+    const waitingSeconds = Math.max(0, Math.floor((now.getTime() - lastIncoming.createdAt.getTime()) / 1000));
+    return {
+      id: dismissalKey,
+      pipelineKey,
+      dealId: draft.deal.id,
+      dealExternalId: draft.deal.externalId,
+      title: draft.deal.title,
+      amount: Number(draft.deal.amount ?? 0),
+      managerName: draft.deal.responsible?.name ?? 'Без менеджера',
+      groupName: draft.deal.responsible?.group?.name ?? '-',
+      pipelineName: draft.deal.pipeline?.name ?? '-',
+      stageName: draft.deal.stage?.name ?? '-',
+      contactName: draft.deal.contact?.name ?? null,
+      contactEmail: draft.deal.contact?.email ?? null,
+      threadId: draft.threadId,
+      lastIncomingNoteExternalId: lastIncoming.noteExternalId,
+      lastIncomingAt: lastIncoming.createdAt.toISOString(),
+      waitingSeconds,
+      subject: lastIncoming.subject,
+      summary: lastIncoming.summary,
+      attachCount: lastIncoming.attachCount,
+      dealUrl: this.dealUrl(domain, draft.deal.externalId),
+      messages: draft.messages.map((message) => ({
+        id: message.id,
+        direction: message.direction,
+        createdAt: message.createdAt.toISOString(),
+        subject: message.subject,
+        summary: message.summary,
+        body: message.body,
+        from: message.from,
+        to: message.to,
+        attachCount: message.attachCount,
+        deliveryStatus: message.deliveryStatus,
+        source: message.source,
+      })),
+    };
+  }
+
+  private emailNoteParams(raw: unknown, storedText?: string | null) {
+    const params = (raw as { params?: Record<string, any> } | null)?.params ?? {};
+    const body = this.cleanEmailBody(storedText ?? params.text ?? params.body ?? params.html);
+    return {
+      income: typeof params.income === 'boolean' ? params.income : null,
+      threadId: params.thread_id == null ? null : String(params.thread_id),
+      subject: this.cleanEmailText(params.subject),
+      summary: this.cleanEmailText(params.content_summary ?? body),
+      body,
+      from: this.emailPartyLabel(params.from),
+      to: this.emailPartyLabel(params.to),
+      attachCount: Math.max(0, Number(params.attach_cnt ?? 0) || 0),
+      deliveryStatus: params.delivery?.status == null ? null : String(params.delivery.status),
+    };
+  }
+
+  private emailEventEntity(raw: unknown) {
+    const payload = raw as Record<string, any> | null;
+    const type = String(payload?.entity_type ?? payload?._embedded?.entity?.type ?? '').toLowerCase();
+    const id = payload?.entity_id ?? payload?._embedded?.entity?.id;
+    return {
+      type: type.includes('lead') ? 'lead' : type.includes('contact') ? 'contact' : type.includes('company') ? 'company' : '',
+      id: id == null ? '' : String(id),
+    };
+  }
+
+  private emailEventNoteId(raw: unknown) {
+    const payload = raw as Record<string, any> | null;
+    const value = payload?.value_after?.[0]?.note?.id ?? payload?.value_before?.[0]?.note?.id;
+    return value == null ? null : String(value);
+  }
+
+  private emailEventThreadId(entity: { type: string; id: string }, dealExternalId?: string | null) {
+    if (entity.type && entity.id) return `mail-event:${entity.type}:${entity.id}`;
+    return `mail-event:lead:${dealExternalId ?? 'unknown'}`;
+  }
+
+  private emailPartyLabel(value: unknown) {
+    if (!value || typeof value !== 'object') return null;
+    const party = value as { name?: unknown; email?: unknown };
+    const name = this.cleanEmailText(party.name);
+    const email = this.cleanEmailText(party.email);
+    if (name && email) return `${name} <${email}>`;
+    return email || name;
+  }
+
+  private cleanEmailText(value: unknown) {
+    const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+    return text || null;
+  }
+
+  private cleanEmailBody(value: unknown) {
+    const raw = String(value ?? '');
+    if (!raw.trim()) return null;
+    const text = raw
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<\/p>/gi, '\n\n')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/&amp;/gi, '&')
+      .replace(/&lt;/gi, '<')
+      .replace(/&gt;/gi, '>')
+      .replace(/&quot;/gi, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/\r\n?/g, '\n')
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+    return text || null;
+  }
+
+  private emailPipelineKey(name?: string | null): EmailPipelineKey | null {
+    const normalized = this.normalizeEmailPipelineName(name);
+    if (normalized.includes('продаж')) return 'sales';
+    if (normalized.includes('база')) return 'base';
+    if (normalized.includes('закреплен') && normalized.includes('компан')) return 'assignedCompanies';
+    return null;
+  }
+
+  private normalizeEmailPipelineName(name?: string | null) {
+    return String(name ?? '').trim().toLowerCase().replace(/ё/g, 'е');
+  }
+
+  private emailThreadSummary(threads: Array<{ waitingSeconds: number }>) {
+    return {
+      total: threads.length,
+      olderThan1h: threads.filter((thread) => thread.waitingSeconds >= 60 * 60).length,
+      olderThan4h: threads.filter((thread) => thread.waitingSeconds >= 4 * 60 * 60).length,
+      olderThan24h: threads.filter((thread) => thread.waitingSeconds >= 24 * 60 * 60).length,
+    };
+  }
+
+  private emailDismissalKey(dealId: string, threadId: string, lastIncomingNoteExternalId: string) {
+    return `${dealId}:${threadId}:${lastIncomingNoteExternalId}`;
+  }
+
+  private ensureEmailThreadAccess(user: AuthUser) {
+    if (user.role !== 'ADMIN' && user.role !== 'ROP' && user.businessRole !== 'ROP' && user.businessRole !== 'OWNER') {
+      throw new ForbiddenException('Нет доступа');
+    }
+  }
+
+  private async resolveAmoDomain() {
+    const connection = await this.prisma.amoConnection.findFirst({ orderBy: { updatedAt: 'desc' } });
+    const snapshot = connection
+      ? null
+      : await this.prisma.amoAccountSnapshot.findFirst({ orderBy: { updatedAt: 'desc' } });
+    return this.cleanDomain(connection?.subdomain ?? snapshot?.subdomain ?? '');
+  }
+
+  private dealUrl(domain: string, externalId?: string | null) {
+    const cleanDomain = this.cleanDomain(domain);
+    if (!cleanDomain || !externalId) return '';
+    return `https://${cleanDomain}/leads/detail/${externalId}`;
+  }
+
+  private cleanDomain(domain: string) {
+    return domain.replace(/^https?:\/\//, '').replace(/\/$/, '').trim();
+  }
+
   private ensureOwner(user: AuthUser, ownerId?: string | null) {
     if (user.role !== 'ADMIN' && ownerId && ownerId !== user.id) {
       throw new ForbiddenException('Нет доступа');
@@ -1269,7 +2439,15 @@ export class PlatformService {
 
   private optionalDecimal(value: unknown) {
     if (value === undefined || value === null || value === '') return null;
-    return new Prisma.Decimal(String(value).replace(',', '.'));
+    const normalized = String(value)
+      .trim()
+      .replace(/\s+/g, '')
+      .replace(/[^\d,.\-+]/g, '')
+      .replace(',', '.');
+    if (!/^[-+]?\d+(\.\d+)?$/.test(normalized)) {
+      throw new BadRequestException('Введите число');
+    }
+    return new Prisma.Decimal(normalized);
   }
 
   private clampInt(value: unknown, min: number, max: number, fallback: number) {

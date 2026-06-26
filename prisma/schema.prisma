@@ -454,6 +454,7 @@ model Deal {
   notes        Note[]
   events       CrmEvent[]
   products     DealProduct[]
+  emailThreadDismissals EmailThreadDismissal[]
 
   @@index([pipelineId, stageId])
   @@index([responsibleId])
@@ -520,6 +521,24 @@ model Note {
   raw        Json     @default("{}")
 
   deal Deal? @relation(fields: [dealId], references: [id], onDelete: SetNull)
+}
+
+model EmailThreadDismissal {
+  id                         String   @id @default(uuid())
+  dealId                     String
+  threadId                   String
+  lastIncomingNoteExternalId String
+  lastIncomingAt             DateTime
+  dismissedById              String?
+  reason                     String?
+  createdAt                  DateTime @default(now())
+  updatedAt                  DateTime @updatedAt
+
+  deal Deal @relation(fields: [dealId], references: [id], onDelete: Cascade)
+
+  @@unique([dealId, threadId, lastIncomingNoteExternalId])
+  @@index([dealId])
+  @@index([lastIncomingAt])
 }
 
 model CrmEvent {

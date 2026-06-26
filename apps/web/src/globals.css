@@ -523,6 +523,15 @@ button:disabled {
   text-align: left;
 }
 
+.dashboard-section-header.static {
+  cursor: default;
+}
+
+.dashboard-section-header.static:hover {
+  border-color: var(--pb-border);
+  background: rgba(255, 255, 255, 0.78);
+}
+
 .dashboard-section-header:hover,
 .dashboard-section-header:focus-visible {
   border-color: var(--pb-border-strong);
@@ -564,6 +573,204 @@ button:disabled {
 
 .widget-contract {
   grid-column: 1 / -1;
+}
+
+.plan-fact-actions {
+  display: flex;
+  align-items: end;
+  gap: 8px;
+}
+
+.plan-fact-month {
+  width: 170px;
+}
+
+.plan-fact-report-group {
+  display: grid;
+  gap: 12px;
+}
+
+.plan-fact-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--pb-border);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.plan-fact-table,
+.plan-fact-plan-table {
+  width: 100%;
+  min-width: 980px;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+.plan-fact-table th,
+.plan-fact-table td,
+.plan-fact-plan-table th,
+.plan-fact-plan-table td {
+  border-right: 1px solid var(--pb-border);
+  border-bottom: 1px solid var(--pb-border);
+  padding: 8px;
+  vertical-align: top;
+}
+
+.plan-fact-table thead th,
+.plan-fact-plan-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--pb-surface-soft);
+  color: var(--pb-text-secondary);
+  font-size: 11px;
+  font-weight: 850;
+  line-height: 1.2;
+  text-align: left;
+  text-transform: uppercase;
+}
+
+.plan-fact-table th:first-child,
+.plan-fact-plan-table th:first-child {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  width: 190px;
+  background: #fff;
+}
+
+.plan-fact-table thead th:first-child,
+.plan-fact-plan-table thead th:first-child {
+  z-index: 3;
+  background: var(--pb-surface-soft);
+}
+
+.plan-fact-table tbody th,
+.plan-fact-plan-table tbody th {
+  color: var(--pb-text-primary);
+  font-size: 13px;
+  font-weight: 800;
+  line-height: 1.2;
+  text-align: left;
+}
+
+.plan-fact-cell {
+  min-width: 132px;
+  padding-left: 8px;
+  border-left: 3px solid transparent;
+  font-size: 12px;
+  line-height: 1.25;
+}
+
+.plan-fact-main,
+.plan-fact-day {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  margin-top: 4px;
+  color: var(--pb-text-primary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.plan-fact-main span {
+  color: var(--pb-text-secondary);
+}
+
+.plan-fact-delta {
+  font-size: 15px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.plan-fact-cell.positive {
+  border-left-color: var(--pb-accent-green);
+}
+
+.plan-fact-cell.positive .plan-fact-delta {
+  color: var(--pb-accent-green);
+}
+
+.plan-fact-cell.negative {
+  border-left-color: var(--pb-accent-red);
+}
+
+.plan-fact-cell.negative .plan-fact-delta {
+  color: var(--pb-accent-red);
+}
+
+.plan-fact-cell.neutral {
+  border-left-color: var(--pb-border);
+}
+
+.plan-fact-cell.neutral .plan-fact-delta {
+  color: var(--pb-text-muted);
+}
+
+.plan-fact-day {
+  color: var(--pb-text-secondary);
+}
+
+.plan-fact-editor {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+}
+
+.plan-fact-editor-head {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.plan-fact-editor-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  white-space: nowrap;
+}
+
+.plan-fact-editor-team {
+  display: grid;
+  gap: 8px;
+}
+
+.plan-fact-plan-input {
+  min-height: 30px;
+  max-width: 118px;
+  padding: 5px 7px;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.plan-fact-shared-plan {
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  color: var(--pb-text-muted);
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+.plan-fact-save {
+  color: var(--pb-text-muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.plan-fact-save.dirty,
+.plan-fact-save.saving {
+  color: var(--pb-text-secondary);
+}
+
+.plan-fact-save.saved {
+  color: var(--pb-accent-green);
+}
+
+.plan-fact-save.error {
+  color: var(--pb-accent-red);
 }
 
 .metric-value {
@@ -1470,6 +1677,265 @@ button:disabled {
   padding-top: 10px;
 }
 
+.email-watch-tabs {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.email-watch-tab {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 190px;
+  gap: 12px;
+  border: 1px solid var(--pb-border);
+  border-radius: 8px;
+  background: var(--pb-surface);
+  color: var(--pb-text-primary);
+  padding: 9px 12px;
+  text-align: left;
+}
+
+.email-watch-tab:hover,
+.email-watch-tab:focus-visible {
+  background: var(--pb-surface-hover);
+  outline: none;
+}
+
+.email-watch-tab.active {
+  border-color: var(--pb-primary);
+  box-shadow: inset 0 -2px 0 var(--pb-primary);
+}
+
+.email-watch-tab span {
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.email-watch-tab strong {
+  flex: 0 0 auto;
+  color: var(--pb-text-secondary);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 850;
+}
+
+.email-watch-layout {
+  display: grid;
+  grid-template-columns: minmax(280px, 390px) minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.email-watch-list {
+  display: grid;
+  max-height: calc(100vh - 190px);
+  overflow-y: auto;
+  border: 1px solid var(--pb-border);
+  border-radius: 8px;
+  background: var(--pb-surface);
+}
+
+.email-watch-item {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+  border: 0;
+  border-bottom: 1px solid var(--pb-border);
+  background: transparent;
+  color: var(--pb-text-primary);
+  padding: 12px;
+  text-align: left;
+}
+
+.email-watch-item:last-child {
+  border-bottom: 0;
+}
+
+.email-watch-item:hover,
+.email-watch-item.active,
+.email-watch-item:focus-visible {
+  background: var(--pb-surface-hover);
+  outline: none;
+}
+
+.email-watch-item.active {
+  box-shadow: inset 3px 0 0 var(--pb-primary);
+}
+
+.email-watch-item-head {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.email-watch-item-head strong {
+  overflow: hidden;
+  font-size: 14px;
+  font-weight: 850;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.email-watch-item-head span {
+  flex: 0 0 auto;
+  color: var(--pb-accent-red);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 850;
+}
+
+.email-watch-item-meta,
+.email-watch-item-subject {
+  overflow: hidden;
+  color: var(--pb-text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.email-watch-item-subject {
+  color: var(--pb-text-primary);
+  font-weight: 750;
+}
+
+.email-thread-panel {
+  display: grid;
+  min-width: 0;
+  gap: 14px;
+  border: 1px solid var(--pb-border);
+  border-radius: 8px;
+  background: var(--pb-surface);
+  padding: 14px;
+  box-shadow: var(--pb-shadow-card);
+}
+
+.email-thread-head {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.email-thread-title {
+  display: block;
+  overflow: hidden;
+  color: var(--pb-primary);
+  font-size: 18px;
+  font-weight: 850;
+  line-height: 1.2;
+  text-decoration: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.email-thread-title:hover {
+  text-decoration: underline;
+}
+
+.email-thread-meta {
+  overflow: hidden;
+  color: var(--pb-text-secondary);
+  font-size: 13px;
+  font-weight: 750;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.email-thread-actions {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.email-thread-info {
+  display: grid;
+  border-top: 1px solid var(--pb-border);
+  border-bottom: 1px solid var(--pb-border);
+}
+
+.email-thread-messages {
+  display: grid;
+  gap: 10px;
+}
+
+.email-message-row {
+  display: grid;
+  max-width: 760px;
+  gap: 6px;
+  border: 1px solid var(--pb-border);
+  border-radius: 8px;
+  background: #fff;
+  padding: 11px 12px;
+}
+
+.email-message-row.outgoing {
+  justify-self: end;
+  background: #f8fafc;
+}
+
+.email-message-head {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.email-message-head strong {
+  font-size: 13px;
+  font-weight: 850;
+}
+
+.email-message-head span {
+  flex: 0 0 auto;
+  color: var(--pb-text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.email-message-subject {
+  overflow-wrap: anywhere;
+  font-size: 14px;
+  font-weight: 850;
+}
+
+.email-message-row p {
+  margin: 0;
+  color: var(--pb-text-primary);
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.email-message-meta {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: var(--pb-text-secondary);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.email-message-meta span {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
 .revenue-forecast-table-wrap {
   overflow: hidden;
   border: 1px solid var(--pb-border);
@@ -1960,6 +2426,10 @@ button:disabled {
     grid-template-columns: minmax(110px, 150px) minmax(0, 1fr);
   }
 
+  .email-watch-layout {
+    grid-template-columns: minmax(260px, 340px) minmax(0, 1fr);
+  }
+
   .deal-cycle-segment {
     padding-inline: 6px;
   }
@@ -2093,6 +2563,49 @@ button:disabled {
 
   .revenue-forecast-summary {
     grid-template-columns: 1fr;
+  }
+
+  .email-watch-tabs {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .email-watch-tab {
+    width: 100%;
+  }
+
+  .email-watch-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .email-watch-list {
+    max-height: none;
+  }
+
+  .email-thread-panel {
+    order: -1;
+  }
+
+  .email-thread-head,
+  .email-thread-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .email-thread-actions .btn {
+    width: 100%;
+  }
+
+  .email-message-row,
+  .email-message-row.outgoing {
+    max-width: none;
+    justify-self: stretch;
+  }
+
+  .email-message-head {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 3px;
   }
 
   .revenue-forecast-table-wrap {
