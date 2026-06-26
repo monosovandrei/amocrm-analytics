@@ -50,6 +50,12 @@ export class AmoController {
     return this.sync.trigger(SyncJobType.FULL, req.user.id);
   }
 
+  @Get('sync/health')
+  @UseGuards(JwtAuthGuard)
+  getSyncHealth() {
+    return this.sync.getHealth();
+  }
+
   @Get('sync-jobs/:id')
   @UseGuards(JwtAuthGuard)
   getSyncJob(@Param('id') id: string) {

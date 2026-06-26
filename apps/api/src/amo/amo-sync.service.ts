@@ -9,9 +9,11 @@ import { AmoSyncMaps } from './amo.types';
 import { AuditService } from '../audit/audit.service';
 import { CrmEventNotificationsService } from '../platform/crm-event-notifications.service';
 
+type SyncJobWithConnection = Prisma.SyncJobGetPayload<{ include: { connection: true } }>;
+
 @Injectable()
 export class AmoSyncService {
-  private static readonly DEFAULT_STALE_SYNC_JOB_MS = 10 * 60 * 1000;
+  private static readonly DEFAULT_STALE_SYNC_JOB_MS = 6 * 60 * 60 * 1000;
   private readonly logger = new Logger(AmoSyncService.name);
 
   constructor(
@@ -26,20 +28,36 @@ export class AmoSyncService {
     const connection = await this.amo.getActiveConnectionOrFail();
     await this.expireStaleJobs(connection.id);
 
-    const runningJob = await this.prisma.syncJob.findFirst({
-      where: {
-        connectionId: connection.id,
-        status: { in: ['QUEUED', 'RUNNING'] },
-      },
-      orderBy: { createdAt: 'desc' },
-    });
-    if (runningJob) {
-      return { jobId: runningJob.id, status: runningJob.status, type: runningJob.type };
-    }
+    const result = await this.prisma.$transaction(async (tx) => {
+      await tx.$executeRawUnsafe('SELECT pg_advisory_xact_lock(hashtext($1::text))', `amo-sync:${connection.id}`);
+      const runningJob = await tx.syncJob.findFirst({
+        where: {
+          connectionId: connection.id,
+          status: { in: ['QUEUED', 'RUNNING'] },
+        },
+        orderBy: { createdAt: 'desc' },
+      });
+      if (runningJob) {
+        return {
+          job: runningJob,
+          shouldRun: false,
+          response: { jobId: runningJob.id, status: runningJob.status, type: runningJob.type },
+        };
+      }
 
-    const job = await this.prisma.syncJob.create({
-      data: { connectionId: connection.id, type, status: 'QUEUED' },
+      const job = await tx.syncJob.create({
+        data: { connectionId: connection.id, type, status: 'QUEUED', heartbeatAt: new Date() },
+      });
+      return {
+        job,
+        shouldRun: true,
+        response: { jobId: job.id, status: job.status, type: job.type },
+      };
     });
+
+    if (!result.shouldRun) return result.response;
+
+    const job = result.job;
     await this.audit.record({
       userId: actorUserId,
       action: 'amo.sync.trigger',
@@ -52,18 +70,33 @@ export class AmoSyncService {
       this.logger.error(`amoCRM sync job ${job.id} failed: ${error.message}`, error.stack);
     });
 
-    return { jobId: job.id, status: job.status, type: job.type };
+    return result.response;
   }
 
   async expireStaleJobs(connectionId: string) {
-    const cutoff = new Date(Date.now() - this.getStaleSyncJobMs());
+    const fullCutoff = new Date(Date.now() - this.getStaleSyncJobMs(SyncJobType.FULL));
+    const deltaCutoff = new Date(Date.now() - this.getStaleSyncJobMs(SyncJobType.INCREMENTAL));
     const expired = await this.prisma.syncJob.updateMany({
       where: {
         connectionId,
         status: { in: ['QUEUED', 'RUNNING'] },
         OR: [
-          { startedAt: { lt: cutoff } },
-          { startedAt: null, createdAt: { lt: cutoff } },
+          {
+            type: SyncJobType.FULL,
+            OR: [
+              { heartbeatAt: { lt: fullCutoff } },
+              { heartbeatAt: null, startedAt: { lt: fullCutoff } },
+              { heartbeatAt: null, startedAt: null, createdAt: { lt: fullCutoff } },
+            ],
+          },
+          {
+            type: { not: SyncJobType.FULL },
+            OR: [
+              { heartbeatAt: { lt: deltaCutoff } },
+              { heartbeatAt: null, startedAt: { lt: deltaCutoff } },
+              { heartbeatAt: null, startedAt: null, createdAt: { lt: deltaCutoff } },
+            ],
+          },
         ],
       },
       data: {
@@ -84,20 +117,116 @@ export class AmoSyncService {
     return expired.count;
   }
 
-  private getStaleSyncJobMs() {
+  private getStaleSyncJobMs(type?: SyncJobType) {
     const rawTimeout = this.config.get<string>('AMOCRM_SYNC_JOB_TIMEOUT_MINUTES');
-    if (!rawTimeout) return AmoSyncService.DEFAULT_STALE_SYNC_JOB_MS;
+    const parsed = rawTimeout ? Number(rawTimeout) : NaN;
+    const fullTimeoutMs =
+      Number.isFinite(parsed) && parsed > 0
+        ? parsed * 60_000
+        : AmoSyncService.DEFAULT_STALE_SYNC_JOB_MS;
 
-    const parsed = Number(rawTimeout);
-    if (!Number.isFinite(parsed) || parsed <= 0) {
-      return AmoSyncService.DEFAULT_STALE_SYNC_JOB_MS;
-    }
-
-    return parsed * 60_000;
+    if (type === SyncJobType.FULL) return fullTimeoutMs;
+    return Math.min(fullTimeoutMs, 30 * 60_000);
   }
 
   async getJob(id: string) {
     return this.prisma.syncJob.findUnique({ where: { id } });
+  }
+
+  async getHealth() {
+    const connection = await this.prisma.amoConnection.findFirst({ orderBy: { createdAt: 'desc' } });
+    if (!connection) {
+      return {
+        healthy: false,
+        message: 'amoCRM не подключена',
+        connectionStatus: 'INACTIVE',
+        pendingWebhooks: 0,
+        runningJobs: 0,
+        staleJobs: 0,
+        lastSuccessfulSyncAt: null,
+        lastWebhookAt: null,
+        lastError: null,
+      };
+    }
+
+    await this.expireStaleJobs(connection.id);
+
+    const fullStaleCutoff = new Date(Date.now() - this.getStaleSyncJobMs(SyncJobType.FULL));
+    const deltaStaleCutoff = new Date(Date.now() - this.getStaleSyncJobMs(SyncJobType.INCREMENTAL));
+    const [pendingWebhooks, runningJobs, staleJobs, lastSuccessJob, lastJob, lastWebhook] = await Promise.all([
+      this.prisma.webhookEvent.count({
+        where: {
+          connectionId: connection.id,
+          processedAt: null,
+          status: { in: ['received', 'error'] },
+        },
+      }),
+      this.prisma.syncJob.count({
+        where: { connectionId: connection.id, status: { in: ['QUEUED', 'RUNNING'] } },
+      }),
+      this.prisma.syncJob.count({
+        where: {
+          connectionId: connection.id,
+          status: { in: ['QUEUED', 'RUNNING'] },
+          OR: [
+            {
+              type: SyncJobType.FULL,
+              OR: [
+                { heartbeatAt: { lt: fullStaleCutoff } },
+                { heartbeatAt: null, startedAt: { lt: fullStaleCutoff } },
+                { heartbeatAt: null, startedAt: null, createdAt: { lt: fullStaleCutoff } },
+              ],
+            },
+            {
+              type: { not: SyncJobType.FULL },
+              OR: [
+                { heartbeatAt: { lt: deltaStaleCutoff } },
+                { heartbeatAt: null, startedAt: { lt: deltaStaleCutoff } },
+                { heartbeatAt: null, startedAt: null, createdAt: { lt: deltaStaleCutoff } },
+              ],
+            },
+          ],
+        },
+      }),
+      this.prisma.syncJob.findFirst({
+        where: { connectionId: connection.id, status: 'SUCCESS' },
+        orderBy: { finishedAt: 'desc' },
+        select: { finishedAt: true, type: true, stats: true },
+      }),
+      this.prisma.syncJob.findFirst({
+        where: { connectionId: connection.id },
+        orderBy: { createdAt: 'desc' },
+        select: { status: true, type: true, error: true, finishedAt: true, heartbeatAt: true },
+      }),
+      this.prisma.webhookEvent.findFirst({
+        where: { connectionId: connection.id },
+        orderBy: { receivedAt: 'desc' },
+        select: { receivedAt: true, status: true },
+      }),
+    ]);
+
+    const hasBlockingError = connection.status === 'ERROR' && lastJob?.status !== 'RUNNING';
+    const healthy = !hasBlockingError && staleJobs === 0 && pendingWebhooks < 1000;
+    const message = healthy
+      ? 'Синхронизация работает'
+      : staleJobs > 0
+        ? 'Есть зависшая синхронизация'
+        : pendingWebhooks >= 1000
+          ? 'Копится очередь webhook'
+          : 'Есть ошибка синхронизации';
+
+    return {
+      healthy,
+      message,
+      connectionStatus: connection.status,
+      pendingWebhooks,
+      runningJobs,
+      staleJobs,
+      lastSuccessfulSyncAt: lastSuccessJob?.finishedAt ?? connection.lastIncrementalSyncAt ?? connection.lastFullSyncAt,
+      lastWebhookAt: lastWebhook?.receivedAt ?? null,
+      lastJob,
+      lastError: hasBlockingError ? connection.lastError : null,
+    };
   }
 
   async run(jobId: string) {
@@ -107,9 +236,19 @@ export class AmoSyncService {
     });
     if (!job) return;
 
+    if (job.type === SyncJobType.WEBHOOK) {
+      await this.runWebhookJob(job);
+      return;
+    }
+
+    await this.runPullJob(job);
+  }
+
+  private async runPullJob(job: SyncJobWithConnection) {
+    const jobId = job.id;
     await this.prisma.syncJob.update({
       where: { id: jobId },
-      data: { status: 'RUNNING', startedAt: new Date() },
+      data: { status: 'RUNNING', startedAt: new Date(), heartbeatAt: new Date() },
     });
     await this.prisma.amoConnection.update({
       where: { id: job.connectionId },
@@ -125,37 +264,55 @@ export class AmoSyncService {
       const notificationSince = job.connection.lastIncrementalSyncAt
         ? new Date(job.connection.lastIncrementalSyncAt.getTime() - 5 * 60_000)
         : syncStartedAt;
+      const isFullSync = job.type === SyncJobType.FULL;
 
       await this.syncAccount(client, stats);
-      const maps = await this.syncMetadata(client, stats);
-      await this.syncOptional('sources', stats, () => this.syncSources(client, maps, stats));
-      await this.syncOptional('tags', stats, () => this.syncTags(client, stats));
-      await this.syncOptional('catalogs', stats, () => this.syncCatalogs(client, stats));
-      await this.syncOptional('customersMetadata', stats, () => this.syncCustomerMetadata(client, maps, stats));
-      await this.syncCustomFieldDefinitions(client, stats);
+      const maps = this.emptyMaps();
+      if (isFullSync) {
+        const freshMaps = await this.syncMetadata(client, stats);
+        this.mergeMaps(maps, freshMaps);
+        await this.syncOptional('sources', stats, () => this.syncSources(client, maps, stats));
+        await this.syncOptional('tags', stats, () => this.syncTags(client, stats));
+        await this.syncOptional('catalogs', stats, () => this.syncCatalogs(client, stats));
+        await this.syncOptional('customersMetadata', stats, () => this.syncCustomerMetadata(client, maps, stats));
+        await this.syncCustomFieldDefinitions(client, stats);
+      } else {
+        await this.hydrateMetadataMaps(maps);
+        stats.metadataFromCache = 1;
+      }
       await this.hydrateExistingEntityMaps(maps);
+      await this.touchJob(jobId, 'deals');
       this.logger.log(`amoCRM sync job ${jobId}: syncing deals`);
       await this.syncDeals(client, maps, stats, updatedSince);
-      await this.backfillLossReasonsFromRaw(stats);
+      if (isFullSync) {
+        await this.backfillLossReasonsFromRaw(stats);
+      }
       await this.reconcileLeadSlaDeals(client, maps, stats);
+      await this.touchJob(jobId, 'notes');
       this.logger.log(`amoCRM sync job ${jobId}: syncing notes`);
       await this.syncNotes(client, stats, updatedSince);
+      await this.touchJob(jobId, 'events');
       this.logger.log(`amoCRM sync job ${jobId}: syncing events`);
       await this.syncEvents(client, maps, stats, updatedSince);
+      await this.touchJob(jobId, 'tasks');
       this.logger.log(`amoCRM sync job ${jobId}: syncing tasks`);
       await this.syncOptional('tasks', stats, () => this.syncTasks(client, maps, stats, updatedSince));
+      await this.touchJob(jobId, 'contacts_companies');
       this.logger.log(`amoCRM sync job ${jobId}: syncing contacts and companies`);
       await this.syncContacts(client, maps, stats, updatedSince);
       await this.syncCompanies(client, maps, stats, updatedSince);
       await this.syncOptional('customers', stats, () => this.syncCustomers(client, maps, stats, updatedSince));
-      await this.syncOptional('entityLinks', stats, () => this.syncEntityLinks(client, stats));
-      await this.recalculateStageProbabilities();
+      if (isFullSync) {
+        await this.syncOptional('entityLinks', stats, () => this.syncEntityLinks(client, stats));
+        await this.recalculateStageProbabilities();
+      }
+      await this.touchJob(jobId, 'notifications');
       await this.processCrmNotifications(stats, notificationSince, client.domain);
 
       const syncFinishedAt = new Date();
       await this.prisma.syncJob.update({
         where: { id: jobId },
-        data: { status: 'SUCCESS', finishedAt: syncFinishedAt, stats },
+        data: { status: 'SUCCESS', heartbeatAt: syncFinishedAt, finishedAt: syncFinishedAt, stats },
       });
       await this.prisma.amoConnection.update({
         where: { id: job.connectionId },
@@ -169,7 +326,92 @@ export class AmoSyncService {
     } catch (error: any) {
       await this.prisma.syncJob.update({
         where: { id: jobId },
-        data: { status: 'ERROR', finishedAt: new Date(), error: error.message, stats },
+        data: { status: 'ERROR', heartbeatAt: new Date(), finishedAt: new Date(), error: error.message, stats },
+      });
+      await this.prisma.amoConnection.update({
+        where: { id: job.connectionId },
+        data: { status: 'ERROR', lastError: error.message },
+      });
+      throw error;
+    }
+  }
+
+  private async runWebhookJob(job: SyncJobWithConnection) {
+    const jobId = job.id;
+    const startedAt = new Date();
+    await this.prisma.syncJob.update({
+      where: { id: jobId },
+      data: { status: 'RUNNING', startedAt, heartbeatAt: startedAt, cursor: { step: 'webhook_queue' } },
+    });
+    await this.prisma.amoConnection.update({
+      where: { id: job.connectionId },
+      data: { status: 'SYNCING', lastError: null },
+    });
+
+    const stats: Record<string, number> = {};
+    try {
+      const events = await this.prisma.webhookEvent.findMany({
+        where: {
+          connectionId: job.connectionId,
+          processedAt: null,
+          status: { in: ['received', 'error'] },
+        },
+        orderBy: { receivedAt: 'asc' },
+        take: 500,
+      });
+
+      const client = await this.amo.getClient(job.connection);
+      const maps = this.emptyMaps();
+      await this.hydrateMetadataMaps(maps);
+      await this.hydrateExistingEntityMaps(maps);
+
+      const earliestEventAt = events[0]?.receivedAt ?? startedAt;
+      const groups = this.groupWebhookEvents(events);
+      stats.webhookEvents = events.length;
+      stats.webhookGroups = groups.length;
+
+      for (const group of groups) {
+        await this.touchJob(jobId, `webhook:${group.entity}:${group.externalId ?? 'no-id'}`);
+        try {
+          await this.processWebhookGroup(client, maps, group, stats);
+          await this.prisma.webhookEvent.updateMany({
+            where: { id: { in: group.ids } },
+            data: { processedAt: new Date(), status: 'processed', error: null },
+          });
+        } catch (error: any) {
+          stats.webhookErrors = (stats.webhookErrors ?? 0) + group.ids.length;
+          await this.prisma.webhookEvent.updateMany({
+            where: { id: { in: group.ids } },
+            data: { status: 'error', error: error.message },
+          });
+          this.logger.warn(`Webhook group ${group.entity}:${group.externalId ?? 'no-id'} failed: ${error.message}`);
+        }
+      }
+
+      if (groups.length > 0) {
+        const eventSyncFrom = Math.floor((earliestEventAt.getTime() - 5 * 60_000) / 1000);
+        await this.syncEvents(client, maps, stats, eventSyncFrom);
+        await this.processCrmNotifications(stats, new Date(eventSyncFrom * 1000), client.domain);
+      }
+
+      const finishedAt = new Date();
+      await this.prisma.syncJob.update({
+        where: { id: jobId },
+        data: { status: 'SUCCESS', heartbeatAt: finishedAt, finishedAt, stats },
+      });
+      await this.prisma.amoConnection.update({
+        where: { id: job.connectionId },
+        data: {
+          status: 'ACTIVE',
+          lastError: null,
+          lastFullSyncAt: job.connection.lastFullSyncAt,
+          lastIncrementalSyncAt: groups.length > 0 ? finishedAt : job.connection.lastIncrementalSyncAt,
+        },
+      });
+    } catch (error: any) {
+      await this.prisma.syncJob.update({
+        where: { id: jobId },
+        data: { status: 'ERROR', heartbeatAt: new Date(), finishedAt: new Date(), error: error.message, stats },
       });
       await this.prisma.amoConnection.update({
         where: { id: job.connectionId },
@@ -180,7 +422,8 @@ export class AmoSyncService {
   }
 
   private getUpdatedSince(type: SyncJobType, lastIncrementalSyncAt: Date | null): number | undefined {
-    if (type === 'FULL' || !lastIncrementalSyncAt) return undefined;
+    if (type === 'FULL') return undefined;
+    if (!lastIncrementalSyncAt) return Math.floor((Date.now() - 5 * 60_000) / 1000);
     return Math.floor((lastIncrementalSyncAt.getTime() - 5 * 60_000) / 1000);
   }
 
@@ -195,6 +438,274 @@ export class AmoSyncService {
       customerStatuses: new Map(),
       customers: new Map(),
     };
+  }
+
+  private mergeMaps(target: AmoSyncMaps, source: AmoSyncMaps) {
+    for (const [key, value] of source.pipelines) target.pipelines.set(key, value);
+    for (const [key, value] of source.stages) target.stages.set(key, value);
+    for (const [key, value] of source.users) target.users.set(key, value);
+    for (const [key, value] of source.contacts) target.contacts.set(key, value);
+    for (const [key, value] of source.companies) target.companies.set(key, value);
+    for (const [key, value] of source.lossReasons) target.lossReasons.set(key, value);
+    for (const [key, value] of source.customerStatuses) target.customerStatuses.set(key, value);
+    for (const [key, value] of source.customers) target.customers.set(key, value);
+  }
+
+  private async touchJob(jobId: string, step: string) {
+    await this.prisma.syncJob.update({
+      where: { id: jobId },
+      data: { heartbeatAt: new Date(), cursor: { step } },
+    });
+  }
+
+  private async hydrateMetadataMaps(maps: AmoSyncMaps) {
+    const [pipelines, stages, users, lossReasons, customerStatuses, customers] = await Promise.all([
+      this.prisma.pipeline.findMany({ select: { id: true, externalId: true } }),
+      this.prisma.pipelineStage.findMany({
+        select: { id: true, externalId: true, pipeline: { select: { externalId: true } } },
+      }),
+      this.prisma.crmUser.findMany({ select: { id: true, externalId: true } }),
+      this.prisma.lossReason.findMany({
+        select: { id: true, externalId: true, pipeline: { select: { externalId: true } } },
+      }),
+      this.prisma.customerStatus.findMany({ select: { id: true, externalId: true } }),
+      this.prisma.customer.findMany({ select: { id: true, externalId: true } }),
+    ]);
+
+    for (const pipeline of pipelines) maps.pipelines.set(pipeline.externalId, pipeline.id);
+    for (const stage of stages) maps.stages.set(`${stage.pipeline.externalId}_${stage.externalId}`, stage.id);
+    for (const user of users) maps.users.set(user.externalId, user.id);
+    for (const reason of lossReasons) maps.lossReasons.set(`${reason.pipeline.externalId}_${reason.externalId}`, reason.id);
+    for (const status of customerStatuses) maps.customerStatuses.set(status.externalId, status.id);
+    for (const customer of customers) maps.customers.set(customer.externalId, customer.id);
+  }
+
+  private groupWebhookEvents(
+    events: Array<{
+      id: string;
+      entity: string;
+      action: string;
+      externalId: string | null;
+      payload: Prisma.JsonValue;
+    }>,
+  ) {
+    const groups = new Map<
+      string,
+      {
+        ids: string[];
+        entity: string;
+        externalId: string | null;
+        actions: Set<string>;
+        payloads: Prisma.JsonValue[];
+      }
+    >();
+
+    for (const event of events) {
+      const entity = this.normalizeWebhookEntity(event.entity);
+      const key = `${entity}:${event.externalId ?? event.id}`;
+      const group = groups.get(key) ?? {
+        ids: [],
+        entity,
+        externalId: event.externalId,
+        actions: new Set<string>(),
+        payloads: [],
+      };
+      group.ids.push(event.id);
+      group.actions.add(String(event.action ?? '').toLowerCase());
+      group.payloads.push(event.payload);
+      groups.set(key, group);
+    }
+
+    return [...groups.values()].map((group) => ({
+      ...group,
+      actions: [...group.actions],
+    }));
+  }
+
+  private normalizeWebhookEntity(entity: string) {
+    const normalized = String(entity ?? '').toLowerCase();
+    if (normalized.includes('lead')) return 'leads';
+    if (normalized.includes('task')) return 'tasks';
+    if (normalized.includes('contact')) return 'contacts';
+    if (normalized.includes('compan')) return 'companies';
+    if (normalized.includes('customer')) return 'customers';
+    return normalized;
+  }
+
+  private async processWebhookGroup(
+    client: AmoClient,
+    maps: AmoSyncMaps,
+    group: { entity: string; externalId: string | null; actions: string[]; payloads: Prisma.JsonValue[] },
+    stats: Record<string, number>,
+  ) {
+    if (!group.externalId) {
+      stats.webhookSkippedNoId = (stats.webhookSkippedNoId ?? 0) + 1;
+      return;
+    }
+
+    if (group.actions.some((action) => action.includes('delete'))) {
+      await this.markWebhookEntityDeleted(group.entity, group.externalId, stats);
+      return;
+    }
+
+    if (group.entity === 'leads') {
+      await this.syncSingleLead(client, maps, group.externalId, stats);
+      return;
+    }
+    if (group.entity === 'tasks') {
+      await this.syncSingleTask(client, maps, group.externalId, stats);
+      return;
+    }
+    if (group.entity === 'contacts') {
+      await this.syncSingleContact(client, maps, group.externalId, stats);
+      return;
+    }
+    if (group.entity === 'companies') {
+      await this.syncSingleCompany(client, maps, group.externalId, stats);
+      return;
+    }
+    if (group.entity === 'customers') {
+      await this.syncSingleCustomer(client, maps, group.externalId, stats);
+      return;
+    }
+
+    stats.webhookSkippedUnsupported = (stats.webhookSkippedUnsupported ?? 0) + 1;
+  }
+
+  private async markWebhookEntityDeleted(entity: string, externalId: string, stats: Record<string, number>) {
+    if (entity === 'leads') {
+      await this.prisma.deal.updateMany({
+        where: { externalId },
+        data: { deletedAt: new Date(), updatedAt: new Date() },
+      });
+      stats.webhookDealsDeleted = (stats.webhookDealsDeleted ?? 0) + 1;
+    }
+  }
+
+  private async syncSingleLead(
+    client: AmoClient,
+    maps: AmoSyncMaps,
+    externalId: string,
+    stats: Record<string, number>,
+  ) {
+    try {
+      const lead = await client.get<any>(`/leads/${externalId}`, { with: 'contacts,catalog_elements,loss_reason' });
+      await this.ensureLeadMetadata(client, maps, lead, stats);
+      await this.syncLeadEmbeddedContacts(client, maps, lead, stats);
+      await this.upsertDeal(lead, maps);
+      stats.webhookDeals = (stats.webhookDeals ?? 0) + 1;
+    } catch (error: any) {
+      if (String(error?.message ?? '').includes('amoCRM API 404')) {
+        await this.markWebhookEntityDeleted('leads', externalId, stats);
+        return;
+      }
+      throw error;
+    }
+  }
+
+  private async syncLeadEmbeddedContacts(
+    client: AmoClient,
+    maps: AmoSyncMaps,
+    lead: any,
+    stats: Record<string, number>,
+  ) {
+    const contacts = lead._embedded?.contacts ?? [];
+    if (!Array.isArray(contacts) || contacts.length === 0) return;
+
+    for (const contactRef of contacts) {
+      const contactId = contactRef?.id;
+      if (!contactId || maps.contacts.has(String(contactId))) continue;
+      try {
+        const contact = await client.get<any>(`/contacts/${contactId}`);
+        const dbContact = await this.upsertContact(contact);
+        maps.contacts.set(String(contactId), dbContact.id);
+        stats.webhookLeadContacts = (stats.webhookLeadContacts ?? 0) + 1;
+      } catch (error: any) {
+        this.logger.warn(`Lead contact ${contactId} sync skipped: ${error.message}`);
+      }
+    }
+  }
+
+  private async ensureLeadMetadata(
+    client: AmoClient,
+    maps: AmoSyncMaps,
+    lead: any,
+    stats: Record<string, number>,
+  ) {
+    const pipelineKey = String(lead.pipeline_id);
+    const stageKey = `${lead.pipeline_id}_${lead.status_id}`;
+    const userKey = lead.responsible_user_id ? String(lead.responsible_user_id) : null;
+    const hasMissingMetadata =
+      !maps.pipelines.has(pipelineKey) ||
+      !maps.stages.has(stageKey) ||
+      (userKey ? !maps.users.has(userKey) : false);
+
+    if (!hasMissingMetadata) return;
+
+    const freshMaps = await this.syncMetadata(client, stats);
+    this.mergeMaps(maps, freshMaps);
+    stats.webhookMetadataRefreshed = (stats.webhookMetadataRefreshed ?? 0) + 1;
+  }
+
+  private async syncSingleTask(
+    client: AmoClient,
+    maps: AmoSyncMaps,
+    externalId: string,
+    stats: Record<string, number>,
+  ) {
+    let task: any;
+    try {
+      task = await client.get<any>(`/tasks/${externalId}`);
+    } catch (error: any) {
+      if (String(error?.message ?? '').includes('amoCRM API 404')) {
+        await this.prisma.task.deleteMany({ where: { externalId } });
+        stats.webhookTasksDeleted = (stats.webhookTasksDeleted ?? 0) + 1;
+        return;
+      }
+      throw error;
+    }
+    await this.upsertTask(task, maps);
+    stats.webhookTasks = (stats.webhookTasks ?? 0) + 1;
+
+    if (task.entity_type === 'leads' && task.entity_id) {
+      await this.syncSingleLead(client, maps, String(task.entity_id), stats);
+    }
+  }
+
+  private async syncSingleContact(
+    client: AmoClient,
+    maps: AmoSyncMaps,
+    externalId: string,
+    stats: Record<string, number>,
+  ) {
+    const contact = await client.get<any>(`/contacts/${externalId}`);
+    const dbContact = await this.upsertContact(contact);
+    maps.contacts.set(String(contact.id), dbContact.id);
+    stats.webhookContacts = (stats.webhookContacts ?? 0) + 1;
+  }
+
+  private async syncSingleCompany(
+    client: AmoClient,
+    maps: AmoSyncMaps,
+    externalId: string,
+    stats: Record<string, number>,
+  ) {
+    const company = await client.get<any>(`/companies/${externalId}`);
+    const dbCompany = await this.upsertCompany(company);
+    maps.companies.set(String(company.id), dbCompany.id);
+    stats.webhookCompanies = (stats.webhookCompanies ?? 0) + 1;
+  }
+
+  private async syncSingleCustomer(
+    client: AmoClient,
+    maps: AmoSyncMaps,
+    externalId: string,
+    stats: Record<string, number>,
+  ) {
+    const customer = await client.get<any>(`/customers/${externalId}`);
+    const dbCustomer = await this.upsertCustomer(client, maps, customer);
+    maps.customers.set(String(customer.id), dbCustomer.id);
+    stats.webhookCustomers = (stats.webhookCustomers ?? 0) + 1;
   }
 
   private async syncOptional(name: string, stats: Record<string, number>, action: () => Promise<void>) {
@@ -632,6 +1143,23 @@ export class AmoSyncService {
     stats.companies = companies.length;
   }
 
+  private async upsertCompany(company: any) {
+    return this.prisma.crmCompany.upsert({
+      where: { externalId: String(company.id) },
+      create: {
+        externalId: String(company.id),
+        name: company.name || `Компания ${company.id}`,
+        customFields: this.parseCustomFields(company.custom_fields_values),
+        raw: company,
+      },
+      update: {
+        name: company.name || `Компания ${company.id}`,
+        customFields: this.parseCustomFields(company.custom_fields_values),
+        raw: company,
+      },
+    });
+  }
+
   private async hydrateExistingEntityMaps(maps: AmoSyncMaps) {
     const [contacts, companies] = await Promise.all([
       this.prisma.contact.findMany({ select: { id: true, externalId: true } }),
@@ -673,6 +1201,29 @@ export class AmoSyncService {
       maps.contacts.set(String(contact.id), dbContact.id);
     }
     stats.contacts = contacts.length;
+  }
+
+  private async upsertContact(contact: any) {
+    const fields = this.parseCustomFields(contact.custom_fields_values);
+    return this.prisma.contact.upsert({
+      where: { externalId: String(contact.id) },
+      create: {
+        externalId: String(contact.id),
+        name: contact.name || `Контакт ${contact.id}`,
+        phone: this.findFieldValue(contact.custom_fields_values, 'PHONE'),
+        email: this.findFieldValue(contact.custom_fields_values, 'EMAIL'),
+        customFields: fields,
+        raw: contact,
+        createdAt: toDateFromAmoTimestamp(contact.created_at) ?? new Date(),
+      },
+      update: {
+        name: contact.name || `Контакт ${contact.id}`,
+        phone: this.findFieldValue(contact.custom_fields_values, 'PHONE'),
+        email: this.findFieldValue(contact.custom_fields_values, 'EMAIL'),
+        customFields: fields,
+        raw: contact,
+      },
+    });
   }
 
   private async syncDeals(
@@ -787,6 +1338,35 @@ export class AmoSyncService {
 
     stats.customers = customers.length;
     stats.customerTransactions = transactionCount;
+  }
+
+  private async upsertCustomer(client: AmoClient, maps: AmoSyncMaps, customer: any) {
+    const statusId = customer.status_id ? maps.customerStatuses.get(String(customer.status_id)) ?? null : null;
+    const dbCustomer = await this.prisma.customer.upsert({
+      where: { externalId: String(customer.id) },
+      create: {
+        externalId: String(customer.id),
+        statusId,
+        name: customer.name || `Покупатель ${customer.id}`,
+        nextPrice: Number(customer.next_price ?? 0),
+        periodicity: customer.periodicity ? Number(customer.periodicity) : null,
+        responsibleId: customer.responsible_user_id ? maps.users.get(String(customer.responsible_user_id)) ?? null : null,
+        customFields: this.parseCustomFields(customer.custom_fields_values),
+        raw: customer,
+        createdAt: toDateFromAmoTimestamp(customer.created_at) ?? new Date(),
+      },
+      update: {
+        statusId,
+        name: customer.name || `Покупатель ${customer.id}`,
+        nextPrice: Number(customer.next_price ?? 0),
+        periodicity: customer.periodicity ? Number(customer.periodicity) : null,
+        responsibleId: customer.responsible_user_id ? maps.users.get(String(customer.responsible_user_id)) ?? null : null,
+        customFields: this.parseCustomFields(customer.custom_fields_values),
+        raw: customer,
+      },
+    });
+    await this.syncCustomerTransactions(client, dbCustomer.id, String(customer.id));
+    return dbCustomer;
   }
 
   private isSalesPipelineName(name?: string | null) {
@@ -1103,6 +1683,48 @@ export class AmoSyncService {
       });
     }
     stats.tasks = tasks.length;
+  }
+
+  private async upsertTask(task: any, maps: AmoSyncMaps) {
+    let dealId: string | null = null;
+    if (task.entity_type === 'leads' && task.entity_id) {
+      const deal = await this.prisma.deal.findUnique({
+        where: { externalId: String(task.entity_id) },
+        select: { id: true },
+      });
+      dealId = deal?.id ?? null;
+    }
+
+    return this.prisma.task.upsert({
+      where: { externalId: String(task.id) },
+      create: {
+        externalId: String(task.id),
+        dealId,
+        responsibleId: task.responsible_user_id ? maps.users.get(String(task.responsible_user_id)) ?? null : null,
+        title: task.text || `Задача ${task.id}`,
+        typeId: task.task_type_id ?? null,
+        typeName: task.task_type ?? null,
+        dueAt: toDateFromAmoTimestamp(task.complete_till),
+        completedAt: task.is_completed ? toDateFromAmoTimestamp(task.updated_at) ?? new Date() : null,
+        isCompleted: Boolean(task.is_completed),
+        createdAt: toDateFromAmoTimestamp(task.created_at) ?? new Date(),
+        updatedAt: toDateFromAmoTimestamp(task.updated_at) ?? new Date(),
+        raw: task,
+      },
+      update: {
+        dealId,
+        responsibleId: task.responsible_user_id ? maps.users.get(String(task.responsible_user_id)) ?? null : null,
+        title: task.text || `Задача ${task.id}`,
+        typeId: task.task_type_id ?? null,
+        typeName: task.task_type ?? null,
+        dueAt: toDateFromAmoTimestamp(task.complete_till),
+        completedAt: task.is_completed ? toDateFromAmoTimestamp(task.updated_at) ?? new Date() : null,
+        isCompleted: Boolean(task.is_completed),
+        createdAt: toDateFromAmoTimestamp(task.created_at) ?? undefined,
+        updatedAt: toDateFromAmoTimestamp(task.updated_at) ?? undefined,
+        raw: task,
+      },
+    });
   }
 
   private async syncNotes(client: AmoClient, stats: Record<string, number>, updatedSince?: number) {

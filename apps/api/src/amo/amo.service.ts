@@ -143,7 +143,7 @@ export class AmoService {
   async findByWebhookSecret(secret: string) {
     if (!secret) return null;
     const connections = await this.prisma.amoConnection.findMany({
-      where: { status: { in: ['ACTIVE', 'ERROR'] } },
+      where: { status: { in: ['ACTIVE', 'SYNCING', 'ERROR'] } },
     });
     const incoming = Buffer.from(secret);
 

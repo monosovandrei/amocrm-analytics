@@ -185,16 +185,19 @@ model SyncJob {
   type         SyncJobType
   status       SyncJobStatus @default(QUEUED)
   startedAt    DateTime?
+  heartbeatAt  DateTime?
   finishedAt   DateTime?
   cursor        Json         @default("{}")
   stats         Json         @default("{}")
   error         String?
   createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
 
   connection AmoConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
 
   @@index([connectionId, createdAt])
   @@index([status, createdAt])
+  @@index([status, heartbeatAt])
 }
 
 model WebhookEvent {
@@ -212,6 +215,7 @@ model WebhookEvent {
   connection AmoConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
 
   @@index([connectionId, receivedAt])
+  @@index([connectionId, status, processedAt])
   @@index([entity, action])
 }
 

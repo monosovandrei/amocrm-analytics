@@ -55,7 +55,13 @@ export class ReportsService {
     const cached = await this.getCachedReport(cacheKey);
     if (cached) {
       if (this.cacheIsStale(cached.sourceSyncAt, latestSyncAt)) {
-        void this.refreshCachedReport(cacheKey, dto, user, latestSyncAt);
+        try {
+          const report = await this.computeFresh(dto, user);
+          await this.saveCachedReport(cacheKey, dto.name, report, latestSyncAt);
+          return report;
+        } catch {
+          return cached.payload;
+        }
       }
       return cached.payload;
     }

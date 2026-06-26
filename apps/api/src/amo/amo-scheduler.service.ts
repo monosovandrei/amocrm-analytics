@@ -8,6 +8,7 @@ import { AmoSyncService } from './amo-sync.service';
 @Injectable()
 export class AmoSchedulerService {
   private readonly logger = new Logger(AmoSchedulerService.name);
+  private webhookBusy = false;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -27,6 +28,7 @@ export class AmoSchedulerService {
     await this.sync.expireStaleJobs(connection.id);
 
     const lastSync = connection.lastIncrementalSyncAt ?? connection.lastFullSyncAt;
+    if (!lastSync) return;
     const due =
       !lastSync ||
       Date.now() - lastSync.getTime() >= syncIntervalMinutes * 60_000;
@@ -41,6 +43,34 @@ export class AmoSchedulerService {
       await this.sync.trigger(SyncJobType.INCREMENTAL);
     } catch (error: any) {
       this.logger.warn(`Scheduled amoCRM sync failed: ${error.message}`);
+    }
+  }
+
+  @Interval(5_000)
+  async processWebhookQueue() {
+    if (this.webhookBusy) return;
+    this.webhookBusy = true;
+    try {
+      const connection = await this.prisma.amoConnection.findFirst({
+        where: { status: { in: ['ACTIVE', 'ERROR', 'SYNCING'] } },
+        orderBy: { createdAt: 'desc' },
+      });
+      if (!connection) return;
+
+      const pending = await this.prisma.webhookEvent.count({
+        where: {
+          connectionId: connection.id,
+          processedAt: null,
+          status: { in: ['received', 'error'] },
+        },
+      });
+      if (pending === 0) return;
+
+      await this.sync.trigger(SyncJobType.WEBHOOK);
+    } catch (error: any) {
+      this.logger.warn(`Webhook amoCRM queue processing failed: ${error.message}`);
+    } finally {
+      this.webhookBusy = false;
     }
   }
 

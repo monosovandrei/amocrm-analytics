@@ -61,6 +61,7 @@ cp .env.example .env
 - `AMOCRM_REDIRECT_URI` - redirect URI из настроек amoCRM.
 - `WEBHOOK_BASE_URL` - внешний API URL без завершающего slash, например `https://analytics.example.ru/api/v1`.
 - `AMOCRM_SYNC_INTERVAL_MINUTES` - страховочный polling amoCRM в минутах; основной production-режим обновления идет через webhooks.
+- `AMOCRM_SYNC_JOB_TIMEOUT_MINUTES` - через сколько минут job без heartbeat считается зависшим; для production рекомендуется `360`.
 - `WEB_ORIGIN` - разрешенный origin фронтенда для CORS.
 - `VITE_API_URL` - публичный URL API для web-приложения.
 - `TELEGRAM_BOT_TOKEN` - токен Telegram-бота для уведомлений.

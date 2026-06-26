@@ -590,6 +590,7 @@ export default function HomePage() {
   const [tab, setTab] = useState<AppTab>('workspace');
   const [options, setOptions] = useState<Options | null>(null);
   const [connection, setConnection] = useState<Record<string, any> | null>(null);
+  const [syncHealth, setSyncHealth] = useState<Record<string, any> | null>(null);
   const [forecastSettings, setForecastSettings] = useState<ForecastSettings | null>(null);
   const [templates, setTemplates] = useState<ReportTemplate[]>([]);
   const [filters, setFilters] = useState<ReportFilters>(getInitialFilters);
@@ -601,15 +602,17 @@ export default function HomePage() {
   const lastAmoSyncSeenRef = useRef<string | null>(null);
 
   const loadData = useCallback(async () => {
-    const [nextOptions, nextConnection, nextForecast, nextTemplates, nextLayout] = await Promise.all([
+    const [nextOptions, nextConnection, nextSyncHealth, nextForecast, nextTemplates, nextLayout] = await Promise.all([
       api<Options>('/settings/options'),
       api<Record<string, any> | null>('/amo/connection'),
+      api<Record<string, any> | null>('/amo/sync/health').catch(() => null),
       api<ForecastSettings>('/settings/forecast'),
       api<ReportTemplate[]>('/reports/templates'),
       api<DashboardLayout>('/settings/dashboard-layout').catch(() => ({ config: {} })),
     ]);
     setOptions(nextOptions);
     setConnection(nextConnection);
+    setSyncHealth(nextSyncHealth);
     setForecastSettings(nextForecast);
     setTemplates(normalizeTemplates(nextTemplates, nextLayout));
   }, []);
@@ -644,8 +647,8 @@ export default function HomePage() {
   const amoHasConnection = Boolean(connection?.subdomain);
   const amoConnected = amoHasConnection && connection?.status !== 'INACTIVE';
   const lastAmoSyncAt = connection?.lastIncrementalSyncAt ?? connection?.lastFullSyncAt;
-  const amoConnectionHealthy = amoConnected;
-  const amoStatusText = amoConnectionHealthy ? 'Синхронизация работает' : 'Синхронизация не работает';
+  const amoConnectionHealthy = amoConnected && syncHealth?.healthy !== false;
+  const amoStatusText = syncHealth?.message ?? (amoConnectionHealthy ? 'Синхронизация работает' : 'Синхронизация не работает');
 
   useEffect(() => {
     if (!user) return;
@@ -661,10 +664,14 @@ export default function HomePage() {
     let cancelled = false;
     const pollConnection = async () => {
       try {
-        const nextConnection = await api<Record<string, any> | null>('/amo/connection');
+        const [nextConnection, nextSyncHealth] = await Promise.all([
+          api<Record<string, any> | null>('/amo/connection'),
+          api<Record<string, any> | null>('/amo/sync/health').catch(() => null),
+        ]);
         if (cancelled || !nextConnection) return;
 
         setConnection(nextConnection);
+        setSyncHealth(nextSyncHealth);
         const nextSyncAt = String(nextConnection.lastIncrementalSyncAt ?? nextConnection.lastFullSyncAt ?? '');
         if (nextSyncAt && lastAmoSyncSeenRef.current && nextSyncAt !== lastAmoSyncSeenRef.current) {
           lastAmoSyncSeenRef.current = nextSyncAt;
@@ -837,7 +844,7 @@ export default function HomePage() {
           </div>
 
           <div className="topbar-actions">
-            <div className={`sync-panel ${amoConnectionHealthy ? 'sync-panel-ok' : 'sync-panel-warn'}`}>
+            <div className={`sync-panel ${amoConnectionHealthy ? 'sync-panel-ok' : 'sync-panel-warn'}`} title={syncHealth?.message ?? amoStatusText}>
               {amoConnectionHealthy ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}
               <div className="min-w-0">
                 <div className="sync-panel-title">{amoStatusText}</div>
