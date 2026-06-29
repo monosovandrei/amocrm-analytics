@@ -646,9 +646,10 @@ export default function HomePage() {
   const ordered = useMemo(() => orderTemplates(templates), [templates]);
   const amoHasConnection = Boolean(connection?.subdomain);
   const amoConnected = amoHasConnection && connection?.status !== 'INACTIVE';
-  const lastAmoSyncAt = connection?.lastIncrementalSyncAt ?? connection?.lastFullSyncAt;
+  const lastAmoSyncAt = syncHealth?.lastSuccessfulSyncAt ?? connection?.lastIncrementalSyncAt ?? connection?.lastFullSyncAt;
   const amoConnectionHealthy = amoConnected && syncHealth?.healthy !== false;
   const amoStatusText = syncHealth?.message ?? (amoConnectionHealthy ? 'Синхронизация работает' : 'Синхронизация не работает');
+  const amoSyncUpdatedText = lastAmoSyncAt ? `Обновлено: ${formatMoscowDateTime(lastAmoSyncAt)} МСК` : 'Данные ещё не обновлялись';
 
   useEffect(() => {
     if (!user) return;
@@ -844,10 +845,14 @@ export default function HomePage() {
           </div>
 
           <div className="topbar-actions">
-            <div className={`sync-panel ${amoConnectionHealthy ? 'sync-panel-ok' : 'sync-panel-warn'}`} title={syncHealth?.message ?? amoStatusText}>
+            <div
+              className={`sync-panel ${amoConnectionHealthy ? 'sync-panel-ok' : 'sync-panel-warn'}`}
+              title={`${syncHealth?.message ?? amoStatusText}. ${amoSyncUpdatedText}`}
+            >
               {amoConnectionHealthy ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}
               <div className="min-w-0">
                 <div className="sync-panel-title">{amoStatusText}</div>
+                <div className="sync-panel-meta">{amoSyncUpdatedText}</div>
               </div>
             </div>
             <div className="topbar-user">
