@@ -27,6 +27,12 @@ import {
 
 type XlsxValue = string | number | boolean | null | undefined;
 type XlsxSheet = { name: string; rows: XlsxValue[][] };
+type BuiltinReportTemplate = {
+  name: string;
+  position: number;
+  sourceType: ReportSourceType;
+  config: ReportConfig;
+};
 
 function stableStringify(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
@@ -311,32 +317,277 @@ export class ReportsService {
   }
 
   private async ensureBuiltinReportTemplates() {
-    const templates = await this.buildCsmReportTemplates();
+    const templates = [
+      ...(await this.buildSalesReportTemplates()),
+      ...(await this.buildCsmReportTemplates()),
+      this.buildRevenueForecastReportTemplate(),
+    ];
 
     for (const template of templates) {
-      const existing = await this.db.reportTemplate.findFirst({ where: { name: template.name } });
       const data = {
         userId: null,
         name: template.name,
-        sourceType: 'CURRENT' as ReportSourceType,
+        sourceType: template.sourceType,
         config: template.config as any,
         position: template.position,
         isShared: true,
       };
+      const existing = await this.db.reportTemplate.findFirst({ where: { name: template.name } });
       if (!existing) {
         await this.db.reportTemplate.create({ data });
         continue;
       }
-      const existingConfig = existing.config as ReportConfig;
-      if (existingConfig.builtinKey === template.config.builtinKey) {
-        await this.db.reportTemplate.update({ where: { id: existing.id }, data });
-      }
+      await this.db.reportTemplate.update({ where: { id: existing.id }, data });
+      await this.db.reportTemplate.deleteMany({
+        where: {
+          name: template.name,
+          id: { not: existing.id },
+        },
+      });
     }
 
     await this.ensureTeamScopedReportTemplates();
   }
 
-  private async buildCsmReportTemplates() {
+  private async buildSalesReportTemplates(): Promise<BuiltinReportTemplate[]> {
+    const refs = await this.resolveSalesRefs();
+    if (!refs) return [];
+
+    const marketingFieldId = (await this.resolveLeadFieldExternalId('маркетинг')) ?? '809047';
+    const salesFilters = { pipelineIds: [refs.salesPipeline.id], groupIds: [refs.salesGroup.id] };
+    const baseConfig = (key: string, order: number, config: ReportConfig): ReportConfig => ({
+      ...config,
+      builtinKey: key,
+      dashboardSection: 'sales',
+      pinned: true,
+      order,
+      lockPipelineFilter: true,
+      lockTeamFilter: true,
+    });
+    const contractBase = {
+      entity: 'deal' as const,
+      groupBy: 'manager' as const,
+      conversions: [],
+      durations: [],
+      includeRowTotal: false,
+      rowTotalMode: 'sum' as const,
+      includeSummaryRow: true,
+      summaryRowMode: 'sum' as const,
+    };
+    const stageMetric = (
+      id: string,
+      label: string,
+      stageIds: string[],
+      display: DataContractMetric['display'] = 'number',
+      measure: DataContractMetric['measure'] = 'deal_count',
+      pipelineId = refs.salesPipeline.id,
+    ): DataContractMetric => ({
+      id,
+      label,
+      type: 'stage_reached',
+      measure,
+      display,
+      pipelineId,
+      stageIds,
+    });
+    const currentStageMetric = (
+      id: string,
+      label: string,
+      stageIds: string[],
+      display: DataContractMetric['display'] = 'number',
+      measure: DataContractMetric['measure'] = 'deal_count',
+      pipelineId = refs.salesPipeline.id,
+    ): DataContractMetric => ({
+      id,
+      label,
+      type: 'current_stage',
+      measure,
+      display,
+      pipelineId,
+      stageIds,
+    });
+    const conversionMetric = (id: string, label: string, fromMetricId: string, toMetricId: string): DataContractMetric => ({
+      id,
+      label,
+      type: 'conversion',
+      measure: 'deal_count',
+      display: 'percent',
+      fromMetricId,
+      toMetricId,
+    });
+
+    const funnelMetrics: DataContractMetric[] = [
+      {
+        id: 'leads_received',
+        label: 'Получили лидов',
+        type: 'created_deals',
+        measure: 'deal_count',
+        display: 'number',
+        fieldOperator: 'equals',
+        extraFilters: [
+          {
+            id: 'marketing_accepted',
+            subject: 'deal_field',
+            fieldId: marketingFieldId,
+            operator: 'equals',
+            value: 'Принято',
+          },
+        ],
+      },
+      conversionMetric('conv_lead_to_kp', 'Конверсия лид -> КП', 'leads_received', 'kp_presented'),
+      stageMetric('kp_presented', 'КП сделали', [refs.stages.kp.id]),
+      conversionMetric('conv_kp_to_invoice', 'Конверсия КП -> счёт', 'kp_presented', 'invoice_sent'),
+      stageMetric('invoice_sent', 'Счета выставили', [refs.stages.invoice.id]),
+      conversionMetric('conv_invoice_to_paid', 'Конверсия счёт -> оплата', 'invoice_sent', 'paid'),
+      stageMetric('paid', 'Оплаты получили', [refs.stages.paid.id]),
+      stageMetric('payment_amount', 'Сумма оплат', [refs.stages.paid.id], 'money', 'field_sum'),
+      {
+        id: 'avg_check',
+        type: 'formula',
+        label: 'Средний чек',
+        display: 'money',
+        formula: '[Сумма оплат] / [Оплаты получили]',
+      },
+    ];
+    const weightedQuoteStageIds = [refs.stages.kp, refs.stages.objections].filter(Boolean).map((stage) => stage!.id);
+    const assemblyStageIds = refs.assemblyStages.map((stage) => stage.id);
+    const weightedMetrics: DataContractMetric[] = [
+      currentStageMetric('count_kp', 'Сделок в КП', weightedQuoteStageIds),
+      currentStageMetric('sum_kp', 'Сумма КП', weightedQuoteStageIds, 'money', 'field_sum'),
+      { id: 'weighted_kp', label: 'КП x 30%', type: 'formula', display: 'money', formula: '[Сумма КП] * 0.3' },
+      currentStageMetric('count_invoice', 'Сделок в счетах', [refs.stages.invoice.id]),
+      currentStageMetric('sum_invoice', 'Сумма счетов', [refs.stages.invoice.id], 'money', 'field_sum'),
+      { id: 'weighted_invoice', label: 'Счета x 90%', type: 'formula', display: 'money', formula: '[Сумма счетов] * 0.9' },
+      currentStageMetric('count_assembly', 'Сделок в сборке', assemblyStageIds, 'number', 'deal_count', refs.assemblyPipeline?.id ?? ''),
+      currentStageMetric('sum_assembly', 'Сумма сборки', assemblyStageIds, 'money', 'field_sum', refs.assemblyPipeline?.id ?? ''),
+      { id: 'weighted_assembly', label: 'Сборка x 100%', type: 'formula', display: 'money', formula: '[Сумма сборки]' },
+      {
+        id: 'weighted_total',
+        label: 'Итого взвешенно',
+        type: 'formula',
+        display: 'money',
+        formula: '[КП x 30%] + [Счета x 90%] + [Сборка x 100%]',
+      },
+    ];
+
+    return [
+      {
+        name: 'Sales: шаги и конверсии за месяц',
+        position: 0,
+        sourceType: 'EVENT',
+        config: baseConfig('sales_funnel_steps', 0, {
+          metric: 'contract',
+          display: 'table',
+          description: 'Полученные лиды, КП, счета, оплаты и конверсии по менеджерам Sales',
+          conditionLabel: 'Полученные лиды, КП, счета, оплаты и конверсии по менеджерам Sales',
+          filters: salesFilters,
+          contract: { ...contractBase, metrics: funnelMetrics },
+          size: 'lg',
+        }),
+      },
+      {
+        name: 'Sales: взвешенная воронка',
+        position: 1,
+        sourceType: 'CURRENT',
+        config: baseConfig('sales_weighted_funnel', 1, {
+          metric: 'contract',
+          display: 'table',
+          description: 'Взвешенная сумма по КП, счетам и сборке по менеджерам Sales',
+          filters: salesFilters,
+          contract: { ...contractBase, metrics: weightedMetrics },
+          size: 'lg',
+        }),
+      },
+      {
+        name: 'Sales: скорость взятия сделок',
+        position: 2,
+        sourceType: 'EVENT',
+        config: baseConfig('sales_assigned_stage_speed', 2, {
+          metric: 'contract',
+          display: 'table',
+          description: 'Среднее время от назначения sales-ответственного и появления задачи на него до выхода сделки из этапа',
+          conditionLabel: 'От назначения sales-ответственного и задачи на него до выхода из этапа',
+          filters: salesFilters,
+          contract: {
+            ...contractBase,
+            metrics: [],
+            durations: [
+              {
+                id: 'assigned_stage_speed',
+                label: 'Среднее время до взятия',
+                stageId: refs.stages.assigned.id,
+                startMode: 'sales_responsible_task',
+                onlyExited: true,
+              },
+            ],
+            includeSummaryRow: false,
+          },
+          size: 'lg',
+        }),
+      },
+      {
+        name: 'Sales: циклы сделки',
+        position: 3,
+        sourceType: 'EVENT',
+        config: baseConfig('sales_deal_cycle', 3, {
+          metric: 'deal_cycle',
+          display: 'cycle',
+          description: 'Циклы сделки по менеджерам Sales',
+          conditionLabel: 'Выход из этапа за выбранный период: вход в этап -> выход из этапа',
+          filters: salesFilters,
+          size: 'lg',
+        }),
+      },
+      {
+        name: 'Sales: текущие сделки по этапам',
+        position: 4,
+        sourceType: 'CURRENT',
+        config: baseConfig('sales_stage_age', 4, {
+          metric: 'deal_stage_age',
+          display: 'cycle',
+          description: 'Сколько текущие открытые сделки находятся в своих этапах по менеджерам Sales',
+          conditionLabel: 'Открытые сделки сейчас: вход в текущий этап -> текущее время',
+          filters: salesFilters,
+          size: 'lg',
+        }),
+      },
+      {
+        name: 'Sales: причины отказа',
+        position: 6,
+        sourceType: 'EVENT',
+        config: baseConfig('sales_loss_reasons', 6, {
+          metric: 'loss_reasons',
+          display: 'table',
+          description: 'Сделки, отправленные в отказ за выбранный период, по причинам отказа',
+          conditionLabel: 'Продажи: вход в отказ за выбранный период, по менеджерам Sales',
+          filters: salesFilters,
+          size: 'lg',
+        }),
+      },
+    ];
+  }
+
+  private buildRevenueForecastReportTemplate(): BuiltinReportTemplate {
+    return {
+      name: 'Прогноз выручки и прибыли',
+      position: 5,
+      sourceType: 'CURRENT',
+      config: {
+        metric: 'revenue_profit_forecast',
+        display: 'forecast',
+        description: 'Прогноз выручки до конца календарного месяца',
+        conditionLabel: 'Сборка, счета, КП и возражения',
+        filters: {},
+        pinned: true,
+        order: 5,
+        dashboardSection: 'forecast',
+        builtinKey: 'revenue_profit_forecast',
+        size: 'lg',
+      },
+    };
+  }
+
+  private async buildCsmReportTemplates(): Promise<BuiltinReportTemplate[]> {
     const refs = await this.resolveCsmRefs();
     if (!refs) return [];
 
@@ -469,6 +720,7 @@ export class ReportsService {
       {
         name: 'CSM: воронка',
         position: 100,
+        sourceType: 'CURRENT',
         config: baseConfig('csm_funnel', 100, {
           metric: 'contract',
           display: 'table',
@@ -482,6 +734,7 @@ export class ReportsService {
       {
         name: 'CSM: взвешенная воронка',
         position: 101,
+        sourceType: 'CURRENT',
         config: baseConfig('csm_weighted_funnel', 101, {
           metric: 'contract',
           display: 'table',
@@ -495,6 +748,7 @@ export class ReportsService {
       {
         name: 'CSM: время на этапах - База',
         position: 102,
+        sourceType: 'CURRENT',
         config: baseConfig('csm_base_deal_cycle', 102, {
           metric: 'deal_cycle',
           display: 'cycle',
@@ -507,6 +761,7 @@ export class ReportsService {
       {
         name: 'CSM: время на этапах - Закрепленные компании',
         position: 103,
+        sourceType: 'CURRENT',
         config: baseConfig('csm_assigned_deal_cycle', 103, {
           metric: 'deal_cycle',
           display: 'cycle',
@@ -519,6 +774,7 @@ export class ReportsService {
       {
         name: 'CSM: текущие сделки на этапах - База',
         position: 104,
+        sourceType: 'CURRENT',
         config: baseConfig('csm_base_stage_age', 104, {
           metric: 'deal_stage_age',
           display: 'cycle',
@@ -531,6 +787,7 @@ export class ReportsService {
       {
         name: 'CSM: текущие сделки на этапах - Закрепленные компании',
         position: 105,
+        sourceType: 'CURRENT',
         config: baseConfig('csm_assigned_stage_age', 105, {
           metric: 'deal_stage_age',
           display: 'cycle',
@@ -589,10 +846,7 @@ export class ReportsService {
       await this.db.reportTemplate.create({ data });
       return;
     }
-    const existingConfig = existing.config as ReportConfig;
-    if (existingConfig.builtinKey === config.builtinKey) {
-      await this.db.reportTemplate.update({ where: { id: existing.id }, data });
-    }
+    await this.db.reportTemplate.update({ where: { id: existing.id }, data });
   }
 
   private async applySalesAssignedStageSpeedMode() {
@@ -2729,6 +2983,80 @@ ${sheets}
       repeatPipelines,
       shippingDoneStage,
       assemblyStages: openAssemblyStages,
+    };
+  }
+
+  private async resolveSalesRefs() {
+    const [pipelines, salesGroup] = await Promise.all([
+      this.db.pipeline.findMany({
+        where: { isArchived: false },
+        include: { stages: { orderBy: { position: 'asc' } } },
+      }),
+      this.findCrmGroupByName('Sales'),
+    ]);
+    if (!salesGroup) return null;
+
+    const pipelineByExternalId = (externalId: string) =>
+      pipelines.find((pipeline) => String(pipeline.externalId ?? '') === externalId) ?? null;
+    const pipelineByName = (needle: string) =>
+      pipelines.find((pipeline) => this.normalizeStageName(pipeline.name).includes(this.normalizeStageName(needle))) ?? null;
+    const stageByExternalId = (
+      stages: Array<{ id: string; externalId?: string | null; name: string; isWon?: boolean; isLost?: boolean }>,
+      externalId: string,
+    ) => stages.find((stage) => String(stage.externalId ?? '') === externalId) ?? null;
+    const stageByName = (
+      stages: Array<{ id: string; externalId?: string | null; name: string; isWon?: boolean; isLost?: boolean }>,
+      needles: string[],
+    ) =>
+      stages.find((stage) => {
+        const name = this.normalizeStageName(stage.name);
+        return needles.every((needle) => name.includes(this.normalizeStageName(needle)));
+      }) ?? null;
+
+    const salesPipeline = pipelineByExternalId('1278508') ?? pipelineByName('воронка продажи') ?? pipelineByName('продажи');
+    const assemblyPipeline = pipelineByExternalId('1278793') ?? pipelineByName('воронка сборка') ?? pipelineByName('сборка');
+    if (!salesPipeline) return null;
+
+    const salesStages = salesPipeline.stages ?? [];
+    const assigned =
+      stageByExternalId(salesStages, '20959402') ??
+      stageByName(salesStages, ['назначен', 'ответствен']);
+    const kp =
+      stageByExternalId(salesStages, '20959408') ??
+      stageByName(salesStages, ['кп', 'презент']) ??
+      stageByName(salesStages, ['кп', 'отправ']);
+    const objections =
+      stageByExternalId(salesStages, '57732446') ??
+      stageByName(salesStages, ['возраж']);
+    const invoice =
+      stageByExternalId(salesStages, '20959411') ??
+      stageByName(salesStages, ['счет', 'отправ']);
+    const paid =
+      stageByExternalId(salesStages, '142') ??
+      stageByName(salesStages, ['счет', 'оплачен']) ??
+      salesStages.find((stage) => this.isBusinessWonStage(stage)) ??
+      null;
+    if (!assigned || !kp || !invoice || !paid) return null;
+
+    const assemblyStages = (assemblyPipeline?.stages ?? [])
+      .filter((stage) => !this.isBusinessWonStage(stage) && !this.isBusinessLostStage(stage))
+      .filter((stage) => {
+        const name = this.normalizeStageName(stage.name);
+        return !name.includes('dispatched / not fully paid') && !name.includes('partially dispatched');
+      });
+
+    return {
+      salesGroup,
+      salesPipeline,
+      assemblyPipeline,
+      assemblyStages,
+      stages: {
+        assigned,
+        kp,
+        objections,
+        invoice,
+        paid,
+      },
     };
   }
 

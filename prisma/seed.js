@@ -18,24 +18,31 @@ const { PrismaClient, UserRole } = require('../apps/api/src/generated/prisma');
 const prisma = new PrismaClient();
 
 async function main() {
-  const email = process.env.SEED_ADMIN_EMAIL;
+  const email = process.env.SEED_ADMIN_EMAIL?.toLowerCase();
   const password = process.env.SEED_ADMIN_PASSWORD;
 
   if (!email || !password) {
     throw new Error('SEED_ADMIN_EMAIL and SEED_ADMIN_PASSWORD env vars are required');
   }
 
+  const passwordHash = await bcrypt.hash(password, 12);
   const existing = await prisma.user.findUnique({ where: { email } });
-  if (!existing) {
-    await prisma.user.create({
-      data: {
-        email,
-        name: 'Администратор',
-        role: UserRole.ADMIN,
-        passwordHash: await bcrypt.hash(password, 12),
-      },
-    });
-  }
+  await prisma.user.upsert({
+    where: { email },
+    create: {
+      email,
+      name: 'Администратор',
+      role: UserRole.ADMIN,
+      passwordHash,
+      isActive: true,
+    },
+    update: {
+      name: existing?.name || 'Администратор',
+      role: UserRole.ADMIN,
+      passwordHash,
+      isActive: true,
+    },
+  });
 
   const forecastSettings = await prisma.forecastSettings.findFirst();
   if (!forecastSettings) {
