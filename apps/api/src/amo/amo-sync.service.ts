@@ -816,6 +816,7 @@ export class AmoSyncService {
       stats.csmZeroOfferMadeNotifications = result.csmZeroOfferMade;
       stats.invoiceNoPaymentNotifications = result.invoiceNoPayment;
       stats.proposalStaleNotifications = result.proposalStale;
+      stats.highValueIdleNotifications = result.highValueIdle;
       stats.notificationSkips = result.skipped;
     } catch (error: any) {
       stats.notificationErrors = 1;

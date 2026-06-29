@@ -51,6 +51,8 @@ export class CrmEventNotificationsService {
   private readonly massTaskMoveWindowMinutes = 15;
   private readonly overdueTasksThreshold = 5;
   private readonly csmDailyCheckHour = 13;
+  private readonly highValueIdleAmount = 20_000;
+  private readonly highValueIdleHours = 24;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -118,6 +120,7 @@ export class CrmEventNotificationsService {
       csmZeroOfferMade: 0,
       invoiceNoPayment: 0,
       proposalStale: 0,
+      highValueIdle: 0,
     };
     const leaders = this.salesLeaderUsers(users);
     const csmLeaders = this.csmLeaderUsers(users);
@@ -192,6 +195,7 @@ export class CrmEventNotificationsService {
     result.assignedLeadReminder += stateAlerts.assignedLeadReminder;
     result.invoiceNoPayment += stateAlerts.invoiceNoPayment;
     result.proposalStale += stateAlerts.proposalStale;
+    result.highValueIdle += stateAlerts.highValueIdle;
     result.skipped += stateAlerts.skipped;
 
     return result;
@@ -636,7 +640,7 @@ export class CrmEventNotificationsService {
   private async notifyStateBasedAlerts(users: AppUser[], leaders: AppUser[], domain: string) {
     const salesPipelineIds = await this.salesPipelineIds();
     if (!salesPipelineIds.length) {
-      return { assignedLeadNew: 0, assignedLeadReminder: 0, invoiceNoPayment: 0, proposalStale: 0, skipped: 0 };
+      return { assignedLeadNew: 0, assignedLeadReminder: 0, invoiceNoPayment: 0, proposalStale: 0, highValueIdle: 0, skipped: 0 };
     }
 
     const now = new Date();
@@ -651,13 +655,15 @@ export class CrmEventNotificationsService {
         pipeline: true,
         stage: true,
         tasks: { where: { isCompleted: false }, orderBy: { createdAt: 'asc' } },
+        notes: { orderBy: { createdAt: 'desc' }, take: 1 },
+        events: { orderBy: { createdAt: 'desc' }, take: 1 },
         stageHistory: { orderBy: { movedAt: 'desc' }, take: 20 },
       },
       orderBy: { createdAt: 'asc' },
       take: 2000,
     });
 
-    const result = { assignedLeadNew: 0, assignedLeadReminder: 0, invoiceNoPayment: 0, proposalStale: 0, skipped: 0 };
+    const result = { assignedLeadNew: 0, assignedLeadReminder: 0, invoiceNoPayment: 0, proposalStale: 0, highValueIdle: 0, skipped: 0 };
     for (const deal of deals) {
       if (this.isAssignedResponsibleStage(deal.stage?.name)) {
         const delivered = await this.notifyAssignedLeadManagerAlerts(deal, users, domain, now);
@@ -677,6 +683,10 @@ export class CrmEventNotificationsService {
         result.proposalStale += delivered.sent;
         result.skipped += delivered.skipped;
       }
+
+      const highValueIdle = await this.notifyHighValueIdle(deal, leaders, domain, now);
+      result.highValueIdle += highValueIdle.sent;
+      result.skipped += highValueIdle.skipped;
     }
 
     return result;
@@ -816,6 +826,45 @@ export class CrmEventNotificationsService {
     return deliveries.some((delivery) => delivery?.status === 'SENT') ? { sent: 1, skipped: 0 } : { sent: 0, skipped: 1 };
   }
 
+  private async notifyHighValueIdle(deal: any, leaders: AppUser[], domain: string, now: Date) {
+    if (!leaders.length) return { sent: 0, skipped: 0 };
+    if (Number(deal.amount ?? 0) <= this.highValueIdleAmount) return { sent: 0, skipped: 0 };
+
+    const lastActivityAt = this.lastDealActivityAt(deal);
+    const idleMs = moscowWeekdayElapsedMs(lastActivityAt, now);
+    if (idleMs < this.highValueIdleHours * 60 * 60_000) return { sent: 0, skipped: 0 };
+
+    const eventKey = `amo:high-value-idle-24h:${deal.id}:${deal.stageId}:${lastActivityAt.toISOString()}`;
+    const message = await this.renderNotification('amo_high_value_idle_24h', 'amo_high_value_idle_24h', {
+      deal: deal.title,
+      dealUrl: this.dealUrl(domain, deal.externalId),
+      amount: this.formatMoney(deal.amount),
+      manager: deal.responsible?.name ?? '-',
+      pipeline: deal.pipeline?.name ?? '-',
+      stage: deal.stage?.name ?? '-',
+    });
+    const payload = {
+      type: 'amo_high_value_idle_24h',
+      dealId: deal.id,
+      dealExternalId: deal.externalId,
+      amount: Number(deal.amount ?? 0),
+      managerCrmUserId: deal.responsibleId,
+      lastActivityAt: lastActivityAt.toISOString(),
+    };
+    const configuredDeliveries = await this.sendConfiguredNotification('amo_high_value_idle_24h', message, payload, eventKey);
+    if (configuredDeliveries) {
+      return configuredDeliveries.some((delivery) => delivery?.status === 'SENT') ? { sent: 1, skipped: 0 } : { sent: 0, skipped: 1 };
+    }
+    const deliveries = await this.telegram.sendDirectMessageToUsers(
+      leaders.map((leader) => leader.id),
+      message,
+      payload,
+      undefined,
+      eventKey,
+    );
+    return deliveries.some((delivery) => delivery?.status === 'SENT') ? { sent: 1, skipped: 0 } : { sent: 0, skipped: 1 };
+  }
+
   private async notifyWorkAcceptedDeal(deal: any, leaders: AppUser[], domain: string, eventId?: string | null) {
     const managerMention = await this.telegram.mentionForCrmUser(deal.responsibleId, deal.responsible?.name);
     const payload = {
@@ -930,6 +979,18 @@ export class CrmEventNotificationsService {
       .filter((item: any) => item.toStageId === deal.stageId)
       .sort((a: any, b: any) => b.movedAt.getTime() - a.movedAt.getTime())[0];
     return currentStageHistory?.movedAt ?? deal.createdAt;
+  }
+
+  private lastDealActivityAt(deal: any) {
+    const dates = [
+      deal.updatedAt,
+      deal.stageHistory?.[0]?.movedAt,
+      deal.notes?.[0]?.createdAt,
+      deal.events?.[0]?.createdAt,
+      ...(deal.tasks ?? []).flatMap((task: any) => [task.createdAt, task.updatedAt, task.completedAt].filter(Boolean)),
+    ].filter((date): date is Date => date instanceof Date && !Number.isNaN(date.getTime()));
+    if (!dates.length) return deal.createdAt;
+    return new Date(Math.max(...dates.map((date) => date.getTime())));
   }
 
   private taskCreatedAt(task: { createdAt: Date; raw?: unknown }) {
@@ -1364,6 +1425,9 @@ export class CrmEventNotificationsService {
     }
     if (type === 'amo_proposal_stale_24h') {
       return '\u0421\u0434\u0435\u043b\u043a\u0430 \u043d\u0430 {amount} \u0441\u0442\u043e\u0438\u0442 \u0432\u0442\u043e\u0440\u043e\u0439 \u0434\u0435\u043d\u044c - {dealUrl}';
+    }
+    if (type === 'amo_high_value_idle_24h') {
+      return '\u041a\u0440\u0443\u043f\u043d\u0430\u044f \u0441\u0434\u0435\u043b\u043a\u0430 \u0431\u0435\u0437 \u0434\u0432\u0438\u0436\u0435\u043d\u0438\u044f 24 \u0447\u0430\u0441\u0430.\n\u0421\u0434\u0435\u043b\u043a\u0430: {deal}\n\u0421\u0443\u043c\u043c\u0430: {amount}\n\u041c\u0435\u043d\u0435\u0434\u0436\u0435\u0440: {manager}\n\u042d\u0442\u0430\u043f: {stage}\n\u0421\u0441\u044b\u043b\u043a\u0430: {dealUrl}';
     }
     if (type === 'amo_take_to_work_enabled') {
       return '{managerMention}, \u0443 \u0442\u0435\u0431\u044f \u0432\u0445\u043e\u0434\u044f\u0449\u0438\u0439 \u043b\u0438\u0434 \u043f\u0440\u043e\u0441\u0440\u043e\u0447\u0435\u043d! \u0421\u0441\u044b\u043b\u043a\u0430 \u043d\u0430 \u0441\u0434\u0435\u043b\u043a\u0443: {dealUrl}';
