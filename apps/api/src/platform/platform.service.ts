@@ -48,6 +48,20 @@ type EmailMessageItem = {
   source: 'note' | 'event';
 };
 
+type EmailMessageParams = {
+  income: boolean | null;
+  threadId: string | null;
+  subject: string | null;
+  summary: string | null;
+  body: string | null;
+  from: string | null;
+  fromEmail: string | null;
+  to: string | null;
+  toEmail: string | null;
+  attachCount: number;
+  deliveryStatus: string | null;
+};
+
 type EmailThreadDraft = {
   deal: {
     id: string;
@@ -57,7 +71,7 @@ type EmailThreadDraft = {
     contactId: string | null;
     pipeline: { name: string } | null;
     stage: { name: string } | null;
-    responsible: { name: string; group: { name: string } | null } | null;
+    responsible: { name: string; externalId: string; group: { name: string } | null } | null;
     contact: { externalId: string; name: string; email: string | null } | null;
   };
   threadId: string;
@@ -1937,7 +1951,7 @@ export class PlatformService {
         contactId: true,
         pipeline: { select: { name: true } },
         stage: { select: { name: true } },
-        responsible: { select: { name: true, group: { select: { name: true } } } },
+        responsible: { select: { name: true, externalId: true, group: { select: { name: true } } } },
         contact: { select: { externalId: true, name: true, email: true } },
       },
     });
@@ -1964,7 +1978,7 @@ export class PlatformService {
             deletedAt: true,
             pipeline: { select: { name: true } },
             stage: { select: { name: true, isWon: true, isLost: true } },
-            responsible: { select: { name: true, group: { select: { name: true } } } },
+            responsible: { select: { name: true, externalId: true, group: { select: { name: true } } } },
             contact: { select: { externalId: true, name: true, email: true } },
           },
         },
@@ -1973,6 +1987,7 @@ export class PlatformService {
 
     const drafts = new Map<string, EmailThreadDraft>();
     const storedNoteIds = new Set<string>();
+    const internalEmailDomains = await this.emailInternalDomains();
     const openDealsById = new Map(openDeals.map((deal) => [deal.id, deal]));
     const leadExternalToDealId = new Map<string, string>();
     const contactExternalToDealIds = new Map<string, Set<string>>();
@@ -2015,7 +2030,7 @@ export class PlatformService {
       draft.messages.push({
         id: `note:${note.externalId}`,
         noteExternalId: note.externalId,
-        direction: params.income === false ? 'outgoing' : 'incoming',
+        direction: this.emailDirection(params, internalEmailDomains),
         createdAt: note.createdAt,
         subject: params.subject,
         summary: params.summary,
@@ -2067,7 +2082,7 @@ export class PlatformService {
         const deal = openDealsById.get(dealId);
         if (!deal) continue;
 
-        const direction: EmailDirection = event.type === 'incoming_mail' ? 'incoming' : 'outgoing';
+        const direction = this.emailDirection(eventParams, internalEmailDomains, event.type);
         const threadId = this.emailEventThreadId(entity, deal.externalId);
         const targetDrafts = direction === 'incoming'
           ? [ensureDraft(deal, threadId)]
@@ -2164,17 +2179,32 @@ export class PlatformService {
   private emailNoteParams(raw: unknown, storedText?: string | null) {
     const params = (raw as { params?: Record<string, any> } | null)?.params ?? {};
     const body = this.cleanEmailBody(storedText ?? params.text ?? params.body ?? params.html);
+    const from = this.emailParty(params.from);
+    const to = this.emailParty(params.to);
     return {
       income: typeof params.income === 'boolean' ? params.income : null,
       threadId: params.thread_id == null ? null : String(params.thread_id),
       subject: this.cleanEmailText(params.subject),
       summary: this.cleanEmailText(params.content_summary ?? body),
       body,
-      from: this.emailPartyLabel(params.from),
-      to: this.emailPartyLabel(params.to),
+      from: from.label,
+      fromEmail: from.email,
+      to: to.label,
+      toEmail: to.email,
       attachCount: Math.max(0, Number(params.attach_cnt ?? 0) || 0),
       deliveryStatus: params.delivery?.status == null ? null : String(params.delivery.status),
     };
+  }
+
+  private emailDirection(
+    params: EmailMessageParams,
+    internalEmailDomains: Set<string>,
+    eventType?: string,
+  ): EmailDirection {
+    if (eventType === 'outgoing_mail' || params.income === false) return 'outgoing';
+    const fromDomain = this.emailDomain(params.fromEmail);
+    if (fromDomain && internalEmailDomains.has(fromDomain)) return 'outgoing';
+    return 'incoming';
   }
 
   private emailEventEntity(raw: unknown) {
@@ -2198,13 +2228,35 @@ export class PlatformService {
     return `mail-event:lead:${dealExternalId ?? 'unknown'}`;
   }
 
-  private emailPartyLabel(value: unknown) {
-    if (!value || typeof value !== 'object') return null;
+  private async emailInternalDomains() {
+    const users = await this.prisma.crmUser.findMany({
+      where: { isActive: true, email: { not: null } },
+      select: { email: true },
+    });
+    const domains = new Set<string>();
+    for (const user of users) {
+      const domain = this.emailDomain(user.email);
+      if (domain) domains.add(domain);
+    }
+    return domains;
+  }
+
+  private emailParty(value: unknown) {
+    if (!value || typeof value !== 'object') return { label: null, email: null };
     const party = value as { name?: unknown; email?: unknown };
     const name = this.cleanEmailText(party.name);
-    const email = this.cleanEmailText(party.email);
-    if (name && email) return `${name} <${email}>`;
-    return email || name;
+    const email = this.cleanEmailText(party.email)?.toLowerCase() ?? null;
+    return {
+      label: name && email ? `${name} <${email}>` : email || name,
+      email,
+    };
+  }
+
+  private emailDomain(email?: string | null) {
+    const value = this.cleanEmailText(email)?.toLowerCase();
+    const atIndex = value?.lastIndexOf('@') ?? -1;
+    if (!value || atIndex < 0 || atIndex === value.length - 1) return null;
+    return value.slice(atIndex + 1);
   }
 
   private cleanEmailText(value: unknown) {
