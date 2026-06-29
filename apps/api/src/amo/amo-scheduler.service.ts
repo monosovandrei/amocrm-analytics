@@ -28,10 +28,8 @@ export class AmoSchedulerService {
     await this.sync.expireStaleJobs(connection.id);
 
     const lastSync = connection.lastIncrementalSyncAt ?? connection.lastFullSyncAt;
-    if (!lastSync) return;
-    const due =
-      !lastSync ||
-      Date.now() - lastSync.getTime() >= syncIntervalMinutes * 60_000;
+    const syncType = lastSync ? SyncJobType.INCREMENTAL : SyncJobType.FULL;
+    const due = !lastSync || Date.now() - lastSync.getTime() >= syncIntervalMinutes * 60_000;
     if (!due) return;
 
     const running = await this.prisma.syncJob.count({
@@ -40,7 +38,7 @@ export class AmoSchedulerService {
     if (running > 0) return;
 
     try {
-      await this.sync.trigger(SyncJobType.INCREMENTAL);
+      await this.sync.trigger(syncType);
     } catch (error: any) {
       this.logger.warn(`Scheduled amoCRM sync failed: ${error.message}`);
     }

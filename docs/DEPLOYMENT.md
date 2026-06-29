@@ -46,6 +46,8 @@
 Для частоты фоновой синхронизации amoCRM:
 
 - `AMOCRM_SYNC_INTERVAL_MINUTES=10`
+- `AMOCRM_SYNC_JOB_TIMEOUT_MINUTES=30`
+- `AMOCRM_FULL_SYNC_JOB_TIMEOUT_MINUTES=360`
 
 Это не основной production-режим обновления данных. На production данные должны обновляться через amoCRM webhooks. Polling нужен только как страховка, если webhook не дошел.
 

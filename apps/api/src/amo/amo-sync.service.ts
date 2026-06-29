@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Prisma, SyncJobType } from '../generated/prisma';
+import { AmoConnection, Prisma, SyncJobType } from '../generated/prisma';
 import { toDateFromAmoTimestamp } from '../common/date.util';
 import { PrismaService } from '../prisma/prisma.service';
 import { AmoClient } from './amo-client';
@@ -26,6 +26,7 @@ export class AmoSyncService {
 
   async trigger(type: SyncJobType, actorUserId?: string) {
     const connection = await this.amo.getActiveConnectionOrFail();
+    const syncType = this.resolveRequestedSyncType(type, connection);
     await this.expireStaleJobs(connection.id);
 
     const result = await this.prisma.$transaction(async (tx) => {
@@ -46,12 +47,12 @@ export class AmoSyncService {
       }
 
       const job = await tx.syncJob.create({
-        data: { connectionId: connection.id, type, status: 'QUEUED', heartbeatAt: new Date() },
+        data: { connectionId: connection.id, type: syncType, status: 'QUEUED', heartbeatAt: new Date() },
       });
       return {
         job,
         shouldRun: true,
-        response: { jobId: job.id, status: job.status, type: job.type },
+        response: { jobId: job.id, status: job.status, type: job.type, requestedType: type },
       };
     });
 
@@ -63,7 +64,7 @@ export class AmoSyncService {
       action: 'amo.sync.trigger',
       entity: 'SyncJob',
       entityId: job.id,
-      metadata: { type, connectionId: connection.id },
+      metadata: { type: syncType, requestedType: type, connectionId: connection.id },
     });
 
     this.run(job.id).catch((error) => {
@@ -118,15 +119,25 @@ export class AmoSyncService {
   }
 
   private getStaleSyncJobMs(type?: SyncJobType) {
+    if (type === SyncJobType.FULL) {
+      const rawFullTimeout = this.config.get<string>('AMOCRM_FULL_SYNC_JOB_TIMEOUT_MINUTES');
+      const parsedFull = rawFullTimeout ? Number(rawFullTimeout) : NaN;
+      return Number.isFinite(parsedFull) && parsedFull > 0
+        ? parsedFull * 60_000
+        : AmoSyncService.DEFAULT_STALE_SYNC_JOB_MS;
+    }
+
     const rawTimeout = this.config.get<string>('AMOCRM_SYNC_JOB_TIMEOUT_MINUTES');
     const parsed = rawTimeout ? Number(rawTimeout) : NaN;
-    const fullTimeoutMs =
-      Number.isFinite(parsed) && parsed > 0
-        ? parsed * 60_000
-        : AmoSyncService.DEFAULT_STALE_SYNC_JOB_MS;
+    return Number.isFinite(parsed) && parsed > 0
+      ? parsed * 60_000
+      : 30 * 60_000;
+  }
 
-    if (type === SyncJobType.FULL) return fullTimeoutMs;
-    return Math.min(fullTimeoutMs, 30 * 60_000);
+  private resolveRequestedSyncType(type: SyncJobType, connection: AmoConnection) {
+    if (type === SyncJobType.FULL) return SyncJobType.FULL;
+    if (!connection.lastFullSyncAt && !connection.lastIncrementalSyncAt) return SyncJobType.FULL;
+    return type;
   }
 
   async getJob(id: string) {
@@ -267,6 +278,7 @@ export class AmoSyncService {
       const isFullSync = job.type === SyncJobType.FULL;
 
       await this.syncAccount(client, stats);
+      await this.syncOptional('webhookSubscription', stats, () => this.ensureWebhookSubscription(client, job.connection, stats));
       const maps = this.emptyMaps();
       if (isFullSync) {
         const freshMaps = await this.syncMetadata(client, stats);
@@ -390,6 +402,7 @@ export class AmoSyncService {
 
       if (groups.length > 0) {
         const eventSyncFrom = Math.floor((earliestEventAt.getTime() - 5 * 60_000) / 1000);
+        await this.syncNotes(client, stats, eventSyncFrom);
         await this.syncEvents(client, maps, stats, eventSyncFrom);
         await this.processCrmNotifications(stats, new Date(eventSyncFrom * 1000), client.domain);
       }
@@ -715,6 +728,74 @@ export class AmoSyncService {
       stats[`${name}Skipped`] = 1;
       this.logger.warn(`${name} sync skipped: ${error.message}`);
     }
+  }
+
+  private async ensureWebhookSubscription(client: AmoClient, connection: AmoConnection, stats: Record<string, number>) {
+    const destination = this.webhookDestination(connection);
+    if (!destination) {
+      stats.webhookSubscriptionNoUrl = 1;
+      return;
+    }
+
+    const settings = this.webhookSettings();
+    await client.post('/webhooks', {
+      destination,
+      settings,
+      sort: 10,
+    });
+
+    await this.prisma.amoConnection.update({
+      where: { id: connection.id },
+      data: {
+        config: {
+          ...((connection.config as Record<string, unknown>) ?? {}),
+          webhookUrl: destination,
+          webhookSettings: settings,
+          webhookEnsuredAt: new Date().toISOString(),
+        },
+      },
+    });
+    stats.webhookSubscription = 1;
+  }
+
+  private webhookDestination(connection: AmoConnection) {
+    const base = this.config.get<string>('WEBHOOK_BASE_URL', '').replace(/\/$/, '');
+    if (base) return `${base}/webhooks/amocrm/${connection.webhookSecret}`;
+    const stored = (connection.config as any)?.webhookUrl;
+    return typeof stored === 'string' && /^https:\/\//i.test(stored) ? stored : null;
+  }
+
+  private webhookSettings() {
+    return [
+      'add_lead',
+      'update_lead',
+      'delete_lead',
+      'restore_lead',
+      'status_lead',
+      'responsible_lead',
+      'note_lead',
+      'add_contact',
+      'update_contact',
+      'delete_contact',
+      'restore_contact',
+      'responsible_contact',
+      'note_contact',
+      'add_company',
+      'update_company',
+      'delete_company',
+      'restore_company',
+      'responsible_company',
+      'note_company',
+      'add_customer',
+      'update_customer',
+      'delete_customer',
+      'responsible_customer',
+      'note_customer',
+      'add_task',
+      'update_task',
+      'delete_task',
+      'responsible_task',
+    ];
   }
 
   private async processCrmNotifications(stats: Record<string, number>, since: Date, domain: string) {

@@ -42,13 +42,14 @@ export class AmoClient {
   ): Promise<T[]> {
     const result: T[] = [];
     let page = 1;
+    const limit = params.limit ?? 250;
 
     while (true) {
-      const data = await this.get<any>(path, { ...params, page, limit: 250 });
+      const data = await this.get<any>(path, { ...params, page, limit });
       const items = data?._embedded?.[embeddedKey] ?? [];
       if (!Array.isArray(items) || items.length === 0) break;
       result.push(...items);
-      if (items.length < 250) break;
+      if (!data?._links?.next?.href) break;
       page += 1;
     }
 

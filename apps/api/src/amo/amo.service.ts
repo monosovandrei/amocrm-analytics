@@ -166,7 +166,7 @@ export class AmoService {
       for (const [action, rawItems] of Object.entries(actions as Record<string, unknown>)) {
         const items = this.normalizeWebhookItems(rawItems);
         for (const item of items) {
-          const externalId = item.id ?? item.uid ?? item.entity_id ?? item.task_id ?? item.element_id ?? null;
+          const externalId = this.webhookExternalId(entity, action, item);
           events.push({
             entity,
             action,
@@ -239,6 +239,16 @@ export class AmoService {
     }
 
     return [raw as Record<string, any>];
+  }
+
+  private webhookExternalId(entity: string, action: string, item: Record<string, any>) {
+    const normalizedEntity = String(entity ?? '').toLowerCase();
+    const normalizedAction = String(action ?? '').toLowerCase();
+    if (normalizedAction.includes('note')) {
+      return item.element_id ?? item.entity_id ?? item.lead_id ?? item.contact_id ?? item.company_id ?? item.customer_id ?? item.id ?? null;
+    }
+    if (normalizedEntity.includes('task')) return item.task_id ?? item.id ?? item.entity_id ?? null;
+    return item.id ?? item.uid ?? item.entity_id ?? item.task_id ?? item.element_id ?? null;
   }
 
   private encryptCredentials(credentials: AmoCredentials) {
