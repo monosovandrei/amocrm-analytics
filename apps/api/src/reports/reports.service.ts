@@ -626,6 +626,15 @@ export class ReportsService {
       metric('invoice_sent', 'Счета отправили', [refs.baseStages.invoice.id, refs.assignedStages.invoice.id]),
       conversion('conv_invoice_to_paid', 'Конверсия счёт -> оплата', 'invoice_sent', 'paid'),
       metric('paid', 'Оплаченные счета', [refs.baseStages.paid.id, refs.assignedStages.paid.id]),
+      {
+        id: 'paid_amount',
+        label: 'Сумма оплаченных счетов',
+        type: 'stage_reached',
+        measure: 'field_sum',
+        display: 'money',
+        pipelineId: csmPipelines[0],
+        stageIds: [refs.baseStages.paid.id, refs.assignedStages.paid.id],
+      },
     ];
     const weightedMetrics: DataContractMetric[] = [
       {
