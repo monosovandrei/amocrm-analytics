@@ -2183,7 +2183,6 @@ ${sheets}
       dealCounts.get(groupId)!.add(dealId);
       dealCounts.get(allGroupId)!.add(dealId);
     };
-
     for (const deal of deals) {
       const groupId = deal.responsibleId ?? 'unassigned';
       const groupName = deal.responsible?.name ?? 'Без менеджера';
@@ -2409,6 +2408,7 @@ ${sheets}
 
     const timelineStages = stageRows.filter((stage) => !this.isBusinessWonStage(stage) && !this.isBusinessLostStage(stage));
     const timelineStageIds = new Set(timelineStages.map((stage) => stage.id));
+    const averageStageIds = this.currentStageAverageStageIds(timelineStages);
     const managers = await this.visibleManagers(role, filters.groupIds, filters.managerIds);
     const groups = new Map<string, { id: string; name: string }>();
     for (const manager of managers) groups.set(manager.id, { id: manager.id, name: manager.name });
@@ -2435,6 +2435,8 @@ ${sheets}
 
     const stageValues = new Map<string, Map<string, number[]>>();
     const stageSamples = new Map<string, Map<string, Array<{ dealId: string; dealExternalId: string; dealTitle: string; durationDays: number }>>>();
+    const totalValues = new Map<string, number[]>();
+    const totalSamples = new Map<string, Array<{ dealId: string; dealExternalId: string; dealTitle: string; durationDays: number }>>();
     const dealCounts = new Map<string, Set<string>>();
     const allGroupId = 'all';
     const now = new Date();
@@ -2457,6 +2459,16 @@ ${sheets}
       dealCounts.get(groupId)!.add(dealId);
       dealCounts.get(allGroupId)!.add(dealId);
     };
+    const addTotalValue = (
+      groupId: string,
+      duration: number,
+      sample: { dealId: string; dealExternalId: string; dealTitle: string; durationDays: number },
+    ) => {
+      if (!totalValues.has(groupId)) totalValues.set(groupId, []);
+      if (!totalSamples.has(groupId)) totalSamples.set(groupId, []);
+      totalValues.get(groupId)!.push(duration);
+      totalSamples.get(groupId)!.push(sample);
+    };
 
     for (const deal of openDeals) {
       const groupId = deal.responsibleId ?? 'unassigned';
@@ -2474,6 +2486,10 @@ ${sheets}
       const sample = { dealId: deal.id, dealExternalId: deal.externalId, dealTitle: deal.title, durationDays: duration };
       stageSamplesFor(groupId, deal.stageId).push(sample);
       stageSamplesFor(allGroupId, deal.stageId).push(sample);
+      if (averageStageIds.has(deal.stageId)) {
+        addTotalValue(groupId, duration, sample);
+        addTotalValue(allGroupId, duration, sample);
+      }
       addDealToScope(groupId, deal.id);
     }
 
@@ -2496,16 +2512,21 @@ ${sheets}
       managerName: group.name,
       totalDeals: dealCounts.get(group.id)?.size ?? 0,
       stages: buildStageItems(group.id),
+      overallAverage: this.currentStageOverallAverage(totalValues, totalSamples, group.id),
     }));
     const summary = {
       managerId: allGroupId,
       managerName: 'Итого',
       totalDeals: dealCounts.get(allGroupId)?.size ?? 0,
       stages: buildStageItems(allGroupId),
+      overallAverage: this.currentStageOverallAverage(totalValues, totalSamples, allGroupId),
     };
     const maxAvgDays = Math.max(
       0,
-      ...[...rows, summary].flatMap((row) => row.stages.map((stage) => stage.avgDays ?? 0)),
+      ...[...rows, summary].flatMap((row) => [
+        ...row.stages.map((stage) => stage.avgDays ?? 0),
+        row.overallAverage?.avgDays ?? 0,
+      ]),
     );
 
     return {
@@ -2522,6 +2543,45 @@ ${sheets}
       summary,
       maxAvgDays,
     };
+  }
+
+  private currentStageAverageStageIds(
+    stages: Array<{ id: string; pipelineId: string; name: string; position: number }>,
+  ) {
+    const stagesByPipeline = new Map<string, Array<{ id: string; name: string; position: number }>>();
+    for (const stage of stages) {
+      if (!stagesByPipeline.has(stage.pipelineId)) stagesByPipeline.set(stage.pipelineId, []);
+      stagesByPipeline.get(stage.pipelineId)!.push(stage);
+    }
+
+    const result = new Set<string>();
+    for (const pipelineStages of stagesByPipeline.values()) {
+      const sorted = [...pipelineStages].sort((a, b) => a.position - b.position);
+      const workStage = sorted.find((stage) => this.textHasAll(stage.name, ['взят', 'работ']));
+      const minPosition = workStage?.position ?? sorted[0]?.position ?? 0;
+      for (const stage of sorted) {
+        if (stage.position >= minPosition) result.add(stage.id);
+      }
+    }
+    return result;
+  }
+
+  private currentStageOverallAverage(
+    values: Map<string, number[]>,
+    samples: Map<string, Array<{ dealId: string; dealExternalId: string; dealTitle: string; durationDays: number }>>,
+    groupId: string,
+  ) {
+    const groupValues = values.get(groupId) ?? [];
+    return {
+      avgDays: this.averageDays(groupValues),
+      sampleSize: groupValues.length,
+      samples: samples.get(groupId) ?? [],
+    };
+  }
+
+  private textHasAll(value: string, needles: string[]) {
+    const normalized = String(value ?? '').toLowerCase().replace(/\u0451/g, '\u0435');
+    return needles.every((needle) => normalized.includes(needle));
   }
 
   private async computeCurrentSnapshot(filters: ReportFilters, role: UserRole) {

@@ -2092,7 +2092,7 @@ button:disabled {
 }
 
 .deal-cycle-grid-current {
-  grid-template-columns: minmax(130px, 180px) minmax(0, 1fr);
+  grid-template-columns: minmax(130px, 180px) minmax(0, 1fr) minmax(96px, 120px);
 }
 
 .deal-cycle-head {
@@ -2423,7 +2423,7 @@ button:disabled {
   }
 
   .deal-cycle-grid-current {
-    grid-template-columns: minmax(110px, 150px) minmax(0, 1fr);
+    grid-template-columns: minmax(110px, 150px) minmax(0, 1fr) minmax(82px, 104px);
   }
 
   .email-watch-layout {
