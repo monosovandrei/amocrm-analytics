@@ -1,5 +1,4 @@
 import { Body, Controller, HttpCode, HttpStatus, Logger, Param, Post } from '@nestjs/common';
-import { SyncJobType } from '../generated/prisma';
 import { AmoService } from './amo.service';
 import { AmoSyncService } from './amo-sync.service';
 
@@ -29,7 +28,7 @@ export class AmoWebhookController {
     const events = this.amo.flattenWebhook(body);
     await this.amo.recordWebhook(connection.id, events);
     if (events.length > 0) {
-      await this.sync.trigger(SyncJobType.WEBHOOK);
+      await this.sync.triggerWebhookQueue();
     }
     return { status: 'ok', events: events.length };
   }

@@ -60,7 +60,7 @@ cp .env.example .env
 - `AMOCRM_CLIENT_SECRET` - secret private integration amoCRM.
 - `AMOCRM_REDIRECT_URI` - redirect URI из настроек amoCRM.
 - `WEBHOOK_BASE_URL` - внешний API URL без завершающего slash, например `https://analytics.example.ru/api/v1`.
-- `AMOCRM_SYNC_INTERVAL_MINUTES` - страховочный polling amoCRM в минутах; основной production-режим обновления идет через webhooks.
+- `AMOCRM_SYNC_INTERVAL_MINUTES` - `0` для production; регулярный polling отключен. Положительное значение использовать только локально или для ручной диагностики.
 - `AMOCRM_SYNC_JOB_TIMEOUT_MINUTES` - через сколько минут обычная job без heartbeat считается зависшей; для production рекомендуется `30`.
 - `AMOCRM_FULL_SYNC_JOB_TIMEOUT_MINUTES` - timeout полной исторической синхронизации; для production рекомендуется `360` или больше.
 - `WEB_ORIGIN` - разрешенный origin фронтенда для CORS.
@@ -92,6 +92,19 @@ npm run dev:web
 - Web: `http://localhost:3000`
 - API: `http://localhost:4000/api/v1`
 - Healthcheck: `http://localhost:4000/api/v1/health`
+
+Локально polling тоже выключен по умолчанию: `AMOCRM_SYNC_INTERVAL_MINUTES=0`.
+
+Для проверки без живой amoCRM отправляйте тестовые webhook payload'ы в `/api/v1/webhooks/amocrm/{secret}`.
+
+Для проверки с реальной amoCRM нужен HTTPS-туннель на локальный API:
+
+```env
+WEBHOOK_BASE_URL=https://your-tunnel-url/api/v1
+AMOCRM_SYNC_INTERVAL_MINUTES=0
+```
+
+После смены tunnel URL нужно заново зарегистрировать webhook через `POST /api/v1/amo/webhook/register`.
 
 ## Docker-запуск
 

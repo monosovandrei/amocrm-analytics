@@ -56,6 +56,25 @@ export class AmoClient {
     return result;
   }
 
+  async paginateBatch<T = any>(
+    path: string,
+    embeddedKey: string,
+    params: Record<string, string | number | boolean | undefined>,
+    onBatch: (items: T[], page: number) => Promise<void>,
+  ): Promise<void> {
+    let page = 1;
+    const limit = params.limit ?? 250;
+
+    while (true) {
+      const data = await this.get<any>(path, { ...params, page, limit });
+      const items = data?._embedded?.[embeddedKey] ?? [];
+      if (!Array.isArray(items) || items.length === 0) break;
+      await onBatch(items as T[], page);
+      if (!data?._links?.next?.href) break;
+      page += 1;
+    }
+  }
+
   private async request<T>(
     method: 'GET' | 'POST',
     path: string,

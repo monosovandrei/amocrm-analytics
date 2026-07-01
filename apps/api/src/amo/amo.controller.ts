@@ -50,6 +50,13 @@ export class AmoController {
     return this.sync.trigger(SyncJobType.FULL, req.user.id);
   }
 
+  @Post('webhook/register')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
+  registerWebhook(@Request() req: any) {
+    return this.sync.registerWebhook(req.user.id);
+  }
+
   @Get('sync/health')
   @UseGuards(JwtAuthGuard)
   getSyncHealth() {

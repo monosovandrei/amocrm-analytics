@@ -23,7 +23,7 @@ export class AmoSchedulerService {
       orderBy: { createdAt: 'desc' },
     });
     if (!connection) return;
-    const syncIntervalMinutes = this.getSyncIntervalMinutes(connection.syncIntervalMinutes);
+    const syncIntervalMinutes = this.getSyncIntervalMinutes();
     if (syncIntervalMinutes <= 0) return;
     await this.sync.expireStaleJobs(connection.id);
 
@@ -64,7 +64,7 @@ export class AmoSchedulerService {
       });
       if (pending === 0) return;
 
-      await this.sync.trigger(SyncJobType.WEBHOOK);
+      await this.sync.triggerWebhookQueue();
     } catch (error: any) {
       this.logger.warn(`Webhook amoCRM queue processing failed: ${error.message}`);
     } finally {
@@ -72,11 +72,11 @@ export class AmoSchedulerService {
     }
   }
 
-  private getSyncIntervalMinutes(savedIntervalMinutes: number) {
+  private getSyncIntervalMinutes() {
     const rawInterval = this.config.get<string>('AMOCRM_SYNC_INTERVAL_MINUTES');
-    if (!rawInterval) return savedIntervalMinutes;
+    if (!rawInterval) return 0;
 
     const parsed = Number(rawInterval);
-    return Number.isFinite(parsed) ? Math.max(0, parsed) : savedIntervalMinutes;
+    return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
   }
 }

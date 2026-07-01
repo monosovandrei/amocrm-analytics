@@ -43,13 +43,13 @@
 
 - `TELEGRAM_BOT_TOKEN`
 
-Для частоты фоновой синхронизации amoCRM:
+Для режима синхронизации amoCRM:
 
-- `AMOCRM_SYNC_INTERVAL_MINUTES=10`
+- `AMOCRM_SYNC_INTERVAL_MINUTES=0`
 - `AMOCRM_SYNC_JOB_TIMEOUT_MINUTES=30`
 - `AMOCRM_FULL_SYNC_JOB_TIMEOUT_MINUTES=360`
 
-Это не основной production-режим обновления данных. На production данные должны обновляться через amoCRM webhooks. Polling нужен только как страховка, если webhook не дошел.
+На production регулярный polling отключен. Данные сначала загружаются полным слепком, затем обновляются через amoCRM webhooks. Положительное значение `AMOCRM_SYNC_INTERVAL_MINUTES` использовать только локально или для временной диагностики.
 
 Секреты не коммитить в Git. Реальный `.env` должен лежать только на сервере.
 
@@ -123,9 +123,11 @@ https://analytics.company.ru/api/v1
 
 Webhook URL сервис создаст сам после подключения amoCRM.
 
-Для realtime-обновления ИТ должен обеспечить входящий HTTPS-доступ amoCRM к этому webhook URL. Когда в amoCRM происходит изменение, webhook дергает API, API сразу запускает `WEBHOOK`-синхронизацию и отчеты пересчитываются по свежему слепку.
+Если внешний API URL изменился, администратор должен заново зарегистрировать webhook через `POST /api/v1/amo/webhook/register`; полный импорт для этого не нужен.
 
-`AMOCRM_SYNC_INTERVAL_MINUTES` оставлен только как fallback-проверка, чтобы поймать редкий пропущенный webhook. Для локальной разработки можно ставить `2`, для production рекомендуется `10` или больше.
+Для realtime-обновления ИТ должен обеспечить входящий HTTPS-доступ amoCRM к этому webhook URL. Когда в amoCRM происходит изменение, webhook дергает API, API сохраняет событие в очередь и обрабатывает его после первичного слепка. В штатном режиме после слепка отчеты обновляются по webhook-очереди без регулярного polling.
+
+`AMOCRM_SYNC_INTERVAL_MINUTES=0` - штатный production-режим. Если локально нужен polling без webhook-туннеля, можно временно поставить положительное значение, но это не должно попадать в production.
 
 ## Проверки перед выкладкой
 
