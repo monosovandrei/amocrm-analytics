@@ -27,6 +27,34 @@ describe('AmoService webhook parsing', () => {
     ]);
   });
 
+  it('parses form webhook keys when scalar and nested values share a path', () => {
+    const events = service.flattenWebhook({
+      'contacts[note][0][note][id]': '60864725',
+      'contacts[note][0][note][type]': '3',
+      'contacts[note][0][note][type][message_uuid]': '70f31734-fb5f-4b8e-99a2-5acfe7ca53f43',
+      'contacts[note][0][note][element_id]': '40700289',
+      'account[subdomain]': 'servermallvilnius',
+    });
+
+    expect(events).toEqual([
+      {
+        entity: 'contacts',
+        action: 'note',
+        externalId: null,
+        payload: {
+          note: {
+            id: '60864725',
+            type: {
+              value: '3',
+              message_uuid: '70f31734-fb5f-4b8e-99a2-5acfe7ca53f43',
+            },
+            element_id: '40700289',
+          },
+        },
+      },
+    ]);
+  });
+
   it('parses already nested webhook bodies', () => {
     const events = service.flattenWebhook({
       leads: {

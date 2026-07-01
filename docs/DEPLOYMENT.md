@@ -47,6 +47,7 @@
 
 - `AMOCRM_SYNC_INTERVAL_MINUTES=0`
 - `AMOCRM_SYNC_JOB_TIMEOUT_MINUTES=30`
+- `AMOCRM_WEBHOOK_SYNC_JOB_TIMEOUT_MINUTES=5`
 - `AMOCRM_FULL_SYNC_JOB_TIMEOUT_MINUTES=360`
 
 На production регулярный polling отключен. Данные сначала загружаются полным слепком, затем обновляются через amoCRM webhooks. Положительное значение `AMOCRM_SYNC_INTERVAL_MINUTES` использовать только локально или для временной диагностики.

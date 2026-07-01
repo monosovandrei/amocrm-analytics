@@ -277,7 +277,9 @@ export class AmoService {
         current[part] = value;
         return;
       }
-      current[part] ??= {};
+      if (!current[part] || typeof current[part] !== 'object' || Array.isArray(current[part])) {
+        current[part] = current[part] === undefined ? {} : { value: current[part] };
+      }
       current = current[part];
     });
   }
