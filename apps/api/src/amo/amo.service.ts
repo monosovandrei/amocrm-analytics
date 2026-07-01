@@ -159,7 +159,8 @@ export class AmoService {
 
   flattenWebhook(body: any): AmoWebhookItem[] {
     const events: AmoWebhookItem[] = [];
-    for (const [entity, actions] of Object.entries(body ?? {})) {
+    const normalizedBody = this.normalizeWebhookBody(body);
+    for (const [entity, actions] of Object.entries(normalizedBody ?? {})) {
       if (entity === 'account') continue;
       if (!actions || typeof actions !== 'object') continue;
 
@@ -193,7 +194,8 @@ export class AmoService {
   }
 
   validateWebhookAccount(body: any, connection: AmoConnection) {
-    const payloadSubdomain = body?.account?.[0]?.subdomain ?? body?.account?.subdomain;
+    const normalizedBody = this.normalizeWebhookBody(body);
+    const payloadSubdomain = normalizedBody?.account?.[0]?.subdomain ?? normalizedBody?.account?.subdomain;
     if (!payloadSubdomain) return true;
     return this.normalizeDomain(String(payloadSubdomain)) === this.normalizeDomain(connection.subdomain);
   }
@@ -239,6 +241,45 @@ export class AmoService {
     }
 
     return [raw as Record<string, any>];
+  }
+
+  private normalizeWebhookBody(body: any) {
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
+    const entries = Object.entries(body);
+    if (!entries.some(([key]) => key.includes('['))) return body;
+
+    const result: Record<string, any> = {};
+    for (const [key, value] of entries) {
+      const path = this.parseFormBodyPath(key);
+      if (path.length === 0) {
+        result[key] = value;
+        continue;
+      }
+      this.setWebhookBodyValue(result, path, value);
+    }
+    return result;
+  }
+
+  private parseFormBodyPath(key: string) {
+    const path: string[] = [];
+    const first = key.match(/^[^\[]+/)?.[0];
+    if (first) path.push(first);
+    for (const match of key.matchAll(/\[([^\]]*)\]/g)) {
+      if (match[1]) path.push(match[1]);
+    }
+    return path;
+  }
+
+  private setWebhookBodyValue(target: Record<string, any>, path: string[], value: unknown) {
+    let current: Record<string, any> = target;
+    path.forEach((part, index) => {
+      if (index === path.length - 1) {
+        current[part] = value;
+        return;
+      }
+      current[part] ??= {};
+      current = current[part];
+    });
   }
 
   private webhookExternalId(entity: string, action: string, item: Record<string, any>) {
