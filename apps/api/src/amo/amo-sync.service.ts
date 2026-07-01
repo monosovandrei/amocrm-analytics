@@ -179,30 +179,11 @@ export class AmoSyncService {
   }
 
   async expireStaleJobs(connectionId: string) {
-    const fullCutoff = new Date(Date.now() - this.getStaleSyncJobMs(SyncJobType.FULL));
-    const deltaCutoff = new Date(Date.now() - this.getStaleSyncJobMs(SyncJobType.INCREMENTAL));
     const expired = await this.prisma.syncJob.updateMany({
       where: {
         connectionId,
         status: { in: ['QUEUED', 'RUNNING'] },
-        OR: [
-          {
-            type: SyncJobType.FULL,
-            OR: [
-              { heartbeatAt: { lt: fullCutoff } },
-              { heartbeatAt: null, startedAt: { lt: fullCutoff } },
-              { heartbeatAt: null, startedAt: null, createdAt: { lt: fullCutoff } },
-            ],
-          },
-          {
-            type: { not: SyncJobType.FULL },
-            OR: [
-              { heartbeatAt: { lt: deltaCutoff } },
-              { heartbeatAt: null, startedAt: { lt: deltaCutoff } },
-              { heartbeatAt: null, startedAt: null, createdAt: { lt: deltaCutoff } },
-            ],
-          },
-        ],
+        OR: this.staleSyncJobBranches(),
       },
       data: {
         status: 'ERROR',
@@ -220,6 +201,25 @@ export class AmoSyncService {
     }
 
     return expired.count;
+  }
+
+  private staleSyncJobBranches(): Prisma.SyncJobWhereInput[] {
+    return [
+      this.staleSyncJobBranch(SyncJobType.FULL, new Date(Date.now() - this.getStaleSyncJobMs(SyncJobType.FULL))),
+      this.staleSyncJobBranch(SyncJobType.WEBHOOK, new Date(Date.now() - this.getStaleSyncJobMs(SyncJobType.WEBHOOK))),
+      this.staleSyncJobBranch(SyncJobType.INCREMENTAL, new Date(Date.now() - this.getStaleSyncJobMs(SyncJobType.INCREMENTAL))),
+    ];
+  }
+
+  private staleSyncJobBranch(type: SyncJobType, cutoff: Date): Prisma.SyncJobWhereInput {
+    return {
+      type,
+      OR: [
+        { heartbeatAt: { lt: cutoff } },
+        { heartbeatAt: null, startedAt: { lt: cutoff } },
+        { heartbeatAt: null, startedAt: null, createdAt: { lt: cutoff } },
+      ],
+    };
   }
 
   private getStaleSyncJobMs(type?: SyncJobType) {
@@ -298,8 +298,6 @@ export class AmoSyncService {
 
     await this.expireStaleJobs(connection.id);
 
-    const fullStaleCutoff = new Date(Date.now() - this.getStaleSyncJobMs(SyncJobType.FULL));
-    const deltaStaleCutoff = new Date(Date.now() - this.getStaleSyncJobMs(SyncJobType.INCREMENTAL));
     const [
       pendingWebhooks,
       runningJobs,
@@ -324,24 +322,7 @@ export class AmoSyncService {
         where: {
           connectionId: connection.id,
           status: { in: ['QUEUED', 'RUNNING'] },
-          OR: [
-            {
-              type: SyncJobType.FULL,
-              OR: [
-                { heartbeatAt: { lt: fullStaleCutoff } },
-                { heartbeatAt: null, startedAt: { lt: fullStaleCutoff } },
-                { heartbeatAt: null, startedAt: null, createdAt: { lt: fullStaleCutoff } },
-              ],
-            },
-            {
-              type: { not: SyncJobType.FULL },
-              OR: [
-                { heartbeatAt: { lt: deltaStaleCutoff } },
-                { heartbeatAt: null, startedAt: { lt: deltaStaleCutoff } },
-                { heartbeatAt: null, startedAt: null, createdAt: { lt: deltaStaleCutoff } },
-              ],
-            },
-          ],
+          OR: this.staleSyncJobBranches(),
         },
       }),
       this.prisma.syncJob.findFirst({
