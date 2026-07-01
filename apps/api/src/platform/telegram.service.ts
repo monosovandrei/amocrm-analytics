@@ -115,16 +115,27 @@ export class TelegramService {
       this.updateOffset = Math.max(this.updateOffset, update.update_id + 1);
       const text = update.message?.text?.trim() ?? '';
       const chatId = update.message?.chat?.id == null ? '' : String(update.message.chat.id);
-      if (!chatId || !text.startsWith('/start')) continue;
-      const code = text.split(/\s+/)[1];
+      const isStartCommand = this.isStartCommand(text);
+      const code = this.extractLinkCode(text);
+      if (!chatId || (!isStartCommand && !code)) continue;
       if (!code) {
-        await this.sendChatMessage(chatId, 'Код не найден. В сервисе нажмите "Получить код" и отправьте команду ещё раз.');
+        await this.sendChatMessage(chatId, 'Код не найден. Отправьте полную команду из сервиса или просто 6 цифр кода.');
         continue;
       }
       const linked = await this.linkByCode(code, update);
       processed += linked ? 1 : 0;
     }
     return { processed };
+  }
+
+  private isStartCommand(text: string) {
+    return /^\/start(?:@\w+)?(?:\s|$)/i.test(text);
+  }
+
+  private extractLinkCode(text: string) {
+    const startMatch = text.match(/^\/start(?:@\w+)?(?:\s+(.+))?$/i);
+    if (startMatch) return startMatch[1]?.match(/\b\d{6}\b/)?.[0] ?? '';
+    return text.match(/^\d{6}$/)?.[0] ?? '';
   }
 
   async linkByCode(code: string, update: TelegramUpdate) {
