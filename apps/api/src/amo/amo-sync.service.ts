@@ -381,7 +381,7 @@ export class AmoSyncService {
     const healthy = !hasBlockingError && staleJobs === 0 && pendingWebhooks < 1000 && webhookLagSeconds < 120;
     const message = healthy
       ? syncMode === 'WEBHOOK' && !hasReceivedWebhooks
-        ? 'Webhook подключён, ждём событие amoCRM'
+        ? 'Realtime включён, ждём событие amoCRM'
         : 'Синхронизация работает'
       : staleJobs > 0
         ? 'Есть зависшая синхронизация'
