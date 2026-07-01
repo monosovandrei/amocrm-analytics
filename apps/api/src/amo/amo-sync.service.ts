@@ -800,6 +800,10 @@ export class AmoSyncService {
       if (!contactId || maps.contacts.has(String(contactId))) continue;
       try {
         const contact = await client.get<any>(`/contacts/${contactId}`);
+        if (!contact?.id) {
+          stats.webhookLeadContactsSkipped = (stats.webhookLeadContactsSkipped ?? 0) + 1;
+          continue;
+        }
         const dbContact = await this.upsertContact(contact);
         maps.contacts.set(String(contactId), dbContact.id);
         stats.webhookLeadContacts = (stats.webhookLeadContacts ?? 0) + 1;
@@ -861,7 +865,21 @@ export class AmoSyncService {
     externalId: string,
     stats: Record<string, number>,
   ) {
-    const contact = await client.get<any>(`/contacts/${externalId}`);
+    let contact: any;
+    try {
+      contact = await client.get<any>(`/contacts/${externalId}`);
+    } catch (error: any) {
+      if (this.isAmoNotFoundError(error)) {
+        await this.prisma.contact.deleteMany({ where: { externalId } });
+        stats.webhookContactsDeleted = (stats.webhookContactsDeleted ?? 0) + 1;
+        return;
+      }
+      throw error;
+    }
+    if (!contact?.id) {
+      stats.webhookContactsSkipped = (stats.webhookContactsSkipped ?? 0) + 1;
+      return;
+    }
     const dbContact = await this.upsertContact(contact);
     maps.contacts.set(String(contact.id), dbContact.id);
     stats.webhookContacts = (stats.webhookContacts ?? 0) + 1;
@@ -873,7 +891,21 @@ export class AmoSyncService {
     externalId: string,
     stats: Record<string, number>,
   ) {
-    const company = await client.get<any>(`/companies/${externalId}`);
+    let company: any;
+    try {
+      company = await client.get<any>(`/companies/${externalId}`);
+    } catch (error: any) {
+      if (this.isAmoNotFoundError(error)) {
+        await this.prisma.crmCompany.deleteMany({ where: { externalId } });
+        stats.webhookCompaniesDeleted = (stats.webhookCompaniesDeleted ?? 0) + 1;
+        return;
+      }
+      throw error;
+    }
+    if (!company?.id) {
+      stats.webhookCompaniesSkipped = (stats.webhookCompaniesSkipped ?? 0) + 1;
+      return;
+    }
     const dbCompany = await this.upsertCompany(company);
     maps.companies.set(String(company.id), dbCompany.id);
     stats.webhookCompanies = (stats.webhookCompanies ?? 0) + 1;
@@ -885,10 +917,28 @@ export class AmoSyncService {
     externalId: string,
     stats: Record<string, number>,
   ) {
-    const customer = await client.get<any>(`/customers/${externalId}`);
+    let customer: any;
+    try {
+      customer = await client.get<any>(`/customers/${externalId}`);
+    } catch (error: any) {
+      if (this.isAmoNotFoundError(error)) {
+        await this.prisma.customer.deleteMany({ where: { externalId } });
+        stats.webhookCustomersDeleted = (stats.webhookCustomersDeleted ?? 0) + 1;
+        return;
+      }
+      throw error;
+    }
+    if (!customer?.id) {
+      stats.webhookCustomersSkipped = (stats.webhookCustomersSkipped ?? 0) + 1;
+      return;
+    }
     const dbCustomer = await this.upsertCustomer(client, maps, customer);
     maps.customers.set(String(customer.id), dbCustomer.id);
     stats.webhookCustomers = (stats.webhookCustomers ?? 0) + 1;
+  }
+
+  private isAmoNotFoundError(error: any) {
+    return String(error?.message ?? '').includes('amoCRM API 404');
   }
 
   private async syncOptional(name: string, stats: Record<string, number>, action: () => Promise<void>) {
