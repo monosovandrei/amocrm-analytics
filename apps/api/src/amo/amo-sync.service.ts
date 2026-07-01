@@ -571,6 +571,7 @@ export class AmoSyncService {
       }
 
       if (groups.length > 0) {
+        await this.reconcileLeadSlaDeals(client, maps, stats);
         const eventSyncFrom = Math.floor((earliestEventAt.getTime() - 5 * 60_000) / 1000);
         await this.syncWebhookRelatedNotes(client, groups, stats, eventSyncFrom);
         await this.syncWebhookRelatedEvents(client, maps, groups, stats, eventSyncFrom);
