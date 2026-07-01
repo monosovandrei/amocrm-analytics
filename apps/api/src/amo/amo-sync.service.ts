@@ -277,9 +277,13 @@ export class AmoSyncService {
         runningJobs: 0,
         staleJobs: 0,
         lastSuccessfulSyncAt: null,
+        lastDataUpdateAt: null,
+        lastSnapshotAt: null,
         lastWebhookAt: null,
         lastProcessedWebhookAt: null,
         webhookLagSeconds: 0,
+        syncMode: 'WEBHOOK',
+        hasReceivedWebhooks: false,
         lastError: null,
       };
     }
@@ -366,13 +370,19 @@ export class AmoSyncService {
       }),
     ]);
 
+    const syncMode = this.getConfiguredSyncIntervalMinutes() > 0 ? 'POLLING' : 'WEBHOOK';
+    const hasReceivedWebhooks = Boolean(lastWebhook);
+    const lastSuccessfulSyncAt = lastSuccessJob?.finishedAt ?? connection.lastIncrementalSyncAt ?? connection.lastFullSyncAt;
+    const lastDataUpdateAt = lastProcessedWebhook?.processedAt ?? lastSuccessfulSyncAt;
     const hasBlockingError = connection.status === 'ERROR' && lastJob?.status !== 'RUNNING';
     const webhookLagSeconds = oldestPendingWebhook
       ? Math.max(0, Math.floor((Date.now() - oldestPendingWebhook.receivedAt.getTime()) / 1000))
       : 0;
     const healthy = !hasBlockingError && staleJobs === 0 && pendingWebhooks < 1000 && webhookLagSeconds < 120;
     const message = healthy
-      ? 'Синхронизация работает'
+      ? syncMode === 'WEBHOOK' && !hasReceivedWebhooks
+        ? 'Webhook подключён, ждём событие amoCRM'
+        : 'Синхронизация работает'
       : staleJobs > 0
         ? 'Есть зависшая синхронизация'
         : pendingWebhooks >= 1000
@@ -386,13 +396,24 @@ export class AmoSyncService {
       pendingWebhooks,
       runningJobs,
       staleJobs,
-      lastSuccessfulSyncAt: lastSuccessJob?.finishedAt ?? connection.lastIncrementalSyncAt ?? connection.lastFullSyncAt,
+      lastSuccessfulSyncAt,
+      lastDataUpdateAt,
+      lastSnapshotAt: connection.lastFullSyncAt,
       lastWebhookAt: lastWebhook?.receivedAt ?? null,
       lastProcessedWebhookAt: lastProcessedWebhook?.processedAt ?? null,
       webhookLagSeconds,
+      syncMode,
+      hasReceivedWebhooks,
       lastJob,
       lastError: hasBlockingError ? connection.lastError : null,
     };
+  }
+
+  private getConfiguredSyncIntervalMinutes() {
+    const rawInterval = this.config.get<string>('AMOCRM_SYNC_INTERVAL_MINUTES');
+    if (!rawInterval) return 0;
+    const parsed = Number(rawInterval);
+    return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
   }
 
   async run(jobId: string) {

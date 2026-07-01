@@ -646,10 +646,16 @@ export default function HomePage() {
   const ordered = useMemo(() => orderTemplates(templates), [templates]);
   const amoHasConnection = Boolean(connection?.subdomain);
   const amoConnected = amoHasConnection && connection?.status !== 'INACTIVE';
-  const lastAmoSyncAt = syncHealth?.lastSuccessfulSyncAt ?? connection?.lastIncrementalSyncAt ?? connection?.lastFullSyncAt;
+  const lastAmoSyncAt = syncHealth?.lastDataUpdateAt ?? syncHealth?.lastSuccessfulSyncAt ?? connection?.lastIncrementalSyncAt ?? connection?.lastFullSyncAt;
+  const lastAmoSnapshotAt = syncHealth?.lastSnapshotAt ?? connection?.lastFullSyncAt;
+  const amoRealtimeWaitingForFirstWebhook = syncHealth?.syncMode === 'WEBHOOK' && syncHealth?.hasReceivedWebhooks === false;
   const amoConnectionHealthy = amoConnected && syncHealth?.healthy !== false;
   const amoStatusText = syncHealth?.message ?? (amoConnectionHealthy ? 'Синхронизация работает' : 'Синхронизация не работает');
-  const amoSyncUpdatedText = lastAmoSyncAt ? `Обновлено: ${formatMoscowDateTime(lastAmoSyncAt)} МСК` : 'Данные ещё не обновлялись';
+  const amoSyncUpdatedText = amoRealtimeWaitingForFirstWebhook && lastAmoSnapshotAt
+    ? `Слепок: ${formatMoscowDateTime(lastAmoSnapshotAt)} МСК`
+    : lastAmoSyncAt
+      ? `Обновлено: ${formatMoscowDateTime(lastAmoSyncAt)} МСК`
+      : 'Данные ещё не обновлялись';
 
   useEffect(() => {
     if (!user) return;
@@ -673,7 +679,13 @@ export default function HomePage() {
 
         setConnection(nextConnection);
         setSyncHealth(nextSyncHealth);
-        const nextSyncAt = String(nextConnection.lastIncrementalSyncAt ?? nextConnection.lastFullSyncAt ?? '');
+        const nextSyncAt = String(
+          nextSyncHealth?.lastDataUpdateAt ??
+          nextSyncHealth?.lastSuccessfulSyncAt ??
+          nextConnection.lastIncrementalSyncAt ??
+          nextConnection.lastFullSyncAt ??
+          '',
+        );
         if (nextSyncAt && lastAmoSyncSeenRef.current && nextSyncAt !== lastAmoSyncSeenRef.current) {
           lastAmoSyncSeenRef.current = nextSyncAt;
           setRefreshStamp((value) => value + 1);
