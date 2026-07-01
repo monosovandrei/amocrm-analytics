@@ -965,7 +965,7 @@ function LoginScreen({ onLogin }: { onLogin: (user: User) => void }) {
           </div>
         </div>
         <label>
-          <span className="label">Email</span>
+          <span className="label">Логин</span>
           <input className="field" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="username" />
         </label>
         <label>
