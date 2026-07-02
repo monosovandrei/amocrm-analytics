@@ -1872,7 +1872,7 @@ ${sheets}
             {
               id: duration.id,
               label: duration.label,
-              avgDays: values.length ? Number((values.reduce((sum, value) => sum + value, 0) / values.length).toFixed(2)) : null,
+              avgDays: values.length ? this.roundDurationDays(values.reduce((sum, value) => sum + value, 0) / values.length) : null,
               sampleSize: values.length,
               samples: (byGroupSamples.get(groupId) ?? []).sort((a, b) => b.durationDays - a.durationDays),
             },
@@ -3577,6 +3577,10 @@ ${sheets}
   private averageDays(values: number[]) {
     if (!values.length) return null;
     return Number((values.reduce((sum, value) => sum + value, 0) / values.length).toFixed(2));
+  }
+
+  private roundDurationDays(value: number) {
+    return Number(value.toFixed(6));
   }
 
   private parseFilterDate(value: string, endOfDay: boolean) {

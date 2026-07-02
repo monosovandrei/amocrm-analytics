@@ -124,6 +124,57 @@ const deals = [
     updatedAt: new Date('2026-03-02T10:00:00.000Z'),
     deletedAt: null,
   },
+  {
+    id: 'deal-7',
+    title: 'Быстро взяли 1',
+    amount: 1000,
+    pipelineId: 'pipe-sales',
+    stageId: stages.kp.id,
+    responsibleId: managers.first.id,
+    responsible: managers.first,
+    pipeline: { id: 'pipe-sales', name: 'Продажи' },
+    stage: stages.kp,
+    lossReasonId: null,
+    lossReason: null,
+    customFields: {},
+    createdAt: new Date('2026-04-01T09:55:00.000Z'),
+    updatedAt: new Date('2026-04-01T10:01:00.000Z'),
+    deletedAt: null,
+  },
+  {
+    id: 'deal-8',
+    title: 'Быстро взяли 2',
+    amount: 1000,
+    pipelineId: 'pipe-sales',
+    stageId: stages.kp.id,
+    responsibleId: managers.first.id,
+    responsible: managers.first,
+    pipeline: { id: 'pipe-sales', name: 'Продажи' },
+    stage: stages.kp,
+    lossReasonId: null,
+    lossReason: null,
+    customFields: {},
+    createdAt: new Date('2026-04-01T09:55:00.000Z'),
+    updatedAt: new Date('2026-04-01T10:01:00.000Z'),
+    deletedAt: null,
+  },
+  {
+    id: 'deal-9',
+    title: 'Долго брали',
+    amount: 1000,
+    pipelineId: 'pipe-sales',
+    stageId: stages.kp.id,
+    responsibleId: managers.first.id,
+    responsible: managers.first,
+    pipeline: { id: 'pipe-sales', name: 'Продажи' },
+    stage: stages.kp,
+    lossReasonId: null,
+    lossReason: null,
+    customFields: {},
+    createdAt: new Date('2026-04-01T09:55:00.000Z'),
+    updatedAt: new Date('2026-04-01T10:18:00.000Z'),
+    deletedAt: null,
+  },
 ];
 
 const history = [
@@ -143,6 +194,12 @@ const history = [
   { id: 'h13', dealId: 'deal-5', fromStageId: stages.kp.id, toStageId: stages.lost.id, movedAt: new Date('2026-03-05T10:00:00.000Z') },
   { id: 'h14', dealId: 'deal-6', fromStageId: stages.lead.id, toStageId: stages.qualified.id, movedAt: new Date('2026-02-28T10:00:00.000Z') },
   { id: 'h15', dealId: 'deal-6', fromStageId: stages.qualified.id, toStageId: stages.kp.id, movedAt: new Date('2026-03-02T10:00:00.000Z') },
+  { id: 'h16', dealId: 'deal-7', fromStageId: stages.lead.id, toStageId: stages.qualified.id, movedAt: new Date('2026-04-01T10:00:00.000Z') },
+  { id: 'h17', dealId: 'deal-7', fromStageId: stages.qualified.id, toStageId: stages.kp.id, movedAt: new Date('2026-04-01T10:01:00.000Z') },
+  { id: 'h18', dealId: 'deal-8', fromStageId: stages.lead.id, toStageId: stages.qualified.id, movedAt: new Date('2026-04-01T10:00:00.000Z') },
+  { id: 'h19', dealId: 'deal-8', fromStageId: stages.qualified.id, toStageId: stages.kp.id, movedAt: new Date('2026-04-01T10:01:00.000Z') },
+  { id: 'h20', dealId: 'deal-9', fromStageId: stages.lead.id, toStageId: stages.qualified.id, movedAt: new Date('2026-04-01T10:00:00.000Z') },
+  { id: 'h21', dealId: 'deal-9', fromStageId: stages.qualified.id, toStageId: stages.kp.id, movedAt: new Date('2026-04-01T10:18:00.000Z') },
 ];
 
 const responsibleHistory = [
@@ -162,6 +219,27 @@ const tasks = [
     responsibleId: managers.second.id,
     createdAt: new Date('2026-03-03T09:00:00.000Z'),
     raw: { created_at: Date.parse('2026-03-02T22:00:00.000Z') / 1000 },
+  },
+  {
+    id: 'task-2',
+    dealId: 'deal-7',
+    responsibleId: managers.first.id,
+    createdAt: new Date('2026-04-01T09:59:00.000Z'),
+    raw: {},
+  },
+  {
+    id: 'task-3',
+    dealId: 'deal-8',
+    responsibleId: managers.first.id,
+    createdAt: new Date('2026-04-01T09:59:00.000Z'),
+    raw: {},
+  },
+  {
+    id: 'task-4',
+    dealId: 'deal-9',
+    responsibleId: managers.first.id,
+    createdAt: new Date('2026-04-01T09:59:00.000Z'),
+    raw: {},
   },
 ];
 
@@ -254,7 +332,8 @@ describe('ReportsService data contract', () => {
     expect(row.metrics.invoiceAmount).toMatchObject({ value: 500, unit: 'money', dealCount: 1 });
     expect(row.metrics.avgMargin).toMatchObject({ value: 600, unit: 'money', dealCount: 3 });
     expect(row.metrics.conversion).toMatchObject({ value: 66.67, unit: 'percent', dealCount: 2 });
-    expect(row.durations.kpDuration).toMatchObject({ avgDays: 0.77, sampleSize: 2 });
+    expect(row.durations.kpDuration).toMatchObject({ sampleSize: 2 });
+    expect(row.durations.kpDuration.avgDays).toBeCloseTo(0.770833, 6);
   });
 
   it('counts received leads by creation date and current Marketing = accepted field', async () => {
@@ -502,7 +581,6 @@ describe('ReportsService data contract', () => {
     const emptyRow = (result as any).rows.find((item: any) => item.groupId === managers.first.id);
 
     expect(row.durations.assigned_stage_speed).toMatchObject({
-      avgDays: 0.13,
       sampleSize: 1,
       samples: [
         {
@@ -512,7 +590,46 @@ describe('ReportsService data contract', () => {
         },
       ],
     });
+    expect(row.durations.assigned_stage_speed.avgDays).toBeCloseTo(0.125, 6);
     expect(emptyRow.durations.assigned_stage_speed).toMatchObject({ avgDays: null, sampleSize: 0 });
+  });
+
+  it('keeps minute-level precision for assigned-stage speed averages', async () => {
+    const result = await service.compute(
+      {
+        sourceType: 'EVENT' as any,
+        filters: {
+          dateFrom: '2026-04-01T00:00:00.000Z',
+          dateTo: '2026-04-30T23:59:59.999Z',
+          pipelineIds: ['pipe-sales'],
+          groupIds: ['group-1'],
+        },
+        config: {
+          metric: 'contract',
+          contract: {
+            groupBy: 'manager',
+            metrics: [],
+            durations: [
+              {
+                id: 'assigned_stage_speed',
+                label: 'Среднее время до взятия',
+                stageId: stages.qualified.id,
+                onlyExited: true,
+                startMode: 'sales_responsible_task',
+              },
+            ],
+          },
+        },
+      } as any,
+      { id: 'user-1', role: 'ADMIN' as any },
+    );
+
+    const row = (result as any).rows.find((item: any) => item.groupId === managers.first.id);
+    const value = row.durations.assigned_stage_speed;
+
+    expect(value.sampleSize).toBe(3);
+    expect(value.avgDays).toBeCloseTo(20 / 3 / 60 / 24, 6);
+    expect(value.samples.map((sample: any) => Math.round(sample.durationDays * 24 * 60))).toEqual([18, 1, 1]);
   });
 });
 
