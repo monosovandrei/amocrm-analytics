@@ -347,12 +347,19 @@ export function getMetric(template: Pick<ReportTemplate, 'name' | 'config'>, res
       : null;
     const firstDuration = (result.durations ?? [])[0] as { id: string; label: string } | undefined;
     if (!headlineMetric && firstDuration) {
-      const values = ((result.rows ?? []) as Array<Record<string, any>>)
-        .map((row) => Number((row.durations as Record<string, any> | undefined)?.[firstDuration.id]?.avgDays))
-        .filter((value) => Number.isFinite(value));
-      const avg = values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : null;
+      const rows = ((result.rows ?? []) as Array<Record<string, any>>)
+        .map((row) => (row.durations as Record<string, any> | undefined)?.[firstDuration.id])
+        .map((value) => ({
+          avgDays: Number(value?.avgDays),
+          sampleSize: Number(value?.sampleSize ?? 0),
+        }))
+        .filter((value) => Number.isFinite(value.avgDays) && value.sampleSize > 0);
+      const sampleSize = rows.reduce((sum, value) => sum + value.sampleSize, 0);
+      const avg = sampleSize
+        ? rows.reduce((sum, value) => sum + value.avgDays * value.sampleSize, 0) / sampleSize
+        : null;
       return {
-        value: avg == null ? 'нет данных' : formatDurationFromDays(Number(avg.toFixed(2))),
+        value: avg == null ? 'нет данных' : formatDurationFromDays(avg),
         caption: firstDuration.label,
       };
     }
