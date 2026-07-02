@@ -502,10 +502,15 @@ describe('ReportsService data contract', () => {
     expect(result).toMatchObject({ type: 'dealCycle' });
     expect(qualified).toMatchObject({ avgDays: 1, sampleSize: 1 });
     expect(kp).toMatchObject({ avgDays: 2, sampleSize: 1 });
-    expect(qualifiedFromPreviousPeriodDeal).toMatchObject({ avgDays: 0.54, sampleSize: 1 });
+    expect(qualifiedFromPreviousPeriodDeal.sampleSize).toBe(1);
+    expect(qualifiedFromPreviousPeriodDeal.avgDays).toBeCloseTo(13 / 24, 6);
     expect(previousPeriodCreatedRow.totalDeals).toBe(1);
-    expect(row.lostCycle).toMatchObject({ avgDays: 3.54, sampleSize: 1 });
-    expect((result as any).summary.lostCycle).toMatchObject({ avgDays: 3.54, sampleSize: 1 });
+    expect(row.lostCycle.sampleSize).toBe(1);
+    expect(row.lostCycle.avgDays).toBeCloseTo(85 / 24, 6);
+    expect((result as any).summary.lostCycle.sampleSize).toBe(1);
+    expect((result as any).summary.lostCycle.avgDays).toBeCloseTo(85 / 24, 6);
+    expect((result as any).summary.stageAverage.sampleSize).toBe(3);
+    expect((result as any).summary.stageAverage.avgDays).toBeCloseTo((13 / 24 + 1 + 2) / 3, 6);
   });
 
   it('segments deals sent to lost by loss reason and sales manager', async () => {

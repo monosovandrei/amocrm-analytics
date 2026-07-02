@@ -2233,6 +2233,10 @@ ${sheets}
       avgDays: this.averageDays(values),
       sampleSize: values.length,
     });
+    const buildStageAverage = (groupId: string) => {
+      const values = [...(stageValues.get(groupId)?.values() ?? [])].flat();
+      return buildCycle(values);
+    };
     const buildStageItems = (groupId: string) =>
       timelineStages.map((stage) => {
         const values = stageValues.get(groupId)?.get(stage.id) ?? [];
@@ -2252,6 +2256,7 @@ ${sheets}
       managerName: group.name,
       totalDeals: dealCounts.get(group.id)?.size ?? 0,
       stages: buildStageItems(group.id),
+      stageAverage: buildStageAverage(group.id),
       successCycle: buildCycle(successValues.get(group.id)),
       lostCycle: buildCycle(lostValues.get(group.id)),
     }));
@@ -2260,6 +2265,7 @@ ${sheets}
       managerName: 'Итого',
       totalDeals: dealCounts.get(allGroupId)?.size ?? 0,
       stages: buildStageItems(allGroupId),
+      stageAverage: buildStageAverage(allGroupId),
       successCycle: buildCycle(successValues.get(allGroupId)),
       lostCycle: buildCycle(lostValues.get(allGroupId)),
     };
@@ -3576,7 +3582,7 @@ ${sheets}
 
   private averageDays(values: number[]) {
     if (!values.length) return null;
-    return Number((values.reduce((sum, value) => sum + value, 0) / values.length).toFixed(2));
+    return this.roundDurationDays(values.reduce((sum, value) => sum + value, 0) / values.length);
   }
 
   private roundDurationDays(value: number) {

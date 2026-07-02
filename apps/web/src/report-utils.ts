@@ -373,28 +373,34 @@ export function getMetric(template: Pick<ReportTemplate, 'name' | 'config'>, res
     const summary = result.summary ?? {};
     const stageValues = ((summary.stages ?? []) as Array<{ avgDays?: number | null; sampleSize?: number }>)
       .filter((stage) => stage.avgDays !== null && stage.avgDays !== undefined && Number(stage.sampleSize ?? 0) > 0);
-    const weightedStageAvg = stageValues.length
+    const weightedStageSampleSize = stageValues.reduce((sum, stage) => sum + Number(stage.sampleSize ?? 0), 0);
+    const weightedStageAvg = weightedStageSampleSize > 0
       ? stageValues.reduce((sum, stage) => sum + Number(stage.avgDays) * Number(stage.sampleSize ?? 0), 0) /
-        stageValues.reduce((sum, stage) => sum + Number(stage.sampleSize ?? 0), 0)
+        weightedStageSampleSize
       : null;
     if (result.type === 'dealStageAge') {
+      const average = summary.overallAverage?.avgDays ?? weightedStageAvg;
       return {
-        value: weightedStageAvg == null ? 'нет данных' : formatDurationFromDays(weightedStageAvg),
+        value: average == null ? 'нет данных' : formatDurationFromDays(average),
         caption: `Среднее нахождение в текущем этапе. Сделок в работе: ${formatNumber(summary.totalDeals ?? 0)}`,
       };
     }
+    const stageAverage = summary.stageAverage?.avgDays ?? weightedStageAvg;
+    const stageAverageSampleSize = Number(summary.stageAverage?.sampleSize ?? weightedStageSampleSize);
     const successAvg = summary.successCycle?.avgDays;
     const lostAvg = summary.lostCycle?.avgDays;
-    const avg = successAvg ?? lostAvg ?? weightedStageAvg;
+    const avg = stageAverage ?? successAvg ?? lostAvg;
     const caption =
-      successAvg != null
+      stageAverage != null
+        ? `Среднее время прохождения этапа. Переходов в расчёте: ${formatNumber(stageAverageSampleSize)}`
+        : successAvg != null
         ? 'Средний цикл до успеха'
         : lostAvg != null
           ? 'Средний цикл до отказа'
           : 'Среднее время прохождения этапа';
     return {
       value: avg == null ? 'нет данных' : formatDurationFromDays(avg),
-      caption: `${caption}. Сделок в срезе: ${formatNumber(summary.totalDeals ?? 0)}`,
+      caption: stageAverage != null ? caption : `${caption}. Сделок в срезе: ${formatNumber(summary.totalDeals ?? 0)}`,
     };
   }
 

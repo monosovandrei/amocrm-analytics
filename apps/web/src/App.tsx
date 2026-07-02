@@ -5531,6 +5531,7 @@ type DealCycleRow = {
   managerName: string;
   totalDeals: number;
   stages: DealCycleStage[];
+  stageAverage?: { avgDays: number | null; sampleSize: number };
   overallAverage?: { avgDays: number | null; sampleSize: number };
   successCycle?: { avgDays: number | null; sampleSize: number };
   lostCycle?: { avgDays: number | null; sampleSize: number };
