@@ -40,6 +40,17 @@ type TelegramTemplateRecipient = {
   id: string;
 };
 
+const PAYMENT_NOTIFICATION_ROUTES = [
+  {
+    pipelineNames: ['\u0412\u043e\u0440\u043e\u043d\u043a\u0430 \u041f\u0440\u043e\u0434\u0430\u0436\u0438'],
+    recipientCrmExternalIds: ['13930346'],
+  },
+  {
+    pipelineNames: ['\u0411\u0430\u0437\u0430', '\u0417\u0430\u043a\u0440\u0435\u043f\u043b\u0435\u043d\u043d\u044b\u0435 \u041a\u043e\u043c\u043f\u0430\u043d\u0438\u0438'],
+    recipientCrmExternalIds: ['7462243'],
+  },
+] as const;
+
 @Injectable()
 export class CrmEventNotificationsService {
   private readonly logger = new Logger(CrmEventNotificationsService.name);
@@ -227,6 +238,9 @@ export class CrmEventNotificationsService {
     });
 
     const eventKey = `amo:payment:${event.externalId}:${deal.responsibleId}`;
+    const routeDeliveries = await this.sendPaymentNotificationByPipeline(stage, message, payload, eventKey);
+    if (routeDeliveries) return routeDeliveries.some((delivery) => delivery?.status === 'SENT');
+
     const configuredDeliveries = await this.sendConfiguredNotification('amo_payment_received', message, payload, eventKey);
     if (configuredDeliveries) return configuredDeliveries.some((delivery) => delivery?.status === 'SENT');
 
@@ -235,6 +249,56 @@ export class CrmEventNotificationsService {
 
     const delivery = await this.telegram.sendDirectMessageToCrmUser(deal.responsibleId, message, payload, undefined, eventKey);
     return delivery.status === 'SENT';
+  }
+
+  private async sendPaymentNotificationByPipeline(
+    stage: StageWithPipeline,
+    message: string,
+    payload: Record<string, unknown>,
+    eventKey: string,
+  ) {
+    const route = PAYMENT_NOTIFICATION_ROUTES.find((item) => {
+      const pipelineName = this.normalizeText(stage.pipeline.name);
+      return item.pipelineNames.some((name) => this.normalizeText(name) === pipelineName);
+    });
+    if (!route) return null;
+
+    const recipients = await this.prisma.crmUser.findMany({
+      where: {
+        externalId: { in: [...route.recipientCrmExternalIds] },
+        isActive: true,
+        isVisible: true,
+        telegramAccount: { is: { isActive: true } },
+      },
+      select: { id: true },
+    });
+
+    if (!recipients.length) {
+      return [
+        await this.recordSkipped(
+          `${eventKey}:payment-route`,
+          message,
+          {
+            ...payload,
+            paymentRoute: 'pipeline',
+            paymentPipeline: stage.pipeline.name,
+            reason: '\u041f\u043e\u043b\u0443\u0447\u0430\u0442\u0435\u043b\u044c Telegram \u0434\u043b\u044f \u0432\u043e\u0440\u043e\u043d\u043a\u0438 \u043d\u0435 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0451\u043d',
+          },
+        ),
+      ];
+    }
+
+    return this.telegram.sendDirectMessageToCrmUsers(
+      recipients.map((recipient) => recipient.id),
+      message,
+      {
+        ...payload,
+        paymentRoute: 'pipeline',
+        paymentPipeline: stage.pipeline.name,
+      },
+      undefined,
+      `${eventKey}:payment-route`,
+    );
   }
 
   private async notifyLossWithoutReason(event: any, stage: StageWithPipeline, leaders: AppUser[], domain: string) {
