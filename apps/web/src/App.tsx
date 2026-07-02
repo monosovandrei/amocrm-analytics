@@ -644,6 +644,8 @@ export default function HomePage() {
   }, [loadData]);
 
   const ordered = useMemo(() => orderTemplates(templates), [templates]);
+  const canAccessTelegram = user?.businessRole === 'OWNER';
+  const visibleNavItems = canAccessTelegram ? navItems : navItems.filter((item) => item.id !== 'platform');
   const amoHasConnection = Boolean(connection?.subdomain);
   const amoConnected = amoHasConnection && connection?.status !== 'INACTIVE';
   const lastAmoSyncAt = syncHealth?.lastDataUpdateAt ?? syncHealth?.lastSuccessfulSyncAt ?? connection?.lastIncrementalSyncAt ?? connection?.lastFullSyncAt;
@@ -655,6 +657,12 @@ export default function HomePage() {
     : lastAmoSyncAt
       ? `Обновлено: ${formatMoscowDateTime(lastAmoSyncAt)} МСК`
       : 'Данные ещё не обновлялись';
+
+  useEffect(() => {
+    if (tab === 'platform' && !canAccessTelegram) {
+      setTab('workspace');
+    }
+  }, [canAccessTelegram, tab]);
 
   useEffect(() => {
     if (!user) return;
@@ -841,7 +849,7 @@ export default function HomePage() {
             </div>
 
             <nav className="topbar-nav" aria-label="Основное меню">
-              {navItems.map((item) => (
+              {visibleNavItems.map((item) => (
                 <button
                   key={item.id}
                   className={`topbar-nav-item ${tab === item.id ? 'active' : ''}`}
@@ -919,7 +927,7 @@ export default function HomePage() {
               <EmailThreadsTab onMessage={setMessage} />
             )}
 
-            {tab === 'platform' && (
+            {tab === 'platform' && canAccessTelegram && (
               <PlatformTab
                 user={user}
                 onMessage={setMessage}
@@ -4026,13 +4034,13 @@ function PlatformTab({ user, onMessage }: { user: User; onMessage: (message: str
   const [crmTelegramLinks, setCrmTelegramLinks] = useState<CrmTelegramLinksResponse | null>(null);
   const [crmTelegramActionState, setCrmTelegramActionState] = useState<Record<string, 'saving' | 'saved' | 'error'>>({});
   const [loading, setLoading] = useState(true);
-  const isAdmin = user.role === 'ADMIN';
+  const isOwner = user.businessRole === 'OWNER';
 
   const reload = useCallback(async () => {
     setLoading(true);
     const [nextTelegramTemplates, nextUserLinks, nextCrmTelegramLinks] = await Promise.all([
-      isAdmin ? api<TelegramTemplate[]>('/platform/telegram/templates') : Promise.resolve([]),
-      isAdmin ? api<UserLinksResponse>('/platform/admin/user-links') : Promise.resolve(null),
+      isOwner ? api<TelegramTemplate[]>('/platform/telegram/templates') : Promise.resolve([]),
+      isOwner ? api<UserLinksResponse>('/platform/admin/user-links') : Promise.resolve(null),
       api<CrmTelegramLinksResponse>('/platform/telegram/crm-users').catch(() => null),
     ]);
     setTelegramTemplates(nextTelegramTemplates);
@@ -4057,7 +4065,7 @@ function PlatformTab({ user, onMessage }: { user: User; onMessage: (message: str
       ])));
     }
     setLoading(false);
-  }, [isAdmin]);
+  }, [isOwner]);
 
   useEffect(() => {
     void reload().catch((error) => {
@@ -4146,7 +4154,7 @@ function PlatformTab({ user, onMessage }: { user: User; onMessage: (message: str
         </button>
       </div>
 
-      {isAdmin && (
+      {isOwner && (
         <>
           <UserLinksPanel
             userLinks={userLinks}
@@ -4166,7 +4174,7 @@ function PlatformTab({ user, onMessage }: { user: User; onMessage: (message: str
         onDisconnect={disconnectCrmTelegram}
       />
 
-      {isAdmin && (
+      {isOwner && (
         <section className="card">
           <div className="card-header">
             <div className="card-title">Telegram-уведомления</div>

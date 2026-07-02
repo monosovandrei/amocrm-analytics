@@ -71,8 +71,8 @@ export class PlatformController {
   }
 
   @Get('telegram/templates')
-  telegramTemplates() {
-    return this.platform.listTelegramTemplates();
+  telegramTemplates(@Req() req: AuthRequest) {
+    return this.platform.listTelegramTemplates(req.user);
   }
 
   @Patch('telegram/templates/:eventType')

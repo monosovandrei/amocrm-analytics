@@ -150,7 +150,7 @@ export class PlatformService {
   }
 
   async listUserLinks(actor: AuthUser) {
-    this.ensureAdmin(actor);
+    this.ensureTelegramOwner(actor);
     const [users, crmUsers] = await Promise.all([
       this.prisma.user.findMany({
         where: { isActive: true },
@@ -201,7 +201,7 @@ export class PlatformService {
   }
 
   async updateUserLink(actor: AuthUser, userId: string, body: Record<string, any>) {
-    this.ensureAdmin(actor);
+    this.ensureTelegramOwner(actor);
     const data: Prisma.UserUpdateInput = {};
     if (body.businessRole !== undefined) {
       data.businessRole = this.parseBusinessRole(body.businessRole);
@@ -458,14 +458,15 @@ export class PlatformService {
     return { ok: true };
   }
 
-  async listTelegramTemplates() {
+  async listTelegramTemplates(actor: AuthUser) {
+    this.ensureTelegramOwner(actor);
     await this.ensureTelegramTemplates();
     const templates = await this.prisma.notificationTemplate.findMany({ orderBy: { name: 'asc' } });
     return templates.map((template) => this.serializeTelegramTemplate(template));
   }
 
   async updateTelegramTemplate(actor: AuthUser, eventType: string, body: Record<string, any>) {
-    this.ensureAdmin(actor);
+    this.ensureTelegramOwner(actor);
     const defaults = this.defaultTelegramTemplates().find((template) => template.eventType === eventType);
     if (!defaults) throw new NotFoundException('Шаблон не найден');
     const text = String(body.body ?? '').trim();
@@ -2351,18 +2352,16 @@ export class PlatformService {
     }
   }
 
+  private ensureTelegramOwner(user: AuthUser) {
+    if (user.businessRole !== 'OWNER') {
+      throw new ForbiddenException('Нет доступа');
+    }
+  }
+
   private async crmTelegramAccessWhere(actor: AuthUser): Promise<Prisma.CrmUserWhereInput> {
     const base: Prisma.CrmUserWhereInput = { isActive: true, isVisible: true };
-    if (actor.role === 'ADMIN') return base;
-    if (actor.businessRole !== 'ROP') throw new ForbiddenException('Нет доступа');
-
-    const actorUser = await this.prisma.user.findUnique({
-      where: { id: actor.id },
-      select: { crmUser: { select: { groupId: true } } },
-    });
-    const groupId = actorUser?.crmUser?.groupId;
-    if (!groupId) throw new ForbiddenException('Сначала админ должен связать ваш аккаунт с пользователем amoCRM');
-    return { ...base, groupId };
+    this.ensureTelegramOwner(actor);
+    return base;
   }
 
   private async ensureCrmTelegramAccess(actor: AuthUser, crmUserId: string) {
