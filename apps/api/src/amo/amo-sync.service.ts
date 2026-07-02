@@ -256,22 +256,34 @@ export class AmoSyncService {
     return this.prisma.syncJob.findUnique({ where: { id } });
   }
 
-  async registerWebhook(actorUserId?: string) {
+  async ensureWebhookRegistered() {
     const connection = await this.amo.getActiveConnectionOrFail();
     const client = await this.amo.getClient(connection);
     const stats: Record<string, number> = {};
-    await this.ensureWebhookSubscription(client, connection, stats);
+    try {
+      await this.ensureWebhookSubscription(client, connection, stats);
+    } catch (error: any) {
+      await this.recordWebhookSubscriptionError(connection, error);
+      throw error;
+    }
+
+    const updatedConnection = await this.amo.getConnection();
+    return { status: stats.webhookSubscription ? 'ok' : 'skipped', stats, webhookUrl: updatedConnection?.webhookUrl ?? null };
+  }
+
+  async registerWebhook(actorUserId?: string) {
+    const result = await this.ensureWebhookRegistered();
+    const connection = await this.amo.getActiveConnectionOrFail();
 
     await this.audit.record({
       userId: actorUserId,
       action: 'amo.webhook.register',
       entity: 'AmoConnection',
       entityId: connection.id,
-      metadata: { connectionId: connection.id, stats },
+      metadata: { connectionId: connection.id, stats: result.stats },
     });
 
-    const updatedConnection = await this.amo.getConnection();
-    return { status: stats.webhookSubscription ? 'ok' : 'skipped', stats, webhookUrl: updatedConnection?.webhookUrl ?? null };
+    return result;
   }
 
   async getHealth() {
@@ -290,6 +302,11 @@ export class AmoSyncService {
         lastWebhookAt: null,
         lastProcessedWebhookAt: null,
         webhookLagSeconds: 0,
+        webhookSubscriptionEnsuredAt: null,
+        webhookSubscriptionLagSeconds: null,
+        webhookSubscriptionStale: true,
+        webhookSubscriptionError: null,
+        webhookSubscriptionErrorAt: null,
         syncMode: 'WEBHOOK',
         hasReceivedWebhooks: false,
         lastError: null,
@@ -363,11 +380,29 @@ export class AmoSyncService {
     const hasReceivedWebhooks = Boolean(lastWebhook);
     const lastSuccessfulSyncAt = lastSuccessJob?.finishedAt ?? connection.lastIncrementalSyncAt ?? connection.lastFullSyncAt;
     const lastDataUpdateAt = lastProcessedWebhook?.processedAt ?? lastSuccessfulSyncAt;
+    const connectionConfig = this.connectionConfig(connection);
+    const webhookSubscriptionEnsuredAt = this.parseConfigDate(connectionConfig.webhookEnsuredAt);
+    const webhookSubscriptionErrorAt = this.parseConfigDate(connectionConfig.webhookEnsureErrorAt);
+    const webhookSubscriptionError =
+      typeof connectionConfig.webhookEnsureError === 'string' ? connectionConfig.webhookEnsureError : null;
+    const webhookSubscriptionLagSeconds = webhookSubscriptionEnsuredAt
+      ? Math.max(0, Math.floor((Date.now() - webhookSubscriptionEnsuredAt.getTime()) / 1000))
+      : null;
+    const webhookSubscriptionStale =
+      syncMode === 'WEBHOOK' &&
+      (!webhookSubscriptionEnsuredAt || webhookSubscriptionLagSeconds === null || webhookSubscriptionLagSeconds > 30 * 60);
+    const hasWebhookSubscriptionProblem =
+      syncMode === 'WEBHOOK' && (webhookSubscriptionStale || Boolean(webhookSubscriptionError));
     const hasBlockingError = connection.status === 'ERROR' && lastJob?.status !== 'RUNNING';
     const webhookLagSeconds = oldestPendingWebhook
       ? Math.max(0, Math.floor((Date.now() - oldestPendingWebhook.receivedAt.getTime()) / 1000))
       : 0;
-    const healthy = !hasBlockingError && staleJobs === 0 && pendingWebhooks < 1000 && webhookLagSeconds < 120;
+    const healthy =
+      !hasBlockingError &&
+      staleJobs === 0 &&
+      pendingWebhooks < 1000 &&
+      webhookLagSeconds < 120 &&
+      !hasWebhookSubscriptionProblem;
     const message = healthy
       ? syncMode === 'WEBHOOK' && !hasReceivedWebhooks
         ? 'Realtime включён, ждём событие amoCRM'
@@ -376,7 +411,9 @@ export class AmoSyncService {
         ? 'Есть зависшая синхронизация'
         : pendingWebhooks >= 1000
           ? 'Копится очередь webhook'
-          : 'Есть ошибка синхронизации';
+          : hasWebhookSubscriptionProblem
+            ? 'Webhook amoCRM не подтверждён'
+            : 'Есть ошибка синхронизации';
 
     return {
       healthy,
@@ -391,6 +428,11 @@ export class AmoSyncService {
       lastWebhookAt: lastWebhook?.receivedAt ?? null,
       lastProcessedWebhookAt: lastProcessedWebhook?.processedAt ?? null,
       webhookLagSeconds,
+      webhookSubscriptionEnsuredAt,
+      webhookSubscriptionLagSeconds,
+      webhookSubscriptionStale,
+      webhookSubscriptionError,
+      webhookSubscriptionErrorAt,
       syncMode,
       hasReceivedWebhooks,
       lastJob,
@@ -403,6 +445,17 @@ export class AmoSyncService {
     if (!rawInterval) return 0;
     const parsed = Number(rawInterval);
     return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
+  }
+
+  private connectionConfig(connection: AmoConnection) {
+    const config = connection.config;
+    return config && typeof config === 'object' && !Array.isArray(config) ? (config as Record<string, unknown>) : {};
+  }
+
+  private parseConfigDate(raw: unknown) {
+    if (typeof raw !== 'string') return null;
+    const date = new Date(raw);
+    return Number.isNaN(date.getTime()) ? null : date;
   }
 
   async run(jobId: string) {
@@ -951,6 +1004,19 @@ export class AmoSyncService {
     }
   }
 
+  private async recordWebhookSubscriptionError(connection: AmoConnection, error: any) {
+    await this.prisma.amoConnection.update({
+      where: { id: connection.id },
+      data: {
+        config: {
+          ...this.connectionConfig(connection),
+          webhookEnsureError: String(error?.message ?? error),
+          webhookEnsureErrorAt: new Date().toISOString(),
+        },
+      },
+    });
+  }
+
   private async ensureWebhookSubscription(client: AmoClient, connection: AmoConnection, stats: Record<string, number>) {
     const destination = this.webhookDestination(connection);
     if (!destination) {
@@ -969,10 +1035,12 @@ export class AmoSyncService {
       where: { id: connection.id },
       data: {
         config: {
-          ...((connection.config as Record<string, unknown>) ?? {}),
+          ...this.connectionConfig(connection),
           webhookUrl: destination,
           webhookSettings: settings,
           webhookEnsuredAt: new Date().toISOString(),
+          webhookEnsureError: null,
+          webhookEnsureErrorAt: null,
         },
       },
     });
