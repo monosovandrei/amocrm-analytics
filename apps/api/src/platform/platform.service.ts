@@ -2490,9 +2490,10 @@ export class PlatformService {
     else if (recipients.length) deliveryMode = 'selected';
     if (!this.telegramDeliveryModeAllowed(eventType, deliveryMode)) deliveryMode = 'system';
     const allowedDeliveryModes = TELEGRAM_DELIVERY_MODES.filter((mode) => this.telegramDeliveryModeAllowed(eventType, mode));
+    const visibleRecipients = deliveryMode === 'selected' ? recipients : [];
     return {
       ...template,
-      recipients,
+      recipients: visibleRecipients,
       deliveryMode,
       allowedDeliveryModes,
       recipientsMode: deliveryMode === 'system' ? 'default' : 'custom',
