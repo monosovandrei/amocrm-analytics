@@ -2567,11 +2567,22 @@ ${sheets}
     const samples = activeStages.flatMap((stage) => stage.samples ?? []);
     return {
       avgDays: activeStages.length
-        ? this.roundDurationDays(activeStages.reduce((sum, stage) => sum + Number(stage.avgDays), 0))
+        ? this.roundDurationDays(
+            activeStages.reduce((sum, stage) => sum + this.displayDurationDays(Number(stage.avgDays)), 0),
+          )
         : null,
       sampleSize: activeStages.reduce((sum, stage) => sum + stage.sampleSize, 0),
       samples,
     };
+  }
+
+  private displayDurationDays(value: number) {
+    const totalMinutes = Math.round(value * 24 * 60);
+    if (totalMinutes < 60) return Math.max(totalMinutes, 1) / 24 / 60;
+
+    const hours = Math.floor(totalMinutes / 60);
+    if (hours < 24) return totalMinutes / 24 / 60;
+    return hours / 24;
   }
 
   private async computeCurrentSnapshot(filters: ReportFilters, role: UserRole) {

@@ -436,7 +436,14 @@ describe('ReportsService data contract', () => {
 
       const row = (result as any).rows.find((item: any) => item.managerId === managers.first.id);
       const activeStages = row.stages.filter((stage: any) => stage.sampleSize > 0 && stage.avgDays !== null);
-      const stageSum = activeStages.reduce((sum: number, stage: any) => sum + stage.avgDays, 0);
+      const displayDurationDays = (value: number) => {
+        const totalMinutes = Math.round(value * 24 * 60);
+        if (totalMinutes < 60) return Math.max(totalMinutes, 1) / 24 / 60;
+        const hours = Math.floor(totalMinutes / 60);
+        if (hours < 24) return totalMinutes / 24 / 60;
+        return hours / 24;
+      };
+      const stageSum = activeStages.reduce((sum: number, stage: any) => sum + displayDurationDays(stage.avgDays), 0);
       const stageSamples = activeStages.reduce((sum: number, stage: any) => sum + stage.sampleSize, 0);
       const weightedAverage = activeStages.reduce(
         (sum: number, stage: any) => sum + stage.avgDays * stage.sampleSize,
@@ -451,7 +458,10 @@ describe('ReportsService data contract', () => {
 
       const summary = (result as any).summary;
       const summaryStages = summary.stages.filter((stage: any) => stage.sampleSize > 0 && stage.avgDays !== null);
-      const summaryStageSum = summaryStages.reduce((sum: number, stage: any) => sum + stage.avgDays, 0);
+      const summaryStageSum = summaryStages.reduce(
+        (sum: number, stage: any) => sum + displayDurationDays(stage.avgDays),
+        0,
+      );
       expect(summary.stageTotal.avgDays).toBeCloseTo(summaryStageSum, 6);
     } finally {
       jest.useRealTimers();
