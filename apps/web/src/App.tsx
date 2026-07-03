@@ -5601,6 +5601,7 @@ type DealCycleRow = {
   totalDeals: number;
   stages: DealCycleStage[];
   stageAverage?: { avgDays: number | null; sampleSize: number };
+  stageTotal?: { avgDays: number | null; sampleSize: number };
   overallAverage?: { avgDays: number | null; sampleSize: number };
   successCycle?: { avgDays: number | null; sampleSize: number };
   lostCycle?: { avgDays: number | null; sampleSize: number };
@@ -5787,7 +5788,7 @@ function DealCycleReport({ amoDomain, result }: { amoDomain: string; result: Rec
       <div className={`deal-cycle-grid deal-cycle-head${isCurrentStageAge ? ' deal-cycle-grid-current' : ''}`}>
         <div>Менеджер</div>
         <div>{isCurrentStageAge ? 'Сейчас в этапах' : 'Этапы сделки'}</div>
-        {isCurrentStageAge && <div>Среднее</div>}
+        {isCurrentStageAge && <div>Сумма</div>}
         {!isCurrentStageAge && (
           <>
             <div>До успеха</div>
@@ -5882,7 +5883,7 @@ function DealCycleTimelineRow({
         )}
       </div>
       {isCurrentStageAge && (
-        <DealCycleValue label="Среднее" value={row.overallAverage} />
+        <DealCycleValue label="Сумма" value={row.stageTotal ?? row.overallAverage} />
       )}
       {showFinals && (
         <>

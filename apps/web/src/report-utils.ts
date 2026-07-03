@@ -379,10 +379,14 @@ export function getMetric(template: Pick<ReportTemplate, 'name' | 'config'>, res
         weightedStageSampleSize
       : null;
     if (result.type === 'dealStageAge') {
-      const average = summary.overallAverage?.avgDays ?? weightedStageAvg;
+      const stageTotalFallback = stageValues.length
+        ? stageValues.reduce((sum, stage) => sum + Number(stage.avgDays), 0)
+        : null;
+      const total = summary.stageTotal?.avgDays ?? stageTotalFallback ?? summary.overallAverage?.avgDays;
+      const sampleSize = Number(summary.stageTotal?.sampleSize ?? weightedStageSampleSize);
       return {
-        value: average == null ? 'нет данных' : formatDurationFromDays(average),
-        caption: `Среднее нахождение в текущем этапе. Сделок в работе: ${formatNumber(summary.totalDeals ?? 0)}`,
+        value: total == null ? 'нет данных' : formatDurationFromDays(total),
+        caption: `Сумма средних по текущим этапам. Сделок в работе: ${formatNumber(sampleSize || (summary.totalDeals ?? 0))}`,
       };
     }
     const stageAverage = summary.stageAverage?.avgDays ?? weightedStageAvg;

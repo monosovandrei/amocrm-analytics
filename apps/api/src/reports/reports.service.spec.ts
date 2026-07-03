@@ -418,6 +418,46 @@ describe('ReportsService data contract', () => {
     expect(managerRow.metrics.sourceAd.value).toBe(1);
   });
 
+  it('sums visible current-stage averages for the row total', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2026-04-02T10:00:00.000Z'));
+
+    try {
+      const result = await service.compute(
+        {
+          sourceType: 'CURRENT' as any,
+          filters: {
+            pipelineIds: ['pipe-sales'],
+            groupIds: ['group-1'],
+          },
+          config: { metric: 'deal_stage_age' },
+        } as any,
+        { id: 'user-1', role: 'ADMIN' as any },
+      );
+
+      const row = (result as any).rows.find((item: any) => item.managerId === managers.first.id);
+      const activeStages = row.stages.filter((stage: any) => stage.sampleSize > 0 && stage.avgDays !== null);
+      const stageSum = activeStages.reduce((sum: number, stage: any) => sum + stage.avgDays, 0);
+      const stageSamples = activeStages.reduce((sum: number, stage: any) => sum + stage.sampleSize, 0);
+      const weightedAverage = activeStages.reduce(
+        (sum: number, stage: any) => sum + stage.avgDays * stage.sampleSize,
+        0,
+      ) / stageSamples;
+
+      expect(activeStages.length).toBeGreaterThan(1);
+      expect(row.stageTotal.sampleSize).toBe(stageSamples);
+      expect(row.stageTotal.avgDays).toBeCloseTo(stageSum, 6);
+      expect(row.overallAverage.avgDays).toBeCloseTo(stageSum, 6);
+      expect(Math.abs(row.stageTotal.avgDays - weightedAverage)).toBeGreaterThan(1);
+
+      const summary = (result as any).summary;
+      const summaryStages = summary.stages.filter((stage: any) => stage.sampleSize > 0 && stage.avgDays !== null);
+      const summaryStageSum = summaryStages.reduce((sum: number, stage: any) => sum + stage.avgDays, 0);
+      expect(summary.stageTotal.avgDays).toBeCloseTo(summaryStageSum, 6);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it('writes audit entries when report templates are changed', async () => {
     const saved = await service.saveTemplate(
       {
