@@ -2113,7 +2113,8 @@ export class AmoSyncService {
     updatedSince?: number,
   ) {
     const leadExternalIds = this.webhookLeadExternalIds(groups);
-    if (leadExternalIds.length === 0) return;
+    const contactExternalIds = this.webhookExternalIds(groups, 'contacts');
+    if (leadExternalIds.length === 0 && contactExternalIds.length === 0) return;
 
     const params: Record<string, string | number> = {};
     if (updatedSince) params['filter[updated_at][from]'] = updatedSince;
@@ -2130,6 +2131,19 @@ export class AmoSyncService {
       } catch (error: any) {
         stats.webhookNotesErrors = (stats.webhookNotesErrors ?? 0) + 1;
         this.logger.warn(`Lead ${leadExternalId} notes webhook sync skipped: ${error.message}`);
+      }
+    }
+    for (const contactExternalId of contactExternalIds) {
+      try {
+        await client.paginateBatch<any>(`/contacts/${contactExternalId}/notes`, 'notes', params, async (notes) => {
+          for (const note of notes) {
+            await this.upsertNote('contacts', note);
+          }
+          total += notes.length;
+        });
+      } catch (error: any) {
+        stats.webhookNotesErrors = (stats.webhookNotesErrors ?? 0) + 1;
+        this.logger.warn(`Contact ${contactExternalId} notes webhook sync skipped: ${error.message}`);
       }
     }
 
@@ -2199,39 +2213,44 @@ export class AmoSyncService {
     stats: Record<string, number>,
     updatedSince?: number,
   ) {
-    const leadExternalIds = this.webhookLeadExternalIds(groups);
-    if (leadExternalIds.length === 0) return;
+    const entityGroups = [
+      { entity: 'lead', ids: this.webhookLeadExternalIds(groups) },
+      { entity: 'contact', ids: this.webhookExternalIds(groups, 'contacts') },
+    ];
+    if (entityGroups.every((group) => group.ids.length === 0)) return;
 
     let total = 0;
-    for (const leadExternalId of leadExternalIds) {
-      const params: Record<string, string | number> = {
-        'filter[entity]': 'lead',
-        'filter[entity_id][]': leadExternalId,
-      };
-      if (updatedSince) params['filter[created_at][from]'] = updatedSince;
+    for (const group of entityGroups) {
+      for (const externalId of group.ids) {
+        const params: Record<string, string | number> = {
+          'filter[entity]': group.entity,
+          'filter[entity_id][]': externalId,
+        };
+        if (updatedSince) params['filter[created_at][from]'] = updatedSince;
 
-      const eventsById = new Map<string, any>();
-      const ingest = async (eventParams: Record<string, string | number>) => {
-        await client.paginateBatch<any>('/events', 'events', eventParams, async (events) => {
-          for (const event of events) eventsById.set(String(event.id), event);
-        });
-      };
+        const eventsById = new Map<string, any>();
+        const ingest = async (eventParams: Record<string, string | number>) => {
+          await client.paginateBatch<any>('/events', 'events', eventParams, async (events) => {
+            for (const event of events) eventsById.set(String(event.id), event);
+          });
+        };
 
-      try {
-        await ingest(params);
-        for (const type of this.extraEventTypes()) {
-          await ingest({ ...params, 'filter[type]': type });
+        try {
+          await ingest(params);
+          for (const type of this.extraEventTypes()) {
+            await ingest({ ...params, 'filter[type]': type });
+          }
+        } catch (error: any) {
+          stats.webhookEventSyncErrors = (stats.webhookEventSyncErrors ?? 0) + 1;
+          this.logger.warn(`${group.entity} ${externalId} events webhook sync skipped: ${error.message}`);
+          continue;
         }
-      } catch (error: any) {
-        stats.webhookEventSyncErrors = (stats.webhookEventSyncErrors ?? 0) + 1;
-        this.logger.warn(`Lead ${leadExternalId} events webhook sync skipped: ${error.message}`);
-        continue;
-      }
 
-      for (const event of eventsById.values()) {
-        await this.upsertCrmEvent(event, maps);
+        for (const event of eventsById.values()) {
+          await this.upsertCrmEvent(event, maps);
+        }
+        total += eventsById.size;
       }
-      total += eventsById.size;
     }
 
     stats.webhookEventsSynced = total;
@@ -2267,14 +2286,18 @@ export class AmoSyncService {
   }
 
   private webhookLeadExternalIds(groups: WebhookEventGroup[]) {
+    return this.webhookExternalIds(groups, 'leads');
+  }
+
+  private webhookExternalIds(groups: WebhookEventGroup[], entity: string) {
     return [...new Set(groups
-      .filter((group) => group.entity === 'leads' && group.externalId)
+      .filter((group) => group.entity === entity && group.externalId)
       .map((group) => group.externalId as string))];
   }
 
   private extraEventTypes() {
     const configured = this.config.get<string>('AMOCRM_EXTRA_EVENT_TYPES');
-    const eventTypes = new Set(['custom_field_809047_value_changed']);
+    const eventTypes = new Set(['custom_field_809047_value_changed', 'incoming_mail', 'outgoing_mail']);
     for (const type of configured?.split(',') ?? []) {
       const clean = type.trim();
       if (clean) eventTypes.add(clean);

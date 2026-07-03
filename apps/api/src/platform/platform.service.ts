@@ -1987,7 +1987,6 @@ export class PlatformService {
     const notes = await this.prisma.note.findMany({
       where: {
         type: 'amomail_message',
-        dealId: { not: null },
       },
       orderBy: { createdAt: 'asc' },
       select: {
@@ -2047,28 +2046,50 @@ export class PlatformService {
     };
 
     for (const note of notes) {
-      if (!note.deal || note.deal.deletedAt || note.deal.stage?.isWon || note.deal.stage?.isLost) continue;
+      const targetDeals = new Map<string, EmailThreadDraft['deal']>();
+      if (note.deal && !note.deal.deletedAt && !note.deal.stage?.isWon && !note.deal.stage?.isLost) {
+        targetDeals.set(note.deal.id, note.deal);
+      }
+
+      const noteEntityId = this.emailNoteEntityId(note.raw);
+      if (noteEntityId) {
+        const leadDeal = openDealsById.get(leadExternalToDealId.get(noteEntityId) ?? '');
+        if (leadDeal) targetDeals.set(leadDeal.id, leadDeal);
+        for (const dealId of contactExternalToDealIds.get(noteEntityId) ?? []) {
+          const contactDeal = openDealsById.get(dealId);
+          if (contactDeal) targetDeals.set(contactDeal.id, contactDeal);
+        }
+      }
+
+      if (targetDeals.size === 0) continue;
 
       const params = this.emailNoteParams(note.raw, note.text);
       const threadId = params.threadId || `note:${note.externalId}`;
-      const draft = ensureDraft(note.deal, threadId);
 
       storedNoteIds.add(note.externalId);
 
-      draft.messages.push({
-        id: `note:${note.externalId}`,
-        noteExternalId: note.externalId,
-        direction: this.emailDirection(params, internalEmailDomains),
-        createdAt: note.createdAt,
-        subject: params.subject,
-        summary: params.summary,
-        body: params.body,
-        from: params.from,
-        to: params.to,
-        attachCount: params.attachCount,
-        deliveryStatus: params.deliveryStatus,
-        source: 'note',
-      });
+      for (const deal of targetDeals.values()) {
+        const direction = this.emailDirection(params, internalEmailDomains);
+        const ownDraft = ensureDraft(deal, threadId);
+        const targetDrafts = direction === 'incoming'
+          ? [ownDraft]
+          : (draftsByDealId.get(deal.id)?.length ? draftsByDealId.get(deal.id) ?? [] : [ownDraft]);
+
+        for (const draft of targetDrafts) draft.messages.push({
+          id: `note:${note.externalId}:${draft.threadId}:${deal.id}`,
+          noteExternalId: note.externalId,
+          direction,
+          createdAt: note.createdAt,
+          subject: params.subject,
+          summary: params.summary,
+          body: params.body,
+          from: params.from,
+          to: params.to,
+          attachCount: params.attachCount,
+          deliveryStatus: params.deliveryStatus,
+          source: 'note',
+        });
+      }
     }
 
     const mailEvents = await this.prisma.crmEvent.findMany({
@@ -2254,6 +2275,12 @@ export class PlatformService {
   private emailEventThreadId(entity: { type: string; id: string }, dealExternalId?: string | null) {
     if (entity.type && entity.id) return `mail-event:${entity.type}:${entity.id}`;
     return `mail-event:lead:${dealExternalId ?? 'unknown'}`;
+  }
+
+  private emailNoteEntityId(raw: unknown) {
+    const payload = raw as Record<string, any> | null;
+    const id = payload?.entity_id ?? payload?._embedded?.entity?.id;
+    return id == null ? null : String(id);
   }
 
   private async emailInternalDomains() {
