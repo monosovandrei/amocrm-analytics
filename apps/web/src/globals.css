@@ -1215,12 +1215,15 @@ button:disabled {
   display: grid;
   gap: 6px;
   min-width: 0;
+  width: 100%;
 }
 
 .telegram-recipient-trigger {
   display: flex;
   min-height: 38px;
+  min-width: 0;
   width: 100%;
+  max-width: 100%;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
@@ -1235,6 +1238,7 @@ button:disabled {
 }
 
 .telegram-recipient-trigger span {
+  display: block;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
