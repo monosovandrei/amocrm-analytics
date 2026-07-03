@@ -1984,34 +1984,6 @@ export class PlatformService {
       },
     });
 
-    const notes = await this.prisma.note.findMany({
-      where: {
-        type: 'amomail_message',
-      },
-      orderBy: { createdAt: 'asc' },
-      select: {
-        externalId: true,
-        dealId: true,
-        createdAt: true,
-        text: true,
-        raw: true,
-        deal: {
-          select: {
-            id: true,
-            externalId: true,
-            title: true,
-            amount: true,
-            contactId: true,
-            deletedAt: true,
-            pipeline: { select: { name: true } },
-            stage: { select: { name: true, isWon: true, isLost: true } },
-            responsible: { select: { name: true, externalId: true, group: { select: { name: true } } } },
-            contact: { select: { externalId: true, name: true, email: true } },
-          },
-        },
-      },
-    });
-
     const drafts = new Map<string, EmailThreadDraft>();
     const storedNoteIds = new Set<string>();
     const internalEmailDomains = await this.emailInternalDomains();
@@ -2028,6 +2000,44 @@ export class PlatformService {
       }
       contactExternalToDealIds.get(deal.contact.externalId)?.add(deal.id);
     }
+
+    const noteEntityIds = [...new Set([...leadExternalToDealId.keys(), ...contactExternalToDealIds.keys()])];
+    const noteEntityWhere = noteEntityIds.length
+      ? Prisma.sql`("dealId" IS NOT NULL OR raw->>'entity_id' IN (${Prisma.join(noteEntityIds)}))`
+      : Prisma.sql`"dealId" IS NOT NULL`;
+    const noteRows = await this.prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+      SELECT id
+      FROM "Note"
+      WHERE type = 'amomail_message' AND ${noteEntityWhere}
+      ORDER BY "createdAt" ASC
+    `);
+    const notes = noteRows.length
+      ? await this.prisma.note.findMany({
+        where: { id: { in: noteRows.map((row) => row.id) } },
+        orderBy: { createdAt: 'asc' },
+        select: {
+          externalId: true,
+          dealId: true,
+          createdAt: true,
+          text: true,
+          raw: true,
+          deal: {
+            select: {
+              id: true,
+              externalId: true,
+              title: true,
+              amount: true,
+              contactId: true,
+              deletedAt: true,
+              pipeline: { select: { name: true } },
+              stage: { select: { name: true, isWon: true, isLost: true } },
+              responsible: { select: { name: true, externalId: true, group: { select: { name: true } } } },
+              contact: { select: { externalId: true, name: true, email: true } },
+            },
+          },
+        },
+      })
+      : [];
 
     const ensureDraft = (deal: EmailThreadDraft['deal'], threadId: string) => {
       const key = `${deal.id}:${threadId}`;
