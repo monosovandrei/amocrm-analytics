@@ -30,6 +30,19 @@ type PlanFactMetric = {
   kind: 'additive' | 'conversion';
 };
 
+type TelegramDeliveryMode = 'system' | 'direct_responsible' | 'selected' | 'group' | 'all_connected' | 'disabled';
+
+const TELEGRAM_DELIVERY_MODE_KIND = 'delivery_mode';
+const TELEGRAM_DELIVERY_MODES: TelegramDeliveryMode[] = [
+  'system',
+  'direct_responsible',
+  'selected',
+  'group',
+  'all_connected',
+  'disabled',
+];
+const PERSONAL_TELEGRAM_EVENTS = new Set(['amo_new_assigned_lead', 'amo_assigned_lead_10m', 'amo_take_to_work_enabled']);
+
 type EmailDirection = 'incoming' | 'outgoing';
 type EmailPipelineKey = 'sales' | 'base' | 'assignedCompanies';
 
@@ -472,8 +485,16 @@ export class PlatformService {
     const text = String(body.body ?? '').trim();
     if (!text) throw new BadRequestException('Текст уведомления обязателен');
     const recipients = body.recipients === undefined ? undefined : await this.parseTelegramRecipients(body.recipients);
-    const recipientsMode = this.parseTelegramRecipientMode(body.recipientsMode, recipients === undefined ? 'default' : 'custom');
-    const storedRecipients = recipients === undefined ? undefined : this.telegramRecipientsForStorage(recipientsMode, recipients);
+    const deliveryMode = this.parseTelegramDeliveryMode(body.deliveryMode, body.recipientsMode, recipients);
+    if (!this.telegramDeliveryModeAllowed(eventType, deliveryMode)) {
+      throw new BadRequestException('\u041d\u0435\u0434\u043e\u043f\u0443\u0441\u0442\u0438\u043c\u044b\u0439 \u0440\u0435\u0436\u0438\u043c \u0434\u043e\u0441\u0442\u0430\u0432\u043a\u0438 \u0434\u043b\u044f \u044d\u0442\u043e\u0433\u043e \u0443\u0432\u0435\u0434\u043e\u043c\u043b\u0435\u043d\u0438\u044f');
+    }
+    if (deliveryMode === 'selected' && !(recipients ?? []).length) {
+      throw new BadRequestException('\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u043f\u043e\u043b\u0443\u0447\u0430\u0442\u0435\u043b\u0435\u0439');
+    }
+    const storedRecipients = body.deliveryMode === undefined && body.recipientsMode === undefined && recipients === undefined
+      ? undefined
+      : this.telegramRecipientsForStorage(deliveryMode, recipients ?? []);
     return this.prisma.notificationTemplate.upsert({
       where: { eventType },
       create: {
@@ -2418,13 +2439,32 @@ export class PlatformService {
     );
   }
 
-  private parseTelegramRecipientMode(input: unknown, fallback: 'default' | 'custom') {
-    return String(input ?? fallback) === 'custom' ? 'custom' : 'default';
+  private parseTelegramDeliveryMode(
+    input: unknown,
+    legacyRecipientsMode: unknown,
+    recipients?: Array<{ kind: string; id: string }>,
+  ): TelegramDeliveryMode {
+    const raw = String(input ?? '').trim();
+    if (TELEGRAM_DELIVERY_MODES.includes(raw as TelegramDeliveryMode)) return raw as TelegramDeliveryMode;
+    if (String(legacyRecipientsMode ?? 'default') === 'custom') {
+      return recipients?.length ? 'selected' : 'disabled';
+    }
+    return 'system';
   }
 
-  private telegramRecipientsForStorage(mode: 'default' | 'custom', recipients: Array<{ kind: string; id: string }>) {
-    if (mode === 'default') return [];
-    return recipients.length ? recipients : [{ kind: 'none', id: 'none' }];
+  private telegramDeliveryModeAllowed(eventType: string, mode: TelegramDeliveryMode) {
+    if (PERSONAL_TELEGRAM_EVENTS.has(eventType)) {
+      return mode === 'system' || mode === 'direct_responsible' || mode === 'disabled';
+    }
+    if (mode === 'direct_responsible') return eventType === 'amo_payment_received';
+    return true;
+  }
+
+  private telegramRecipientsForStorage(mode: TelegramDeliveryMode, recipients: Array<{ kind: string; id: string }>) {
+    if (mode === 'system') return [];
+    if (mode === 'disabled') return [{ kind: 'none', id: 'none' }];
+    const modeItem = { kind: TELEGRAM_DELIVERY_MODE_KIND, id: mode };
+    return mode === 'selected' ? [modeItem, ...recipients] : [modeItem];
   }
 
   private serializeTelegramTemplate(template: { recipients: Prisma.JsonValue; [key: string]: unknown }) {
@@ -2439,10 +2479,23 @@ export class PlatformService {
       const record = item as Record<string, unknown>;
       return record?.kind === 'none' && record?.id === 'none';
     });
+    const modeItem = raw.find((item) => {
+      const record = item as Record<string, unknown>;
+      return record?.kind === TELEGRAM_DELIVERY_MODE_KIND && TELEGRAM_DELIVERY_MODES.includes(String(record.id) as TelegramDeliveryMode);
+    }) as Record<string, unknown> | undefined;
+    const eventType = String(template.eventType ?? '');
+    let deliveryMode: TelegramDeliveryMode = 'system';
+    if (disabled) deliveryMode = 'disabled';
+    else if (modeItem) deliveryMode = String(modeItem.id) as TelegramDeliveryMode;
+    else if (recipients.length) deliveryMode = 'selected';
+    if (!this.telegramDeliveryModeAllowed(eventType, deliveryMode)) deliveryMode = 'system';
+    const allowedDeliveryModes = TELEGRAM_DELIVERY_MODES.filter((mode) => this.telegramDeliveryModeAllowed(eventType, mode));
     return {
       ...template,
       recipients,
-      recipientsMode: disabled || recipients.length ? 'custom' : 'default',
+      deliveryMode,
+      allowedDeliveryModes,
+      recipientsMode: deliveryMode === 'system' ? 'default' : 'custom',
     };
   }
 

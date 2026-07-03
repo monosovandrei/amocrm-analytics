@@ -40,6 +40,19 @@ type TelegramTemplateRecipient = {
   id: string;
 };
 
+type TelegramDeliveryMode = 'system' | 'direct_responsible' | 'selected' | 'group' | 'all_connected' | 'disabled';
+
+const TELEGRAM_DELIVERY_MODE_KIND = 'delivery_mode';
+const TELEGRAM_DELIVERY_MODES = new Set<TelegramDeliveryMode>([
+  'system',
+  'direct_responsible',
+  'selected',
+  'group',
+  'all_connected',
+  'disabled',
+]);
+const PERSONAL_TELEGRAM_EVENTS = new Set(['amo_new_assigned_lead', 'amo_assigned_lead_10m', 'amo_take_to_work_enabled']);
+
 const PAYMENT_NOTIFICATION_ROUTES = [
   {
     pipelineNames: ['\u0412\u043e\u0440\u043e\u043d\u043a\u0430 \u041f\u0440\u043e\u0434\u0430\u0436\u0438'],
@@ -243,9 +256,6 @@ export class CrmEventNotificationsService {
 
     const configuredDeliveries = await this.sendConfiguredNotification('amo_payment_received', message, payload, eventKey);
     if (configuredDeliveries) return configuredDeliveries.some((delivery) => delivery?.status === 'SENT');
-
-    const groupDeliveries = await this.telegram.sendMessageToGroupsByCrmUsers([deal.responsibleId], message, payload, undefined, eventKey);
-    if (groupDeliveries.length) return groupDeliveries.some((delivery) => delivery?.status === 'SENT');
 
     const delivery = await this.telegram.sendDirectMessageToCrmUser(deal.responsibleId, message, payload, undefined, eventKey);
     return delivery.status === 'SENT';
@@ -783,6 +793,7 @@ export class CrmEventNotificationsService {
         type: 'amo_new_assigned_lead',
         dealId: deal.id,
         dealExternalId: deal.externalId,
+        managerCrmUserId: deal.responsibleId,
         taskId: managerTask.id,
       };
       const configuredDeliveries = await this.sendConfiguredNotification('amo_new_assigned_lead', message, payload, firstKey);
@@ -814,6 +825,7 @@ export class CrmEventNotificationsService {
         type: 'amo_assigned_lead_10m',
         dealId: deal.id,
         dealExternalId: deal.externalId,
+        managerCrmUserId: deal.responsibleId,
         taskId: managerTask.id,
       };
       const configuredDeliveries = await this.sendConfiguredNotification('amo_assigned_lead_10m', message, payload, reminderKey);
@@ -954,17 +966,13 @@ export class CrmEventNotificationsService {
     const configuredDeliveries = await this.sendConfiguredNotification('amo_take_to_work_enabled', message, payload, eventKey);
     if (configuredDeliveries) return configuredDeliveries.some((delivery) => delivery?.status === 'SENT');
 
-    const groupDeliveries = await this.telegram.sendMessageToGroupsByCrmUsers(
-      deal.responsibleId ? [deal.responsibleId] : [],
-      message,
-      payload,
-      undefined,
-      eventKey,
-    );
-    const groupSent = groupDeliveries.some((delivery) => delivery?.status === 'SENT');
+    const managerDelivery = deal.responsibleId
+      ? await this.telegram.sendDirectMessageToCrmUser(deal.responsibleId, message, payload, undefined, eventKey)
+      : null;
+    const managerSent = managerDelivery?.status === 'SENT';
 
     if (!leaders.length) {
-      if (groupSent) return true;
+      if (managerSent) return true;
       await this.recordSkipped(`amo:work-sla:${deal.id}:no-leader`, message, {
         ...payload,
         reason: 'Нет активного руководителя в платформе',
@@ -979,7 +987,7 @@ export class CrmEventNotificationsService {
       undefined,
       `${eventKey}:sales-rop`,
     );
-    return groupSent || leaderDeliveries.some((delivery) => delivery?.status === 'SENT');
+    return managerSent || leaderDeliveries.some((delivery) => delivery?.status === 'SENT');
   }
 
   private eventEntityId(event: any) {
@@ -1392,8 +1400,44 @@ export class CrmEventNotificationsService {
     payload: Record<string, unknown>,
     eventKey?: string,
   ) {
-    const config = await this.configuredTelegramRecipients(eventType);
-    if (!config.configured) return null;
+    const config = await this.configuredTelegramDelivery(eventType);
+    if (config.mode === 'system') return null;
+    if (!this.telegramDeliveryModeAllowed(eventType, config.mode)) return null;
+    if (config.mode === 'disabled') return [];
+
+    if (config.mode === 'direct_responsible') {
+      const responsibleId = this.payloadCrmUserId(payload);
+      if (!responsibleId) return [];
+      return [
+        await this.telegram.sendDirectMessageToCrmUser(
+          responsibleId,
+          message,
+          { ...payload, deliveryMode: config.mode },
+          undefined,
+          eventKey ? `${eventKey}:direct-responsible` : undefined,
+        ),
+      ];
+    }
+
+    if (config.mode === 'group') {
+      return this.telegram.sendMessageToGroups(
+        [],
+        message,
+        { ...payload, deliveryMode: config.mode },
+        undefined,
+        eventKey ? `${eventKey}:telegram-group` : undefined,
+      );
+    }
+
+    if (config.mode === 'all_connected') {
+      return this.telegram.sendDirectMessageToAllConnected(
+        message,
+        { ...payload, deliveryMode: config.mode },
+        undefined,
+        eventKey ? `${eventKey}:all-connected` : undefined,
+      );
+    }
+
     if (!config.recipients.length) return [];
 
     const deliveries = [];
@@ -1403,7 +1447,7 @@ export class CrmEventNotificationsService {
         deliveries.push(await this.telegram.sendDirectMessageToUser(
           recipient.id,
           message,
-          { ...payload, configuredRecipient: recipient },
+          { ...payload, configuredRecipient: recipient, deliveryMode: config.mode },
           undefined,
           recipientEventKey,
         ));
@@ -1411,7 +1455,7 @@ export class CrmEventNotificationsService {
         deliveries.push(await this.telegram.sendDirectMessageToCrmUser(
           recipient.id,
           message,
-          { ...payload, configuredRecipient: recipient },
+          { ...payload, configuredRecipient: recipient, deliveryMode: config.mode },
           undefined,
           recipientEventKey,
         ));
@@ -1420,18 +1464,22 @@ export class CrmEventNotificationsService {
     return deliveries;
   }
 
-  private async configuredTelegramRecipients(eventType: string): Promise<{ configured: boolean; recipients: TelegramTemplateRecipient[] }> {
+  private async configuredTelegramDelivery(eventType: string): Promise<{ mode: TelegramDeliveryMode; recipients: TelegramTemplateRecipient[] }> {
     const template = await this.prisma.notificationTemplate.findUnique({
       where: { eventType },
       select: { recipients: true },
     });
     const raw = template?.recipients;
-    if (!Array.isArray(raw)) return { configured: false, recipients: [] };
+    if (!Array.isArray(raw)) return { mode: 'system', recipients: [] };
     const disabled = raw.some((item) => {
       const record = item as Record<string, unknown>;
       return record?.kind === 'none' && record?.id === 'none';
     });
-    if (disabled) return { configured: true, recipients: [] };
+    if (disabled) return { mode: 'disabled', recipients: [] };
+    const deliveryMode = raw.find((item) => {
+      const record = item as Record<string, unknown>;
+      return record?.kind === TELEGRAM_DELIVERY_MODE_KIND && TELEGRAM_DELIVERY_MODES.has(String(record.id) as TelegramDeliveryMode);
+    }) as Record<string, unknown> | undefined;
     const recipients = raw
       .map((item) => ({
         kind: String((item as Record<string, unknown>)?.kind ?? ''),
@@ -1440,9 +1488,21 @@ export class CrmEventNotificationsService {
       .filter((item): item is TelegramTemplateRecipient =>
         (item.kind === 'platform_user' || item.kind === 'crm_user') && Boolean(item.id),
       );
-    return recipients.length
-      ? { configured: true, recipients }
-      : { configured: false, recipients: [] };
+    if (deliveryMode) return { mode: String(deliveryMode.id) as TelegramDeliveryMode, recipients };
+    return recipients.length ? { mode: 'selected', recipients } : { mode: 'system', recipients: [] };
+  }
+
+  private telegramDeliveryModeAllowed(eventType: string, mode: TelegramDeliveryMode) {
+    if (PERSONAL_TELEGRAM_EVENTS.has(eventType)) {
+      return mode === 'system' || mode === 'direct_responsible' || mode === 'disabled';
+    }
+    if (mode === 'direct_responsible') return eventType === 'amo_payment_received';
+    return true;
+  }
+
+  private payloadCrmUserId(payload: Record<string, unknown>) {
+    const raw = payload.managerCrmUserId ?? payload.crmUserId ?? payload.responsibleCrmUserId;
+    return typeof raw === 'string' && raw.trim() ? raw.trim() : null;
   }
 
   private async renderNotification(eventType: string, fallbackType: string, variables: Record<string, string>) {

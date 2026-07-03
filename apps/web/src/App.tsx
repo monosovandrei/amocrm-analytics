@@ -311,6 +311,7 @@ type TelegramTemplateRecipient = {
 };
 
 type TelegramRecipientMode = 'default' | 'custom';
+type TelegramDeliveryMode = 'system' | 'direct_responsible' | 'selected' | 'group' | 'all_connected' | 'disabled';
 
 type TelegramTemplate = {
   eventType: string;
@@ -318,6 +319,35 @@ type TelegramTemplate = {
   body: string;
   recipients?: TelegramTemplateRecipient[];
   recipientsMode?: TelegramRecipientMode;
+  deliveryMode?: TelegramDeliveryMode;
+  allowedDeliveryModes?: TelegramDeliveryMode[];
+};
+
+const telegramDeliveryModeLabels: Record<TelegramDeliveryMode, string> = {
+  system: 'По системному правилу',
+  direct_responsible: 'В ЛС ответственному',
+  selected: 'Выбранным получателям',
+  group: 'В активную группу',
+  all_connected: 'Всем подключённым',
+  disabled: 'Не отправлять',
+};
+
+const telegramDeliveryModeOrder: TelegramDeliveryMode[] = [
+  'system',
+  'direct_responsible',
+  'selected',
+  'group',
+  'all_connected',
+  'disabled',
+];
+
+const telegramDeliveryModeHints: Record<TelegramDeliveryMode, string> = {
+  system: 'Используется встроенная логика события.',
+  direct_responsible: 'Получит только менеджер, к которому относится сделка.',
+  selected: 'Получат только выбранные люди.',
+  group: 'Сообщение уйдёт в подключённую группу.',
+  all_connected: 'Сообщение уйдёт всем подключённым аккаунтам.',
+  disabled: 'Уведомление выключено.',
 };
 
 type UserLinkDraft = {
@@ -4026,7 +4056,8 @@ function PlatformTab({ user, onMessage }: { user: User; onMessage: (message: str
   const [telegramTemplates, setTelegramTemplates] = useState<TelegramTemplate[]>([]);
   const [telegramTemplateDrafts, setTelegramTemplateDrafts] = useState<Record<string, string>>({});
   const [telegramRecipientDrafts, setTelegramRecipientDrafts] = useState<Record<string, string[]>>({});
-  const [telegramRecipientModes, setTelegramRecipientModes] = useState<Record<string, TelegramRecipientMode>>({});
+  const [telegramDeliveryModes, setTelegramDeliveryModes] = useState<Record<string, TelegramDeliveryMode>>({});
+  const [expandedTelegramTemplates, setExpandedTelegramTemplates] = useState<Record<string, boolean>>({});
   const [telegramTemplateSaveState, setTelegramTemplateSaveState] = useState<Record<string, 'saving' | 'saved' | 'error'>>({});
   const [userLinks, setUserLinks] = useState<UserLinksResponse | null>(null);
   const [userLinkDrafts, setUserLinkDrafts] = useState<Record<string, UserLinkDraft>>({});
@@ -4049,9 +4080,11 @@ function PlatformTab({ user, onMessage }: { user: User; onMessage: (message: str
       template.eventType,
       (template.recipients ?? []).map((recipient) => recipientValue(recipient)),
     ])));
-    setTelegramRecipientModes(Object.fromEntries(nextTelegramTemplates.map((template) => [
+    setTelegramDeliveryModes(Object.fromEntries(nextTelegramTemplates.map((template) => [
       template.eventType,
-      template.recipientsMode ?? ((template.recipients ?? []).length ? 'custom' : 'default'),
+      template.deliveryMode ?? (template.recipientsMode === 'custom'
+        ? ((template.recipients ?? []).length ? 'selected' : 'disabled')
+        : 'system'),
     ])));
     setUserLinks(nextUserLinks);
     setCrmTelegramLinks(nextCrmTelegramLinks);
@@ -4081,7 +4114,7 @@ function PlatformTab({ user, onMessage }: { user: User; onMessage: (message: str
         method: 'PATCH',
         body: JSON.stringify({
           body: telegramTemplateDrafts[eventType] ?? '',
-          recipientsMode: telegramRecipientModes[eventType] ?? 'default',
+          deliveryMode: telegramDeliveryModes[eventType] ?? 'system',
           recipients: (telegramRecipientDrafts[eventType] ?? []).map(parseRecipientValue).filter(Boolean),
         }),
       });
@@ -4177,74 +4210,125 @@ function PlatformTab({ user, onMessage }: { user: User; onMessage: (message: str
       {isOwner && (
         <section className="card">
           <div className="card-header">
-            <div className="card-title">Telegram-уведомления</div>
-          </div>
-          <div className="card-body grid gap-4">
-            {telegramTemplates.length === 0 && <div className="muted text-sm">Шаблоны уведомлений пока не загружены.</div>}
-            {telegramTemplates.map((template) => (
-              <div className="grid gap-3" key={template.eventType}>
-                <label className="label">{template.name}</label>
-                <TelegramRecipientsSelect
-                  mode={telegramRecipientModes[template.eventType] ?? 'default'}
-                  value={telegramRecipientDrafts[template.eventType] ?? []}
-                  userLinks={userLinks}
-                  crmTelegramLinks={crmTelegramLinks}
-                  onModeChange={(nextMode) => {
-                    setTelegramRecipientModes((current) => ({
-                      ...current,
-                      [template.eventType]: nextMode,
-                    }));
-                    setTelegramTemplateSaveState((current) => {
-                      const next = { ...current };
-                      delete next[template.eventType];
-                      return next;
-                    });
-                  }}
-                  onChange={(nextValue) => {
-                    setTelegramRecipientDrafts((current) => ({
-                      ...current,
-                      [template.eventType]: nextValue,
-                    }));
-                    setTelegramTemplateSaveState((current) => {
-                      const next = { ...current };
-                      delete next[template.eventType];
-                      return next;
-                    });
-                  }}
-                />
-                <textarea
-                  className="field min-h-[96px]"
-                  value={telegramTemplateDrafts[template.eventType] ?? ''}
-                  onChange={(event) => {
-                    setTelegramTemplateDrafts((current) => ({
-                      ...current,
-                      [template.eventType]: event.target.value,
-                    }));
-                    setTelegramTemplateSaveState((current) => {
-                      const next = { ...current };
-                      delete next[template.eventType];
-                      return next;
-                    });
-                  }}
-                />
-                <div className="text-xs text-[var(--pb-text-secondary)]">
-                  Вставки: {'{managerMention}'}, {'{dealUrl}'}, {'{deal}'}, {'{manager}'}, {'{amount}'}, {'{stage}'}, {'{pipeline}'}, {'{group}'}
-                </div>
-                <div className="flex flex-wrap items-center gap-2">
-                  <button
-                    className="btn btn-primary"
-                    type="button"
-                    disabled={telegramTemplateSaveState[template.eventType] === 'saving'}
-                    onClick={() => saveTelegramTemplate(template.eventType)}
-                  >
-                    <Save size={15} />
-                    {telegramTemplateSaveState[template.eventType] === 'saving' ? 'Сохраняю...' : 'Сохранить'}
-                  </button>
-                  {telegramTemplateSaveState[template.eventType] === 'saved' && <span className="badge badge-green">Сохранено</span>}
-                  {telegramTemplateSaveState[template.eventType] === 'error' && <span className="badge badge-red">Не сохранено</span>}
-                </div>
+            <div>
+              <div className="card-title">Telegram-уведомления</div>
+              <div className="mt-1 text-sm text-[var(--pb-text-secondary)]">
+                Режим доставки задаётся отдельно для каждого события.
               </div>
-            ))}
+            </div>
+          </div>
+          <div className="card-body">
+            {telegramTemplates.length === 0 && <div className="muted text-sm">Шаблоны уведомлений пока не загружены.</div>}
+            <div className="telegram-template-grid">
+              {telegramTemplates.map((template) => {
+                const mode = telegramDeliveryModes[template.eventType] ?? template.deliveryMode ?? 'system';
+                const allowedModes = template.allowedDeliveryModes?.length ? template.allowedDeliveryModes : telegramDeliveryModeOrder;
+                const saveState = telegramTemplateSaveState[template.eventType];
+                const selectedCount = telegramRecipientDrafts[template.eventType]?.length ?? 0;
+                const expanded = expandedTelegramTemplates[template.eventType] ?? false;
+                const saveDisabled = saveState === 'saving' || (mode === 'selected' && selectedCount === 0);
+                return (
+                  <article className="telegram-template-card" key={template.eventType}>
+                    <div className="telegram-template-card-header">
+                      <div className="telegram-template-title">{template.name}</div>
+                      {saveState === 'saved' && <span className="badge badge-green">Сохранено</span>}
+                      {saveState === 'error' && <span className="badge badge-red">Ошибка</span>}
+                    </div>
+                    <label className="label" htmlFor={`telegram-mode-${template.eventType}`}>Отправка</label>
+                    <select
+                      className="select"
+                      id={`telegram-mode-${template.eventType}`}
+                      value={mode}
+                      onChange={(event) => {
+                        const nextMode = event.target.value as TelegramDeliveryMode;
+                        setTelegramDeliveryModes((current) => ({
+                          ...current,
+                          [template.eventType]: nextMode,
+                        }));
+                        setTelegramTemplateSaveState((current) => {
+                          const next = { ...current };
+                          delete next[template.eventType];
+                          return next;
+                        });
+                      }}
+                    >
+                      {allowedModes.map((deliveryMode) => (
+                        <option key={deliveryMode} value={deliveryMode}>
+                          {telegramDeliveryModeLabels[deliveryMode]}
+                        </option>
+                      ))}
+                    </select>
+                    <div className="telegram-template-hint">
+                      {mode === 'selected' && selectedCount > 0
+                        ? `Выбрано: ${selectedCount}`
+                        : telegramDeliveryModeHints[mode]}
+                    </div>
+                    {mode === 'selected' && (
+                      <TelegramRecipientsSelect
+                        value={telegramRecipientDrafts[template.eventType] ?? []}
+                        userLinks={userLinks}
+                        crmTelegramLinks={crmTelegramLinks}
+                        onChange={(nextValue) => {
+                          setTelegramRecipientDrafts((current) => ({
+                            ...current,
+                            [template.eventType]: nextValue,
+                          }));
+                          setTelegramTemplateSaveState((current) => {
+                            const next = { ...current };
+                            delete next[template.eventType];
+                            return next;
+                          });
+                        }}
+                      />
+                    )}
+                    <div className="telegram-template-actions">
+                      <button
+                        className="btn"
+                        type="button"
+                        onClick={() => setExpandedTelegramTemplates((current) => ({
+                          ...current,
+                          [template.eventType]: !expanded,
+                        }))}
+                      >
+                        <Settings size={15} />
+                        {expanded ? 'Скрыть текст' : 'Текст'}
+                      </button>
+                      <button
+                        className="btn btn-primary"
+                        type="button"
+                        disabled={saveDisabled}
+                        onClick={() => saveTelegramTemplate(template.eventType)}
+                      >
+                        <Save size={15} />
+                        {saveState === 'saving' ? 'Сохраняю...' : 'Сохранить'}
+                      </button>
+                    </div>
+                    {expanded && (
+                      <div className="telegram-template-editor">
+                        <textarea
+                          className="field min-h-[120px]"
+                          value={telegramTemplateDrafts[template.eventType] ?? ''}
+                          onChange={(event) => {
+                            setTelegramTemplateDrafts((current) => ({
+                              ...current,
+                              [template.eventType]: event.target.value,
+                            }));
+                            setTelegramTemplateSaveState((current) => {
+                              const next = { ...current };
+                              delete next[template.eventType];
+                              return next;
+                            });
+                          }}
+                        />
+                        <div className="text-xs text-[var(--pb-text-secondary)]">
+                          Вставки: {'{managerMention}'}, {'{dealUrl}'}, {'{deal}'}, {'{manager}'}, {'{amount}'}, {'{stage}'}, {'{pipeline}'}, {'{group}'}
+                        </div>
+                      </div>
+                    )}
+                  </article>
+                );
+              })}
+            </div>
           </div>
         </section>
       )}
@@ -4253,42 +4337,33 @@ function PlatformTab({ user, onMessage }: { user: User; onMessage: (message: str
 }
 
 function TelegramRecipientsSelect({
-  mode,
   value,
   userLinks,
   crmTelegramLinks,
-  onModeChange,
   onChange,
 }: {
-  mode: TelegramRecipientMode;
   value: string[];
   userLinks: UserLinksResponse | null;
   crmTelegramLinks: CrmTelegramLinksResponse | null;
-  onModeChange: (mode: TelegramRecipientMode) => void;
   onChange: (value: string[]) => void;
 }) {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState('');
   const options = telegramRecipientOptions(userLinks, crmTelegramLinks);
-  const activeValue = mode === 'custom' ? value : [];
-  const selected = new Set(activeValue);
+  const selected = new Set(value);
   const selectedOptions = options.filter((option) => selected.has(option.value));
   const filteredOptions = options.filter((option) =>
     option.label.toLowerCase().includes(search.trim().toLowerCase()),
   );
-  const buttonText = mode === 'default'
-    ? 'По системному правилу'
-    : selectedOptions.length === 0
-      ? 'Никому'
-      : selectedOptions.length === 1
-        ? selectedOptions[0].label
-        : `${selectedOptions.length} получателя`;
-  const hint = mode === 'default'
-    ? 'Работает системная логика доставки.'
-    : selectedOptions.length === 0
-      ? 'Уведомление отключено: получателей нет.'
-      : 'Уведомление уйдёт только выбранным.';
+  const buttonText = selectedOptions.length === 0
+    ? 'Получатели не выбраны'
+    : selectedOptions.length === 1
+      ? selectedOptions[0].label
+      : `${selectedOptions.length} получателя`;
+  const hint = selectedOptions.length === 0
+    ? 'Выберите минимум одного получателя.'
+    : 'Уведомление уйдёт только выбранным.';
 
   useEffect(() => {
     if (!open) return undefined;
@@ -4310,17 +4385,15 @@ function TelegramRecipientsSelect({
   }, [open]);
 
   function toggleRecipient(optionValue: string) {
-    const currentValue = mode === 'custom' ? value : [];
-    const currentSelected = new Set(currentValue);
-    onModeChange('custom');
-    onChange(currentSelected.has(optionValue) ? currentValue.filter((item) => item !== optionValue) : [...currentValue, optionValue]);
+    const currentSelected = new Set(value);
+    onChange(currentSelected.has(optionValue) ? value.filter((item) => item !== optionValue) : [...value, optionValue]);
   }
 
   return (
     <div className="telegram-recipient-dropdown" ref={rootRef}>
       <label className="label">Кому</label>
       <button
-        className={`telegram-recipient-trigger ${mode === 'custom' && selectedOptions.length === 0 ? 'empty' : ''}`}
+        className={`telegram-recipient-trigger ${selectedOptions.length === 0 ? 'empty' : ''}`}
         type="button"
         aria-expanded={open}
         onClick={() => setOpen((current) => !current)}
@@ -4332,18 +4405,14 @@ function TelegramRecipientsSelect({
       {open && (
         <div className="telegram-recipient-panel">
           <div className="telegram-recipient-actions">
-            <button className={mode === 'default' ? 'active' : ''} type="button" onClick={() => onModeChange('default')}>
-              По умолчанию
-            </button>
             <button
-              className={mode === 'custom' && selectedOptions.length === 0 ? 'active danger' : ''}
+              className={selectedOptions.length === 0 ? 'active danger' : ''}
               type="button"
               onClick={() => {
-                onModeChange('custom');
                 onChange([]);
               }}
             >
-              Никому
+              Очистить
             </button>
           </div>
           <input
@@ -4357,7 +4426,7 @@ function TelegramRecipientsSelect({
             {filteredOptions.map((option) => (
               <label className="telegram-recipient-row" key={option.value}>
                 <input
-                  checked={mode === 'custom' && selected.has(option.value)}
+                  checked={selected.has(option.value)}
                   type="checkbox"
                   onChange={() => toggleRecipient(option.value)}
                 />

@@ -6,9 +6,16 @@ describe('CrmEventNotificationsService payment notification routing', () => {
       crmUser: {
         findMany: jest.fn(),
       },
+      notificationTemplate: {
+        findUnique: jest.fn(),
+      },
     };
     const telegram = {
       sendDirectMessageToCrmUsers: jest.fn().mockResolvedValue([{ status: 'SENT' }]),
+      sendDirectMessageToCrmUser: jest.fn().mockResolvedValue({ status: 'SENT' }),
+      sendDirectMessageToUser: jest.fn().mockResolvedValue({ status: 'SENT' }),
+      sendMessageToGroups: jest.fn().mockResolvedValue([{ status: 'SENT' }]),
+      sendDirectMessageToAllConnected: jest.fn().mockResolvedValue([{ status: 'SENT' }]),
     };
     const service = new CrmEventNotificationsService(prisma as any, telegram as any);
     return { service: service as any, prisma, telegram };
@@ -95,5 +102,70 @@ describe('CrmEventNotificationsService payment notification routing', () => {
     expect(result).toBeNull();
     expect(prisma.crmUser.findMany).not.toHaveBeenCalled();
     expect(telegram.sendDirectMessageToCrmUsers).not.toHaveBeenCalled();
+  });
+
+  it('ignores manual recipients for personal manager events', async () => {
+    const { service, prisma, telegram } = createService();
+    prisma.notificationTemplate.findUnique.mockResolvedValue({
+      recipients: [{ kind: 'crm_user', id: 'other-manager-id' }],
+    });
+
+    const result = await service.sendConfiguredNotification(
+      'amo_new_assigned_lead',
+      'message',
+      { managerCrmUserId: 'responsible-manager-id' },
+      'event-key',
+    );
+
+    expect(result).toBeNull();
+    expect(telegram.sendDirectMessageToCrmUser).not.toHaveBeenCalled();
+    expect(telegram.sendDirectMessageToUser).not.toHaveBeenCalled();
+    expect(telegram.sendMessageToGroups).not.toHaveBeenCalled();
+  });
+
+  it('sends direct-responsible mode only to the responsible CRM user', async () => {
+    const { service, prisma, telegram } = createService();
+    prisma.notificationTemplate.findUnique.mockResolvedValue({
+      recipients: [{ kind: 'delivery_mode', id: 'direct_responsible' }],
+    });
+
+    await service.sendConfiguredNotification(
+      'amo_payment_received',
+      'message',
+      { managerCrmUserId: 'responsible-manager-id' },
+      'event-key',
+    );
+
+    expect(telegram.sendDirectMessageToCrmUser).toHaveBeenCalledWith(
+      'responsible-manager-id',
+      'message',
+      expect.objectContaining({ deliveryMode: 'direct_responsible' }),
+      undefined,
+      'event-key:direct-responsible',
+    );
+    expect(telegram.sendMessageToGroups).not.toHaveBeenCalled();
+  });
+
+  it('sends group mode to active Telegram groups', async () => {
+    const { service, prisma, telegram } = createService();
+    prisma.notificationTemplate.findUnique.mockResolvedValue({
+      recipients: [{ kind: 'delivery_mode', id: 'group' }],
+    });
+
+    await service.sendConfiguredNotification(
+      'amo_loss_without_reason',
+      'message',
+      {},
+      'event-key',
+    );
+
+    expect(telegram.sendMessageToGroups).toHaveBeenCalledWith(
+      [],
+      'message',
+      expect.objectContaining({ deliveryMode: 'group' }),
+      undefined,
+      'event-key:telegram-group',
+    );
+    expect(telegram.sendDirectMessageToCrmUser).not.toHaveBeenCalled();
   });
 });

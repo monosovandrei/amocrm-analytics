@@ -231,14 +231,6 @@ export class TelegramService {
     alertEventId?: string,
     eventKey?: string,
   ) {
-    if (eventKey) {
-      const existing = await this.prisma.notificationDelivery.findUnique({ where: { eventKey } });
-      if (existing) return existing;
-    }
-
-    const groupDeliveries = await this.sendMessageToActiveGroups([userId], message, payload, alertEventId, eventKey);
-    if (groupDeliveries.length) return groupDeliveries[0];
-
     return this.sendDirectMessageToUser(userId, message, payload, alertEventId, eventKey);
   }
 
@@ -371,8 +363,6 @@ export class TelegramService {
     eventKey?: string,
   ) {
     const uniqueUserIds = Array.from(new Set(userIds.filter(Boolean)));
-    const groupDeliveries = await this.sendMessageToActiveGroups(uniqueUserIds, message, payload, alertEventId, eventKey);
-    if (groupDeliveries.length) return groupDeliveries;
     return Promise.all(uniqueUserIds.map((userId) =>
       this.sendMessageToUser(
         userId,
@@ -440,6 +430,67 @@ export class TelegramService {
     eventKey?: string,
   ) {
     return this.sendMessageToActiveGroups([], message, payload, alertEventId, eventKey, true, crmUserIds);
+  }
+
+  async sendDirectMessageToAllConnected(
+    message: string,
+    payload: Record<string, unknown> = {},
+    alertEventId?: string,
+    eventKey?: string,
+  ) {
+    const accounts = await this.prisma.telegramAccount.findMany({
+      where: { isActive: true },
+      orderBy: { linkedAt: 'desc' },
+    });
+    if (!accounts.length) return [];
+
+    if (!this.botToken) {
+      return Promise.all(accounts.map((account) =>
+        this.recordDelivery({
+          eventKey: eventKey ? `${eventKey}:telegram-account:${account.id}` : undefined,
+          userId: account.userId ?? undefined,
+          telegramAccountId: account.id,
+          status: 'ERROR',
+          message,
+          payload: { ...payload, reason: 'TELEGRAM_BOT_TOKEN не задан' },
+          alertEventId,
+        }),
+      ));
+    }
+
+    return Promise.all(accounts.map(async (account) => {
+      const deliveryEventKey = eventKey ? `${eventKey}:telegram-account:${account.id}` : undefined;
+      if (deliveryEventKey) {
+        const existing = await this.prisma.notificationDelivery.findUnique({ where: { eventKey: deliveryEventKey } });
+        if (existing) return existing;
+      }
+
+      try {
+        await this.sendChatMessage(account.chatId, message);
+        return this.recordDelivery({
+          eventKey: deliveryEventKey,
+          userId: account.userId ?? undefined,
+          telegramAccountId: account.id,
+          status: 'SENT',
+          message,
+          payload,
+          alertEventId,
+          sentAt: new Date(),
+        });
+      } catch (error: any) {
+        this.logger.warn(`Telegram send failed: ${error.message}`);
+        return this.recordDelivery({
+          eventKey: deliveryEventKey,
+          userId: account.userId ?? undefined,
+          telegramAccountId: account.id,
+          status: 'ERROR',
+          message,
+          payload,
+          alertEventId,
+          error: error.message,
+        });
+      }
+    }));
   }
 
   async mentionForCrmUser(crmUserId?: string | null, fallbackName?: string | null) {

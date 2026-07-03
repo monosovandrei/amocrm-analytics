@@ -1153,6 +1153,63 @@ button:disabled {
   width: 100%;
 }
 
+.telegram-template-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+}
+
+.telegram-template-card {
+  display: grid;
+  min-width: 0;
+  align-content: start;
+  gap: 10px;
+  border: 1px solid var(--pb-border);
+  border-radius: 7px;
+  background: #fff;
+  padding: 12px;
+}
+
+.telegram-template-card-header {
+  display: flex;
+  min-width: 0;
+  min-height: 28px;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.telegram-template-title {
+  min-width: 0;
+  color: var(--pb-primary);
+  font-size: 13px;
+  font-weight: 850;
+  line-height: 1.25;
+}
+
+.telegram-template-hint {
+  min-height: 32px;
+  color: var(--pb-text-secondary);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.telegram-template-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.telegram-template-actions .btn {
+  flex: 1 1 124px;
+  justify-content: center;
+}
+
+.telegram-template-editor {
+  display: grid;
+  gap: 7px;
+}
+
 .telegram-recipient-dropdown {
   position: relative;
   display: grid;
@@ -1220,9 +1277,8 @@ button:disabled {
 }
 
 .telegram-recipient-actions {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 6px;
+  display: flex;
+  justify-content: flex-end;
 }
 
 .telegram-recipient-actions button {
