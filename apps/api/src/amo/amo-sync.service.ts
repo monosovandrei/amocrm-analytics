@@ -827,6 +827,11 @@ export class AmoSyncService {
   ) {
     try {
       const lead = await client.get<any>(`/leads/${externalId}`, { with: 'contacts,catalog_elements,loss_reason' });
+      if (!lead?.id) {
+        await this.markWebhookEntityDeleted('leads', externalId, stats);
+        stats.webhookDealsEmpty = (stats.webhookDealsEmpty ?? 0) + 1;
+        return;
+      }
       await this.ensureLeadMetadata(client, maps, lead, stats);
       await this.syncLeadEmbeddedContacts(client, maps, lead, stats);
       await this.upsertDeal(lead, maps);
