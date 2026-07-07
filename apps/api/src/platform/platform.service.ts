@@ -505,27 +505,10 @@ export class PlatformService {
       .map((draft) => this.emailThreadStateData(draft))
       .filter((row): row is Prisma.EmailThreadStateCreateManyInput => Boolean(row));
 
-    await this.prisma.$transaction(async (tx) => {
-      for (const row of rows) {
-        const { dealId, threadId, ...update } = row;
-        await tx.emailThreadState.upsert({
-          where: { dealId_threadId: { dealId, threadId } },
-          create: row,
-          update,
-        });
-      }
-
-      if (rows.length === 0) {
-        await tx.emailThreadState.deleteMany();
-        return;
-      }
-
-      const keys = rows.map((row) => Prisma.sql`(${row.dealId}, ${row.threadId})`);
-      await tx.$executeRaw(Prisma.sql`
-        DELETE FROM "EmailThreadState"
-        WHERE ("dealId", "threadId") NOT IN (${Prisma.join(keys)})
-      `);
-    });
+    await this.prisma.$transaction([
+      this.prisma.emailThreadState.deleteMany(),
+      ...(rows.length ? [this.prisma.emailThreadState.createMany({ data: rows })] : []),
+    ]);
 
     return {
       total: rows.length,
