@@ -8,6 +8,7 @@ import { AmoService } from './amo.service';
 import { AmoSyncMaps } from './amo.types';
 import { AuditService } from '../audit/audit.service';
 import { CrmEventNotificationsService } from '../platform/crm-event-notifications.service';
+import { PlatformService } from '../platform/platform.service';
 
 type SyncJobWithConnection = Prisma.SyncJobGetPayload<{ include: { connection: true } }>;
 type WebhookEventGroup = {
@@ -28,6 +29,7 @@ export class AmoSyncService {
     private readonly amo: AmoService,
     private readonly audit: AuditService,
     private readonly crmEventNotifications: CrmEventNotificationsService,
+    private readonly platform: PlatformService,
     private readonly config: ConfigService,
   ) {}
 
@@ -532,6 +534,8 @@ export class AmoSyncService {
       await this.syncContacts(client, maps, stats, updatedSince);
       await this.syncCompanies(client, maps, stats, updatedSince);
       await this.syncOptional('customers', stats, () => this.syncCustomers(client, maps, stats, updatedSince));
+      await this.touchJob(jobId, 'email_thread_state');
+      await this.rebuildEmailThreadStates(stats);
       if (isFullSync) {
         await this.syncOptional('entityLinks', stats, () => this.syncEntityLinks(client, stats));
         await this.recalculateStageProbabilities();
@@ -628,6 +632,8 @@ export class AmoSyncService {
         const eventSyncFrom = Math.floor((earliestEventAt.getTime() - 5 * 60_000) / 1000);
         await this.syncWebhookRelatedNotes(client, groups, stats, eventSyncFrom);
         await this.syncWebhookRelatedEvents(client, maps, groups, stats, eventSyncFrom);
+        await this.touchJob(jobId, 'email_thread_state');
+        await this.rebuildEmailThreadStates(stats);
         await this.processCrmNotifications(stats, new Date(eventSyncFrom * 1000), client.domain);
       }
 
@@ -693,6 +699,12 @@ export class AmoSyncService {
       where: { id: jobId },
       data: { heartbeatAt: new Date(), cursor: { step } },
     });
+  }
+
+  private async rebuildEmailThreadStates(stats: Record<string, number>) {
+    const result = await this.platform.rebuildEmailThreadStates();
+    stats.emailThreadStates = result.total;
+    stats.pendingEmailThreadStates = result.pending;
   }
 
   private async hydrateMetadataMaps(maps: AmoSyncMaps) {

@@ -45,6 +45,11 @@ export class PlatformController {
     return this.platform.dismissEmailThread(req.user, body);
   }
 
+  @Post('email-threads/rebuild-state')
+  rebuildEmailThreadState(@Req() req: AuthRequest) {
+    return this.platform.rebuildEmailThreadStatesManually(req.user);
+  }
+
   @Post('telegram/link-code')
   createTelegramLinkCode(@Req() req: AuthRequest) {
     return this.platform.createTelegramLinkCode(req.user.id);

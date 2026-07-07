@@ -91,6 +91,18 @@ type EmailThreadDraft = {
   messages: EmailMessageItem[];
 };
 
+type EmailThreadStateView = {
+  dealId: string;
+  threadId: string;
+  lastIncomingNoteExternalId: string | null;
+  lastIncomingAt: Date | null;
+  subject: string | null;
+  summary: string | null;
+  attachCount: number;
+  messages: Prisma.JsonValue;
+  deal: EmailThreadDraft['deal'];
+};
+
 const EMAIL_PIPELINE_GROUPS: Array<{ key: EmailPipelineKey; label: string }> = [
   { key: 'sales', label: 'Продажи' },
   { key: 'base', label: 'База' },
@@ -349,8 +361,42 @@ export class PlatformService {
 
     const now = new Date();
     const domain = await this.resolveAmoDomain();
-    const drafts = await this.buildEmailThreadDrafts();
-    const dealIds = [...new Set(drafts.map((draft) => draft.deal.id))];
+    const states = await this.prisma.emailThreadState.findMany({
+      where: {
+        isPending: true,
+        lastIncomingAt: { not: null },
+        lastIncomingNoteExternalId: { not: null },
+        deal: {
+          deletedAt: null,
+          stage: { isWon: false, isLost: false },
+        },
+      },
+      orderBy: { lastIncomingAt: 'asc' },
+      select: {
+        dealId: true,
+        threadId: true,
+        lastIncomingNoteExternalId: true,
+        lastIncomingAt: true,
+        subject: true,
+        summary: true,
+        attachCount: true,
+        messages: true,
+        deal: {
+          select: {
+            id: true,
+            externalId: true,
+            title: true,
+            amount: true,
+            contactId: true,
+            pipeline: { select: { name: true } },
+            stage: { select: { name: true } },
+            responsible: { select: { name: true, externalId: true, group: { select: { name: true } } } },
+            contact: { select: { externalId: true, name: true, email: true } },
+          },
+        },
+      },
+    });
+    const dealIds = [...new Set(states.map((state) => state.dealId))];
     const dismissals = dealIds.length
       ? await this.prisma.emailThreadDismissal.findMany({
         where: { dealId: { in: dealIds } },
@@ -361,8 +407,8 @@ export class PlatformService {
       dismissals.map((item) => this.emailDismissalKey(item.dealId, item.threadId, item.lastIncomingNoteExternalId)),
     );
 
-    const threads = drafts
-      .map((draft) => this.serializePendingEmailThread(draft, now, domain, dismissedKeys))
+    const threads = states
+      .map((state) => this.serializePendingEmailThreadState(state, now, domain, dismissedKeys))
       .filter((thread): thread is NonNullable<typeof thread> => Boolean(thread))
       .sort((a, b) => a.lastIncomingAt.localeCompare(b.lastIncomingAt));
 
@@ -398,42 +444,19 @@ export class PlatformService {
       throw new BadRequestException('Не хватает данных треда');
     }
 
-    const note = await this.prisma.note.findFirst({
+    const state = await this.prisma.emailThreadState.findFirst({
       where: {
-        externalId: lastIncomingNoteExternalId,
         dealId,
-        type: 'amomail_message',
+        threadId,
+        lastIncomingNoteExternalId,
       },
       select: {
-        externalId: true,
-        createdAt: true,
-        raw: true,
+        lastIncomingAt: true,
       },
     });
-    const params = this.emailNoteParams(note?.raw);
-    let lastIncomingAt = note?.createdAt ?? null;
-    let eventFound = false;
+    const lastIncomingAt = state?.lastIncomingAt ?? null;
 
-    if (note && params.threadId === threadId && params.income === true) {
-      lastIncomingAt = note.createdAt;
-    } else if (lastIncomingNoteExternalId.startsWith('event:')) {
-      const eventExternalId = lastIncomingNoteExternalId.slice('event:'.length);
-      const event = await this.prisma.crmEvent.findFirst({
-        where: { externalId: eventExternalId, type: 'incoming_mail' },
-        select: { createdAt: true, raw: true },
-      });
-      if (event) {
-        const entity = this.emailEventEntity(event.raw);
-        const deal = await this.prisma.deal.findUnique({
-          where: { id: dealId },
-          select: { externalId: true },
-        });
-        eventFound = this.emailEventThreadId(entity, deal?.externalId) === threadId;
-        if (eventFound) lastIncomingAt = event.createdAt;
-      }
-    }
-
-    if (!lastIncomingAt || (!note && !eventFound)) {
+    if (!lastIncomingAt) {
       throw new NotFoundException('Входящее письмо не найдено');
     }
 
@@ -469,6 +492,45 @@ export class PlatformService {
     });
 
     return { ok: true };
+  }
+
+  async rebuildEmailThreadStatesManually(actor: AuthUser) {
+    this.ensureAdmin(actor);
+    return this.rebuildEmailThreadStates();
+  }
+
+  async rebuildEmailThreadStates() {
+    const drafts = await this.buildEmailThreadDrafts();
+    const rows = drafts
+      .map((draft) => this.emailThreadStateData(draft))
+      .filter((row): row is Prisma.EmailThreadStateCreateManyInput => Boolean(row));
+
+    await this.prisma.$transaction(async (tx) => {
+      for (const row of rows) {
+        const { dealId, threadId, ...update } = row;
+        await tx.emailThreadState.upsert({
+          where: { dealId_threadId: { dealId, threadId } },
+          create: row,
+          update,
+        });
+      }
+
+      if (rows.length === 0) {
+        await tx.emailThreadState.deleteMany();
+        return;
+      }
+
+      const keys = rows.map((row) => Prisma.sql`(${row.dealId}, ${row.threadId})`);
+      await tx.$executeRaw(Prisma.sql`
+        DELETE FROM "EmailThreadState"
+        WHERE ("dealId", "threadId") NOT IN (${Prisma.join(keys)})
+      `);
+    });
+
+    return {
+      total: rows.length,
+      pending: rows.filter((row) => row.isPending).length,
+    };
   }
 
   async listTelegramTemplates(actor: AuthUser) {
@@ -2206,6 +2268,115 @@ export class PlatformService {
         });
       }
     }
+  }
+
+  private emailThreadStateData(draft: EmailThreadDraft): Prisma.EmailThreadStateCreateManyInput | null {
+    const messages = [...draft.messages].sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+    const lastMessage = messages[messages.length - 1];
+    if (!lastMessage) return null;
+
+    const incomingMessages = messages.filter((message) => message.direction === 'incoming');
+    const outgoingMessages = messages.filter((message) => message.direction === 'outgoing');
+    const lastIncoming = incomingMessages[incomingMessages.length - 1] ?? null;
+    const lastOutgoing = outgoingMessages[outgoingMessages.length - 1] ?? null;
+    const isPending = Boolean(
+      lastIncoming?.noteExternalId && (!lastOutgoing || lastOutgoing.createdAt <= lastIncoming.createdAt),
+    );
+    const displayMessage = lastIncoming ?? lastMessage;
+
+    return {
+      dealId: draft.deal.id,
+      threadId: draft.threadId,
+      lastIncomingNoteExternalId: lastIncoming?.noteExternalId ?? null,
+      lastIncomingAt: lastIncoming?.createdAt ?? null,
+      lastOutgoingAt: lastOutgoing?.createdAt ?? null,
+      lastMessageAt: lastMessage.createdAt,
+      subject: displayMessage.subject,
+      summary: displayMessage.summary,
+      body: displayMessage.body,
+      from: displayMessage.from,
+      to: displayMessage.to,
+      attachCount: displayMessage.attachCount,
+      deliveryStatus: displayMessage.deliveryStatus,
+      messages: this.emailThreadStateMessages(messages) as Prisma.InputJsonValue,
+      isPending,
+    };
+  }
+
+  private emailThreadStateMessages(messages: EmailMessageItem[]) {
+    return messages.map((message) => ({
+      id: message.id,
+      noteExternalId: message.noteExternalId ?? null,
+      direction: message.direction,
+      createdAt: message.createdAt.toISOString(),
+      subject: message.subject,
+      summary: message.summary,
+      body: message.body,
+      from: message.from,
+      to: message.to,
+      attachCount: message.attachCount,
+      deliveryStatus: message.deliveryStatus,
+      source: message.source,
+    }));
+  }
+
+  private serializePendingEmailThreadState(
+    state: EmailThreadStateView,
+    now: Date,
+    domain: string,
+    dismissedKeys: Set<string>,
+  ) {
+    if (!state.lastIncomingAt || !state.lastIncomingNoteExternalId) return null;
+
+    const dismissalKey = this.emailDismissalKey(state.dealId, state.threadId, state.lastIncomingNoteExternalId);
+    if (dismissedKeys.has(dismissalKey)) return null;
+
+    const pipelineKey = this.emailPipelineKey(state.deal.pipeline?.name);
+    if (!pipelineKey) return null;
+
+    const waitingSeconds = Math.max(0, Math.floor((now.getTime() - state.lastIncomingAt.getTime()) / 1000));
+    return {
+      id: dismissalKey,
+      pipelineKey,
+      dealId: state.deal.id,
+      dealExternalId: state.deal.externalId,
+      title: state.deal.title,
+      amount: Number(state.deal.amount ?? 0),
+      managerName: state.deal.responsible?.name ?? 'Р‘РµР· РјРµРЅРµРґР¶РµСЂР°',
+      groupName: state.deal.responsible?.group?.name ?? '-',
+      pipelineName: state.deal.pipeline?.name ?? '-',
+      stageName: state.deal.stage?.name ?? '-',
+      contactName: state.deal.contact?.name ?? null,
+      contactEmail: state.deal.contact?.email ?? null,
+      threadId: state.threadId,
+      lastIncomingNoteExternalId: state.lastIncomingNoteExternalId,
+      lastIncomingAt: state.lastIncomingAt.toISOString(),
+      waitingSeconds,
+      subject: state.subject,
+      summary: state.summary,
+      attachCount: state.attachCount,
+      dealUrl: this.dealUrl(domain, state.deal.externalId),
+      messages: this.emailThreadMessagesFromState(state.messages),
+    };
+  }
+
+  private emailThreadMessagesFromState(value: Prisma.JsonValue) {
+    if (!Array.isArray(value)) return [];
+    return value
+      .filter((message): message is Record<string, any> => Boolean(message) && typeof message === 'object' && !Array.isArray(message))
+      .map((message) => ({
+        id: String(message.id ?? ''),
+        direction: message.direction === 'outgoing' ? 'outgoing' : 'incoming',
+        createdAt: String(message.createdAt ?? ''),
+        subject: this.cleanEmailText(message.subject),
+        summary: this.cleanEmailText(message.summary),
+        body: typeof message.body === 'string' ? message.body : null,
+        from: this.cleanEmailText(message.from),
+        to: this.cleanEmailText(message.to),
+        attachCount: Math.max(0, Number(message.attachCount ?? 0) || 0),
+        deliveryStatus: this.cleanEmailText(message.deliveryStatus),
+        source: message.source === 'event' ? 'event' : 'note',
+      }));
   }
 
   private serializePendingEmailThread(
