@@ -2333,7 +2333,7 @@ export class PlatformService {
       dealExternalId: state.deal.externalId,
       title: state.deal.title,
       amount: Number(state.deal.amount ?? 0),
-      managerName: state.deal.responsible?.name ?? 'Р‘РµР· РјРµРЅРµРґР¶РµСЂР°',
+      managerName: state.deal.responsible?.name ?? 'Без менеджера',
       managerExternalId: state.deal.responsible?.externalId ?? null,
       groupName: state.deal.responsible?.group?.name ?? '-',
       pipelineName: state.deal.pipeline?.name ?? '-',
