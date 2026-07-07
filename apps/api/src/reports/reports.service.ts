@@ -618,6 +618,7 @@ export class ReportsService {
     const csmPipelines = [refs.basePipeline.id, refs.assignedPipeline.id];
     const csmOfferStageIds = [refs.baseStages.offer.id, refs.assignedStages.offer.id];
     const csmInvoiceStageIds = [refs.baseStages.invoice.id, refs.assignedStages.invoice.id];
+    const assemblyStageIds = refs.assemblyStages.map((stage) => stage.id);
     const funnelMetrics: DataContractMetric[] = [
       metric('taken_to_work', 'Взяли в работу', [refs.baseStages.work.id, refs.assignedStages.work.id]),
       conversion('conv_work_to_offer', 'Конверсия в КП', 'taken_to_work', 'offer_made'),
@@ -684,11 +685,36 @@ export class ReportsService {
         formula: '[Сумма счетов] * 0.9',
       },
       {
+        id: 'count_assembly',
+        label: 'Сделок в сборке',
+        type: 'current_stage',
+        measure: 'deal_count',
+        display: 'number',
+        pipelineId: refs.assemblyPipeline?.id ?? '',
+        stageIds: assemblyStageIds,
+      },
+      {
+        id: 'sum_assembly',
+        label: 'Сумма сборки',
+        type: 'current_stage',
+        measure: 'field_sum',
+        display: 'money',
+        pipelineId: refs.assemblyPipeline?.id ?? '',
+        stageIds: assemblyStageIds,
+      },
+      {
+        id: 'weighted_assembly',
+        label: 'Сборка x 100%',
+        type: 'formula',
+        display: 'money',
+        formula: '[Сумма сборки]',
+      },
+      {
         id: 'weighted_total',
         label: 'Итого взвешенно',
         type: 'formula',
         display: 'money',
-        formula: '[КП x 30%] + [Счета x 90%]',
+        formula: '[КП x 30%] + [Счета x 90%] + [Сборка x 100%]',
       },
     ];
 
@@ -747,8 +773,8 @@ export class ReportsService {
         config: baseConfig('csm_weighted_funnel', 101, {
           metric: 'contract',
           display: 'table',
-          description: 'Взвешенная сумма по КП и счетам CSM',
-          conditionLabel: 'База + Закрепленные компании: КП x 30%, счета x 90%',
+          description: 'Взвешенная сумма по КП, счетам и сборке CSM',
+          conditionLabel: 'База + Закрепленные компании: КП x 30%, счета x 90%, сборка x 100%',
           filters: { pipelineIds: csmPipelines, groupIds: [refs.csmGroup.id] },
           contract: weightedContract,
           size: 'lg',
@@ -3137,6 +3163,7 @@ ${sheets}
 
     const basePipeline = pipelineByExactName('база');
     const assignedPipeline = pipelineByName('закреплен');
+    const assemblyPipeline = pipelineByName('воронка сборка') ?? pipelineByName('сборка');
     const csmGroup = await this.findCrmGroupByName('CSM');
     if (!basePipeline || !assignedPipeline || !csmGroup) return null;
 
@@ -3157,10 +3184,18 @@ ${sheets}
     const baseStages = resolveStages(basePipeline.stages);
     const assignedStages = resolveStages(assignedPipeline.stages);
     if (!baseStages || !assignedStages) return null;
+    const assemblyStages = (assemblyPipeline?.stages ?? [])
+      .filter((stage) => !this.isBusinessWonStage(stage) && !this.isBusinessLostStage(stage))
+      .filter((stage) => {
+        const name = this.normalizeStageName(stage.name);
+        return !name.includes('dispatched / not fully paid') && !name.includes('partially dispatched');
+      });
 
     return {
       basePipeline,
       assignedPipeline,
+      assemblyPipeline,
+      assemblyStages,
       baseStages,
       assignedStages,
       csmGroup,
