@@ -2170,11 +2170,42 @@ export class PlatformService {
       }
     }
 
+    this.closeEmailDraftsByDealReplies(draftsByDealId);
+
     for (const draft of drafts.values()) {
       draft.messages.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
     }
 
     return [...drafts.values()];
+  }
+
+  private closeEmailDraftsByDealReplies(draftsByDealId: Map<string, EmailThreadDraft[]>) {
+    for (const dealDrafts of draftsByDealId.values()) {
+      const outgoingMessages = dealDrafts
+        .flatMap((draft) => draft.messages.filter((message) => message.direction === 'outgoing'))
+        .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+
+      if (!outgoingMessages.length) continue;
+
+      for (const draft of dealDrafts) {
+        const incomingMessages = draft.messages.filter((message) => message.direction === 'incoming');
+        const lastIncoming = incomingMessages[incomingMessages.length - 1];
+        if (!lastIncoming) continue;
+
+        const hasLaterOutgoing = draft.messages.some(
+          (message) => message.direction === 'outgoing' && message.createdAt > lastIncoming.createdAt,
+        );
+        if (hasLaterOutgoing) continue;
+
+        const closingOutgoing = outgoingMessages.find((message) => message.createdAt > lastIncoming.createdAt);
+        if (!closingOutgoing) continue;
+
+        draft.messages.push({
+          ...closingOutgoing,
+          id: `${closingOutgoing.id}:closes:${draft.threadId}`,
+        });
+      }
+    }
   }
 
   private serializePendingEmailThread(
