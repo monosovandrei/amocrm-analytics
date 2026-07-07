@@ -288,6 +288,49 @@ export class AmoSyncService {
     return result;
   }
 
+  async syncRecentEmailNotes() {
+    const connection = await this.amo.getActiveConnectionOrFail();
+    if (!connection.lastFullSyncAt) return { status: 'waiting_initial_snapshot' };
+
+    const client = await this.amo.getClient(connection);
+    const stats: Record<string, number> = {};
+    const startedAt = new Date();
+    const connectionConfig = this.connectionConfig(connection);
+    const cursor =
+      this.parseConfigDate(connectionConfig.emailNotesSyncedAt) ??
+      new Date(Date.now() - this.getEmailNotesInitialLookbackDays() * 86_400_000);
+    const updatedSince = Math.floor((cursor.getTime() - 5 * 60_000) / 1000);
+
+    try {
+      await this.syncEmailNotes(client, stats, updatedSince);
+      const state = await this.platform.rebuildEmailThreadStates();
+      await this.prisma.amoConnection.update({
+        where: { id: connection.id },
+        data: {
+          config: {
+            ...connectionConfig,
+            emailNotesSyncedAt: startedAt.toISOString(),
+            emailNotesSyncError: null,
+            emailNotesSyncErrorAt: null,
+          },
+        },
+      });
+      return { status: 'ok', stats: { ...stats, emailThreadStates: state.total, pendingEmailThreadStates: state.pending } };
+    } catch (error: any) {
+      await this.prisma.amoConnection.update({
+        where: { id: connection.id },
+        data: {
+          config: {
+            ...connectionConfig,
+            emailNotesSyncError: String(error?.message ?? error),
+            emailNotesSyncErrorAt: new Date().toISOString(),
+          },
+        },
+      });
+      throw error;
+    }
+  }
+
   async getHealth() {
     const connection = await this.prisma.amoConnection.findFirst({ orderBy: { createdAt: 'desc' } });
     if (!connection) {
@@ -447,6 +490,13 @@ export class AmoSyncService {
     if (!rawInterval) return 0;
     const parsed = Number(rawInterval);
     return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
+  }
+
+  private getEmailNotesInitialLookbackDays() {
+    const rawDays = this.config.get<string>('AMOCRM_EMAIL_NOTES_INITIAL_LOOKBACK_DAYS');
+    if (!rawDays) return 7;
+    const parsed = Number(rawDays);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 7;
   }
 
   private connectionConfig(connection: AmoConnection) {
@@ -751,11 +801,12 @@ export class AmoSyncService {
 
     for (const event of events) {
       const entity = this.normalizeWebhookEntity(event.entity);
-      const key = `${entity}:${event.externalId ?? event.id}`;
+      const externalId = event.externalId ?? this.webhookPayloadExternalId(event.action, event.payload);
+      const key = `${entity}:${externalId ?? event.id}`;
       const group = groups.get(key) ?? {
         ids: [],
         entity,
-        externalId: event.externalId,
+        externalId,
         actions: new Set<string>(),
         payloads: [],
       };
@@ -779,6 +830,17 @@ export class AmoSyncService {
     if (normalized.includes('compan')) return 'companies';
     if (normalized.includes('customer')) return 'customers';
     return normalized;
+  }
+
+  private webhookPayloadExternalId(action: string, payload: Prisma.JsonValue) {
+    const normalizedAction = String(action ?? '').toLowerCase();
+    if (!normalizedAction.includes('note') || !payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
+    const item = payload as Record<string, any>;
+    const note = item.note && typeof item.note === 'object' && !Array.isArray(item.note)
+      ? item.note as Record<string, any>
+      : null;
+    const id = note?.element_id ?? note?.entity_id ?? item.element_id ?? item.entity_id;
+    return id == null ? null : String(id);
   }
 
   private async processWebhookGroup(
@@ -2116,6 +2178,31 @@ export class AmoSyncService {
       }
     }
     stats.notes = total;
+  }
+
+  private async syncEmailNotes(client: AmoClient, stats: Record<string, number>, updatedSince?: number) {
+    const params: Record<string, string | number> = {};
+    if (updatedSince) params['filter[updated_at][from]'] = updatedSince;
+
+    let total = 0;
+    let emailTotal = 0;
+    for (const source of ['leads', 'contacts']) {
+      try {
+        await client.paginateBatch<any>(`/${source}/notes`, 'notes', params, async (notes) => {
+          for (const note of notes) {
+            total += 1;
+            if (note.note_type !== 'amomail_message') continue;
+            await this.upsertNote(source, note);
+            emailTotal += 1;
+          }
+        });
+      } catch (error: any) {
+        stats[`${source}EmailNotesErrors`] = (stats[`${source}EmailNotesErrors`] ?? 0) + 1;
+        this.logger.warn(`${source} email notes sync skipped: ${error.message}`);
+      }
+    }
+    stats.emailNotesScanned = total;
+    stats.emailNotes = emailTotal;
   }
 
   private async syncWebhookRelatedNotes(

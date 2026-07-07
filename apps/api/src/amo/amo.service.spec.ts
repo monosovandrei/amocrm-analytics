@@ -40,7 +40,7 @@ describe('AmoService webhook parsing', () => {
       {
         entity: 'contacts',
         action: 'note',
-        externalId: null,
+        externalId: '40700289',
         payload: {
           note: {
             id: '60864725',

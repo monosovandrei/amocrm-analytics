@@ -10,6 +10,7 @@ export class AmoSchedulerService {
   private readonly logger = new Logger(AmoSchedulerService.name);
   private webhookBusy = false;
   private webhookSubscriptionBusy = false;
+  private emailNotesBusy = false;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -74,6 +75,32 @@ export class AmoSchedulerService {
   }
 
   @Interval(60_000)
+  async syncRecentEmailNotes() {
+    if (this.emailNotesBusy) return;
+    const intervalSeconds = this.getEmailNotesSyncIntervalSeconds();
+    if (intervalSeconds <= 0) return;
+
+    const connection = await this.prisma.amoConnection.findFirst({
+      where: { status: { in: ['ACTIVE', 'ERROR', 'SYNCING'] } },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (!connection?.lastFullSyncAt) return;
+
+    const lastSyncedAt = this.getConfigDate(connection.config, 'emailNotesSyncedAt');
+    const due = !lastSyncedAt || Date.now() - lastSyncedAt.getTime() >= intervalSeconds * 1000;
+    if (!due) return;
+
+    this.emailNotesBusy = true;
+    try {
+      await this.sync.syncRecentEmailNotes();
+    } catch (error: any) {
+      this.logger.warn(`Recent amoCRM email notes sync failed: ${error.message}`);
+    } finally {
+      this.emailNotesBusy = false;
+    }
+  }
+
+  @Interval(60_000)
   async ensureWebhookSubscription() {
     if (this.webhookSubscriptionBusy) return;
     const checkIntervalMinutes = this.getWebhookSubscriptionCheckMinutes();
@@ -113,6 +140,14 @@ export class AmoSchedulerService {
 
     const parsed = Number(rawInterval);
     return Number.isFinite(parsed) ? Math.max(0, parsed) : 10;
+  }
+
+  private getEmailNotesSyncIntervalSeconds() {
+    const rawInterval = this.config.get<string>('AMOCRM_EMAIL_NOTES_SYNC_INTERVAL_SECONDS');
+    if (!rawInterval) return 60;
+
+    const parsed = Number(rawInterval);
+    return Number.isFinite(parsed) ? Math.max(0, parsed) : 60;
   }
 
   private getConfigDate(config: unknown, key: string) {

@@ -288,7 +288,10 @@ export class AmoService {
     const normalizedEntity = String(entity ?? '').toLowerCase();
     const normalizedAction = String(action ?? '').toLowerCase();
     if (normalizedAction.includes('note')) {
-      return item.element_id ?? item.entity_id ?? item.lead_id ?? item.contact_id ?? item.company_id ?? item.customer_id ?? item.id ?? null;
+      const note = item.note && typeof item.note === 'object' && !Array.isArray(item.note)
+        ? item.note as Record<string, any>
+        : null;
+      return note?.element_id ?? note?.entity_id ?? item.element_id ?? item.entity_id ?? item.lead_id ?? item.contact_id ?? item.company_id ?? item.customer_id ?? null;
     }
     if (normalizedEntity.includes('task')) return item.task_id ?? item.id ?? item.entity_id ?? null;
     return item.id ?? item.uid ?? item.entity_id ?? item.task_id ?? item.element_id ?? null;
