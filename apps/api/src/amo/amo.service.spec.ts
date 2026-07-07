@@ -82,4 +82,35 @@ describe('AmoService webhook parsing', () => {
       },
     ]);
   });
+
+  it('uses contact_id for incoming message webhooks', () => {
+    const events = service.flattenWebhook({
+      message: {
+        add: [
+          {
+            id: 'amo12345-31ed-41af-am23-conf1504',
+            contact_id: '3372695',
+            element_id: '123456789',
+            element_type: '1',
+            text: 'Hello World!',
+          },
+        ],
+      },
+    });
+
+    expect(events).toEqual([
+      {
+        entity: 'message',
+        action: 'add',
+        externalId: '3372695',
+        payload: {
+          id: 'amo12345-31ed-41af-am23-conf1504',
+          contact_id: '3372695',
+          element_id: '123456789',
+          element_type: '1',
+          text: 'Hello World!',
+        },
+      },
+    ]);
+  });
 });

@@ -287,6 +287,7 @@ export class AmoService {
   private webhookExternalId(entity: string, action: string, item: Record<string, any>) {
     const normalizedEntity = String(entity ?? '').toLowerCase();
     const normalizedAction = String(action ?? '').toLowerCase();
+    if (normalizedEntity.includes('message')) return item.contact_id ?? item.element_id ?? null;
     if (normalizedAction.includes('note')) {
       const note = item.note && typeof item.note === 'object' && !Array.isArray(item.note)
         ? item.note as Record<string, any>

@@ -827,6 +827,7 @@ export class AmoSyncService {
     if (normalized.includes('lead')) return 'leads';
     if (normalized.includes('task')) return 'tasks';
     if (normalized.includes('contact')) return 'contacts';
+    if (normalized.includes('message')) return 'contacts';
     if (normalized.includes('compan')) return 'companies';
     if (normalized.includes('customer')) return 'customers';
     return normalized;
@@ -834,8 +835,10 @@ export class AmoSyncService {
 
   private webhookPayloadExternalId(action: string, payload: Prisma.JsonValue) {
     const normalizedAction = String(action ?? '').toLowerCase();
-    if (!normalizedAction.includes('note') || !payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
     const item = payload as Record<string, any>;
+    if (item.contact_id != null) return String(item.contact_id);
+    if (!normalizedAction.includes('note')) return null;
     const note = item.note && typeof item.note === 'object' && !Array.isArray(item.note)
       ? item.note as Record<string, any>
       : null;
@@ -1159,6 +1162,8 @@ export class AmoSyncService {
       'delete_customer',
       'responsible_customer',
       'note_customer',
+      'add_message',
+      'add_outgoing_message',
       'add_task',
       'update_task',
       'delete_task',
