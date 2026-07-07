@@ -220,6 +220,7 @@ type PendingEmailThread = {
   title: string;
   amount: number;
   managerName: string;
+  managerExternalId?: string | null;
   groupName: string;
   pipelineName: string;
   stageName: string;
@@ -3686,6 +3687,7 @@ function EmailThreadsTab({ onMessage }: { onMessage: (message: string) => void }
   const [error, setError] = useState('');
   const [activeGroupKey, setActiveGroupKey] = useState<EmailPipelineKey>('sales');
   const [selectedThreadId, setSelectedThreadId] = useState('');
+  const [selectedManagerKeys, setSelectedManagerKeys] = useState<string[]>([]);
   const [closingId, setClosingId] = useState('');
   const [nowMs, setNowMs] = useState(() => Date.now());
 
@@ -3714,11 +3716,26 @@ function EmailThreadsTab({ onMessage }: { onMessage: (message: string) => void }
 
   const groups = useMemo(() => (data ? normalizeEmailThreadGroups(data) : []), [data]);
   const activeGroup = groups.find((group) => group.key === activeGroupKey) ?? groups[0] ?? null;
-  const threads = activeGroup?.threads ?? [];
+  const activeGroupThreads = activeGroup?.threads ?? [];
+  const managerFilters = useMemo(() => buildEmailManagerFilters(activeGroupThreads), [activeGroupThreads]);
+  const threads = useMemo(
+    () => selectedManagerKeys.length
+      ? activeGroupThreads.filter((thread) => selectedManagerKeys.includes(emailManagerKey(thread)))
+      : activeGroupThreads,
+    [activeGroupThreads, selectedManagerKeys],
+  );
   const selectedThread = useMemo(
     () => threads.find((thread) => thread.id === selectedThreadId) ?? threads[0] ?? null,
     [threads, selectedThreadId],
   );
+
+  useEffect(() => {
+    const availableKeys = new Set(managerFilters.map((manager) => manager.key));
+    setSelectedManagerKeys((current) => {
+      const next = current.filter((key) => availableKeys.has(key));
+      return next.length === current.length ? current : next;
+    });
+  }, [managerFilters]);
 
   useEffect(() => {
     if (!threads.length) {
@@ -3782,14 +3799,32 @@ function EmailThreadsTab({ onMessage }: { onMessage: (message: string) => void }
         </div>
       )}
 
+      {data && activeGroupThreads.length > 0 && (
+        <EmailManagerFilter
+          managers={managerFilters}
+          selectedKeys={selectedManagerKeys}
+          total={activeGroupThreads.length}
+          visibleTotal={threads.length}
+          onChange={setSelectedManagerKeys}
+        />
+      )}
+
       {loading && !data ? (
         <div className="card p-5 text-sm text-[var(--pb-text-secondary)]">Загрузка писем...</div>
-      ) : threads.length === 0 ? (
+      ) : activeGroupThreads.length === 0 ? (
         <div className="empty-state">
           <Mail size={24} />
           <div>
             <strong>В этой воронке нет писем без ответа</strong>
             <span>Входящие письма закрыты ответом или пометкой РОПа.</span>
+          </div>
+        </div>
+      ) : threads.length === 0 ? (
+        <div className="empty-state">
+          <Filter size={24} />
+          <div>
+            <strong>По выбранным менеджерам писем нет</strong>
+            <span>Сбросьте фильтр или выберите другого менеджера.</span>
           </div>
         </div>
       ) : (
@@ -3887,6 +3922,83 @@ function buildEmailThreadSummary(threads: PendingEmailThread[]) {
     olderThan4h: threads.filter((thread) => thread.waitingSeconds >= 4 * 60 * 60).length,
     olderThan24h: threads.filter((thread) => thread.waitingSeconds >= 24 * 60 * 60).length,
   };
+}
+
+type EmailManagerFilterOption = {
+  key: string;
+  name: string;
+  count: number;
+};
+
+function EmailManagerFilter({
+  managers,
+  onChange,
+  selectedKeys,
+  total,
+  visibleTotal,
+}: {
+  managers: EmailManagerFilterOption[];
+  onChange: (keys: string[]) => void;
+  selectedKeys: string[];
+  total: number;
+  visibleTotal: number;
+}) {
+  function toggle(key: string, checked: boolean) {
+    onChange(checked ? [...selectedKeys, key] : selectedKeys.filter((item) => item !== key));
+  }
+
+  return (
+    <section className="email-manager-filter" aria-label="Фильтр писем по менеджерам">
+      <div className="email-manager-filter-head">
+        <div className="email-manager-filter-title">
+          <Filter size={15} />
+          <span>Менеджеры</span>
+        </div>
+        <div className="email-manager-filter-total">
+          {selectedKeys.length ? `${visibleTotal} из ${total}` : `${total} всего`}
+        </div>
+      </div>
+      <div className="email-manager-options">
+        <button
+          className={`email-manager-option ${selectedKeys.length === 0 ? 'active' : ''}`}
+          type="button"
+          onClick={() => onChange([])}
+        >
+          <span>Все менеджеры</span>
+          <strong>{total}</strong>
+        </button>
+        {managers.map((manager) => (
+          <label key={manager.key} className={`email-manager-option ${selectedKeys.includes(manager.key) ? 'active' : ''}`}>
+            <input
+              checked={selectedKeys.includes(manager.key)}
+              type="checkbox"
+              onChange={(event) => toggle(manager.key, event.target.checked)}
+            />
+            <span>{manager.name}</span>
+            <strong>{manager.count}</strong>
+          </label>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function buildEmailManagerFilters(threads: PendingEmailThread[]): EmailManagerFilterOption[] {
+  const managers = new Map<string, EmailManagerFilterOption>();
+  for (const thread of threads) {
+    const key = emailManagerKey(thread);
+    const existing = managers.get(key);
+    if (existing) {
+      existing.count += 1;
+      continue;
+    }
+    managers.set(key, { key, name: thread.managerName || 'Без менеджера', count: 1 });
+  }
+  return [...managers.values()].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name, 'ru'));
+}
+
+function emailManagerKey(thread: PendingEmailThread) {
+  return thread.managerExternalId ? `crm:${thread.managerExternalId}` : `name:${thread.managerName || 'Без менеджера'}`;
 }
 
 function EmailMessageRow({ message }: { message: PendingEmailMessage }) {

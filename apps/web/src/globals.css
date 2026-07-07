@@ -1785,6 +1785,103 @@ button:disabled {
   font-weight: 850;
 }
 
+.email-manager-filter {
+  display: grid;
+  gap: 9px;
+  border: 1px solid var(--pb-border);
+  border-radius: 8px;
+  background: var(--pb-surface);
+  padding: 10px;
+}
+
+.email-manager-filter-head {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.email-manager-filter-title {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+  color: var(--pb-text-primary);
+  font-size: 13px;
+  font-weight: 850;
+}
+
+.email-manager-filter-title svg {
+  flex: 0 0 auto;
+  color: var(--pb-primary);
+}
+
+.email-manager-filter-total {
+  flex: 0 0 auto;
+  color: var(--pb-text-secondary);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 800;
+}
+
+.email-manager-options {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.email-manager-option {
+  display: inline-flex;
+  min-width: 0;
+  max-width: 240px;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--pb-border);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--pb-text-primary);
+  padding: 7px 9px;
+  text-align: left;
+}
+
+.email-manager-option:hover,
+.email-manager-option:focus-visible {
+  background: var(--pb-surface-hover);
+  outline: none;
+}
+
+.email-manager-option.active {
+  border-color: var(--pb-primary);
+  background: var(--pb-surface-hover);
+}
+
+.email-manager-option input {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  margin: 0;
+}
+
+.email-manager-option span {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.email-manager-option strong {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--pb-text-secondary);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 850;
+}
+
 .email-watch-layout {
   display: grid;
   grid-template-columns: minmax(280px, 390px) minmax(0, 1fr);
@@ -2631,6 +2728,22 @@ button:disabled {
   }
 
   .email-watch-tab {
+    width: 100%;
+  }
+
+  .email-manager-filter-head {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 5px;
+  }
+
+  .email-manager-options {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .email-manager-option {
+    max-width: none;
     width: 100%;
   }
 
