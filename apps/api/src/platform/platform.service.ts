@@ -407,7 +407,15 @@ export class PlatformService {
       dismissals.map((item) => this.emailDismissalKey(item.dealId, item.threadId, item.lastIncomingNoteExternalId)),
     );
 
-    const threads = states
+    const latestStatesByDealId = new Map<string, (typeof states)[number]>();
+    for (const state of states) {
+      const current = latestStatesByDealId.get(state.dealId);
+      if (!current || (state.lastIncomingAt?.getTime() ?? 0) > (current.lastIncomingAt?.getTime() ?? 0)) {
+        latestStatesByDealId.set(state.dealId, state);
+      }
+    }
+
+    const threads = [...latestStatesByDealId.values()]
       .map((state) => this.serializePendingEmailThreadState(state, now, domain, dismissedKeys))
       .filter((thread): thread is NonNullable<typeof thread> => Boolean(thread))
       .sort((a, b) => a.lastIncomingAt.localeCompare(b.lastIncomingAt));
