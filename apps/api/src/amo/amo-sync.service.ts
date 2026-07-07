@@ -436,8 +436,13 @@ export class AmoSyncService {
     const webhookSubscriptionStale =
       syncMode === 'WEBHOOK' &&
       (!webhookSubscriptionEnsuredAt || webhookSubscriptionLagSeconds === null || webhookSubscriptionLagSeconds > 30 * 60);
+    const webhookArrivedAfterSubscriptionError =
+      Boolean(lastWebhook?.receivedAt) &&
+      Boolean(webhookSubscriptionErrorAt) &&
+      lastWebhook!.receivedAt.getTime() >= webhookSubscriptionErrorAt!.getTime();
     const hasWebhookSubscriptionProblem =
-      syncMode === 'WEBHOOK' && (webhookSubscriptionStale || Boolean(webhookSubscriptionError));
+      syncMode === 'WEBHOOK' &&
+      (webhookSubscriptionStale || (Boolean(webhookSubscriptionError) && !webhookArrivedAfterSubscriptionError));
     const hasBlockingError = connection.status === 'ERROR' && lastJob?.status !== 'RUNNING';
     const webhookLagSeconds = oldestPendingWebhook
       ? Math.max(0, Math.floor((Date.now() - oldestPendingWebhook.receivedAt.getTime()) / 1000))
