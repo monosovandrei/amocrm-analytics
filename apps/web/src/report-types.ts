@@ -25,6 +25,7 @@ export type ContractMetricType =
   | 'field_changed'
   | 'conversion'
   | 'formula'
+  | 'weighted_stage_sum'
   | 'task_count';
 export type ContractMeasure = 'deal_count' | 'field_sum' | 'field_avg';
 export type ContractDisplay = 'number' | 'money' | 'percent';
@@ -220,6 +221,9 @@ export interface ContractMetricDraft {
   fromMetricId: string;
   toMetricId: string;
   formula: string;
+  successStageId?: string;
+  successStageByPipelineId?: Record<string, string>;
+  defaultProbability?: number;
   extraFilters: ContractFilterDraft[];
 }
 
@@ -266,6 +270,9 @@ export interface ContractMetricPayload {
   amountFieldId?: string;
   marginFieldId?: string;
   formula?: string;
+  successStageId?: string;
+  successStageByPipelineId?: Record<string, string>;
+  defaultProbability?: number;
   extraFilters?: Array<{
     id?: string;
     subject: ContractFilterSubject;

@@ -2826,4 +2826,12 @@ button:disabled {
   .revenue-forecast-table {
     min-width: 760px;
   }
+
+  .report-matrix-wrap {
+    overflow-x: auto;
+  }
+
+  .report-matrix {
+    min-width: 520px;
+  }
 }

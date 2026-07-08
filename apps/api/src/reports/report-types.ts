@@ -40,6 +40,7 @@ export interface DataContractMetric {
     | 'field_changed'
     | 'conversion'
     | 'formula'
+    | 'weighted_stage_sum'
     | 'task_count';
   measure?: 'deal_count' | 'field_sum' | 'field_avg';
   display?: 'number' | 'money' | 'percent';
@@ -55,6 +56,9 @@ export interface DataContractMetric {
   amountFieldId?: string;
   marginFieldId?: string;
   formula?: string;
+  successStageId?: string;
+  successStageByPipelineId?: Record<string, string>;
+  defaultProbability?: number;
   extraFilters?: DataContractFilter[];
   createdWithinAmount?: number;
   createdWithinUnit?: 'hours' | 'days' | 'weeks' | 'months';

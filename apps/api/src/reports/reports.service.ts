@@ -38,6 +38,8 @@ type ContractDealSample = {
   dealExternalId?: string | null;
   dealTitle: string;
   amount: number | null;
+  expectedAmount?: number | null;
+  probabilityPercent?: number | null;
   stageName?: string | null;
   pipelineName?: string | null;
   updatedAt?: string | null;
@@ -50,6 +52,28 @@ type ContractBucket = {
   value: number | null;
   unit: string;
 };
+type StageSuccessProbability = {
+  probability: number;
+  source: 'personal' | 'blended' | 'team' | 'default';
+  personalSample: number;
+  teamSample: number;
+  personalWins: number;
+  teamWins: number;
+  personalRate: number | null;
+  teamRate: number | null;
+};
+type StageSuccessProbabilityModel = {
+  probability: (stageId: string, managerId?: string | null) => StageSuccessProbability;
+};
+type RevenueForecastBucketKey =
+  | 'salesShippingThisMonth'
+  | 'salesInvoiceThisMonth'
+  | 'salesQuoteThisMonth'
+  | 'salesNotThisMonth'
+  | 'repeatShippingThisMonth'
+  | 'repeatInvoiceThisMonth'
+  | 'repeatQuoteThisMonth'
+  | 'repeatNotThisMonth';
 
 function stableStringify(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
@@ -466,15 +490,52 @@ export class ReportsService {
         formula: '[Сумма оплат] / [Оплаты получили]',
       },
     ];
-    const weightedQuoteStageIds = [refs.stages.kp, refs.stages.objections].filter(Boolean).map((stage) => stage!.id);
     const assemblyStageIds = refs.assemblyStages.map((stage) => stage.id);
+    const weightedTotalParts = [
+      '[КП презентовано x конверсия]',
+      ...(refs.stages.objections ? ['[Есть возражения x конверсия]'] : []),
+      '[Счета x конверсия]',
+      '[Сборка x 100%]',
+    ];
     const weightedMetrics: DataContractMetric[] = [
-      currentStageMetric('count_kp', 'Сделок в КП', weightedQuoteStageIds),
-      currentStageMetric('sum_kp', 'Сумма КП', weightedQuoteStageIds, 'money', 'field_sum'),
-      { id: 'weighted_kp', label: 'КП x 30%', type: 'formula', display: 'money', formula: '[Сумма КП] * 0.3' },
+      currentStageMetric('count_kp', 'Сделок в КП презентовано', [refs.stages.kp.id]),
+      currentStageMetric('sum_kp', 'Сумма КП презентовано', [refs.stages.kp.id], 'money', 'field_sum'),
+      {
+        id: 'weighted_kp',
+        label: 'КП презентовано x конверсия',
+        type: 'weighted_stage_sum',
+        display: 'money',
+        pipelineId: refs.salesPipeline.id,
+        stageIds: [refs.stages.kp.id],
+        successStageId: refs.stages.paid.id,
+        defaultProbability: 0.3,
+      },
+      ...(refs.stages.objections ? [
+        currentStageMetric('count_objections', 'Сделок в возражениях', [refs.stages.objections.id]),
+        currentStageMetric('sum_objections', 'Сумма возражений', [refs.stages.objections.id], 'money', 'field_sum'),
+        {
+          id: 'weighted_objections',
+          label: 'Есть возражения x конверсия',
+          type: 'weighted_stage_sum',
+          display: 'money',
+          pipelineId: refs.salesPipeline.id,
+          stageIds: [refs.stages.objections.id],
+          successStageId: refs.stages.paid.id,
+          defaultProbability: 0.3,
+        } satisfies DataContractMetric,
+      ] : []),
       currentStageMetric('count_invoice', 'Сделок в счетах', [refs.stages.invoice.id]),
       currentStageMetric('sum_invoice', 'Сумма счетов', [refs.stages.invoice.id], 'money', 'field_sum'),
-      { id: 'weighted_invoice', label: 'Счета x 90%', type: 'formula', display: 'money', formula: '[Сумма счетов] * 0.9' },
+      {
+        id: 'weighted_invoice',
+        label: 'Счета x конверсия',
+        type: 'weighted_stage_sum',
+        display: 'money',
+        pipelineId: refs.salesPipeline.id,
+        stageIds: [refs.stages.invoice.id],
+        successStageId: refs.stages.paid.id,
+        defaultProbability: 0.9,
+      },
       currentStageMetric('count_assembly', 'Сделок в сборке', assemblyStageIds, 'number', 'deal_count', refs.assemblyPipeline?.id ?? ''),
       currentStageMetric('sum_assembly', 'Сумма сборки', assemblyStageIds, 'money', 'field_sum', refs.assemblyPipeline?.id ?? ''),
       { id: 'weighted_assembly', label: 'Сборка x 100%', type: 'formula', display: 'money', formula: '[Сумма сборки]' },
@@ -635,6 +696,10 @@ export class ReportsService {
     const csmPipelines = [refs.basePipeline.id, refs.assignedPipeline.id];
     const csmOfferStageIds = [refs.baseStages.offer.id, refs.assignedStages.offer.id];
     const csmInvoiceStageIds = [refs.baseStages.invoice.id, refs.assignedStages.invoice.id];
+    const csmSuccessStageByPipelineId = {
+      [refs.basePipeline.id]: refs.baseStages.paid.id,
+      [refs.assignedPipeline.id]: refs.assignedStages.paid.id,
+    };
     const assemblyStageIds = refs.assemblyStages.map((stage) => stage.id);
     const funnelMetrics: DataContractMetric[] = [
       metric('taken_to_work', 'Взяли в работу', [refs.baseStages.work.id, refs.assignedStages.work.id]),
@@ -673,10 +738,12 @@ export class ReportsService {
       },
       {
         id: 'weighted_kp',
-        label: 'КП x 30%',
-        type: 'formula',
+        label: 'КП x конверсия',
+        type: 'weighted_stage_sum',
         display: 'money',
-        formula: '[Сумма КП] * 0.3',
+        stageIds: csmOfferStageIds,
+        successStageByPipelineId: csmSuccessStageByPipelineId,
+        defaultProbability: 0.3,
       },
       {
         id: 'count_invoice',
@@ -696,10 +763,12 @@ export class ReportsService {
       },
       {
         id: 'weighted_invoice',
-        label: 'Счета x 90%',
-        type: 'formula',
+        label: 'Счета x конверсия',
+        type: 'weighted_stage_sum',
         display: 'money',
-        formula: '[Сумма счетов] * 0.9',
+        stageIds: csmInvoiceStageIds,
+        successStageByPipelineId: csmSuccessStageByPipelineId,
+        defaultProbability: 0.9,
       },
       {
         id: 'count_assembly',
@@ -731,7 +800,7 @@ export class ReportsService {
         label: 'Итого взвешенно',
         type: 'formula',
         display: 'money',
-        formula: '[КП x 30%] + [Счета x 90%] + [Сборка x 100%]',
+        formula: '[КП x конверсия] + [Счета x конверсия] + [Сборка x 100%]',
       },
     ];
 
@@ -1238,7 +1307,10 @@ ${sheets}
         continue;
       }
 
-      const deals = await this.findDealsForContractMetric(metric, filters, role);
+      let deals = await this.findDealsForContractMetric(metric, filters, role);
+      if (metric.type === 'weighted_stage_sum') {
+        deals = await this.attachWeightedStageValues(deals, metric);
+      }
 
       for (const deal of deals) {
         const group = this.contractGroup(deal, groupBy);
@@ -1580,7 +1652,7 @@ ${sheets}
       return applyMetricFilters(await this.findDealsByIds(dealIds));
     }
 
-    if (metric.type === 'current_stage') {
+    if (metric.type === 'current_stage' || metric.type === 'weighted_stage_sum') {
       const stageIds = metric.stageIds?.filter(Boolean) ?? [];
       if (stageIds.length === 0) return [];
       return applyMetricFilters(await this.findFilteredDeals({ ...scopedFilters, stageIds }, role));
@@ -1682,6 +1754,186 @@ ${sheets}
     return deals.filter((deal) => filters.every((filter) => this.matchesContractFilter(deal, filter, lastNoteByDeal)));
   }
 
+  private async attachWeightedStageValues(deals: any[], metric: DataContractMetric) {
+    if (deals.length === 0) return deals;
+    const stageIds = metric.stageIds?.filter(Boolean) ?? [];
+    const pipelineIds = [...new Set(deals.map((deal) => deal.pipelineId).filter(Boolean))];
+    const successStageByPipelineId = this.metricSuccessStageByPipelineId(metric, pipelineIds);
+    const model = await this.computeStageSuccessProbabilityModel({
+      pipelineIds,
+      stageIds,
+      successStageByPipelineId,
+      defaultProbability: metric.defaultProbability ?? 0,
+    });
+
+    return deals.map((deal) => {
+      const probability = model.probability(deal.stageId, deal.responsibleId);
+      const amount = Number(deal.amount ?? 0);
+      return {
+        ...deal,
+        __contractExpectedAmount: amount * probability.probability,
+        __contractProbabilityPercent: Math.round(probability.probability * 100),
+      };
+    });
+  }
+
+  private metricSuccessStageByPipelineId(metric: DataContractMetric, pipelineIds: string[]) {
+    const byPipeline = { ...(metric.successStageByPipelineId ?? {}) };
+    if (metric.successStageId) {
+      if (metric.pipelineId) byPipeline[metric.pipelineId] = metric.successStageId;
+      for (const pipelineId of pipelineIds) {
+        if (!byPipeline[pipelineId]) byPipeline[pipelineId] = metric.successStageId;
+      }
+    }
+    return byPipeline;
+  }
+
+  private async computeStageSuccessProbabilityModel(options: {
+    pipelineIds: string[];
+    stageIds: string[];
+    successStageByPipelineId: Record<string, string>;
+    defaultProbability: number;
+    now?: Date;
+  }): Promise<StageSuccessProbabilityModel> {
+    const pipelineIds = [...new Set(options.pipelineIds.filter(Boolean))];
+    const stageIds = [...new Set(options.stageIds.filter(Boolean))];
+    const successStageIds = [...new Set(Object.values(options.successStageByPipelineId).filter(Boolean))];
+    const defaultProbability = this.clampProbability(options.defaultProbability);
+    if (!pipelineIds.length || !stageIds.length || !successStageIds.length) {
+      return { probability: () => this.defaultStageProbability(defaultProbability) };
+    }
+
+    const now = options.now ?? new Date();
+    const monthStart = this.startOfMoscowMonth(now);
+    const trainingFrom = this.addDays(monthStart, -90);
+    const matureUntil = this.addDays(monthStart, -14);
+    const entries = await this.db.dealStageHistory.findMany({
+      where: {
+        toStageId: { in: [...stageIds, ...successStageIds] },
+        movedAt: { gte: trainingFrom, lt: monthStart },
+        deal: { pipelineId: { in: pipelineIds }, deletedAt: null },
+      },
+      orderBy: [{ dealId: 'asc' }, { movedAt: 'asc' }],
+      select: {
+        dealId: true,
+        toStageId: true,
+        movedAt: true,
+        deal: { select: { pipelineId: true, responsibleId: true } },
+      },
+    });
+
+    const stats = new Map<string, { sample: number; wins: number }>();
+    const add = (key: string, win: boolean) => {
+      const stat = stats.get(key) ?? { sample: 0, wins: 0 };
+      stat.sample += 1;
+      if (win) stat.wins += 1;
+      stats.set(key, stat);
+    };
+    const byDeal = new Map<string, typeof entries>();
+    for (const entry of entries) {
+      if (!byDeal.has(entry.dealId)) byDeal.set(entry.dealId, []);
+      byDeal.get(entry.dealId)!.push(entry);
+    }
+
+    for (const dealEntries of byDeal.values()) {
+      const pipelineId = dealEntries[0]?.deal.pipelineId;
+      const successStageId = pipelineId ? options.successStageByPipelineId[pipelineId] : null;
+      if (!successStageId) continue;
+      const managerId = dealEntries[0]?.deal.responsibleId ?? 'unassigned';
+      for (const stageId of stageIds) {
+        const stageEntry = dealEntries.find((entry) => (
+          entry.toStageId === stageId &&
+          entry.movedAt >= trainingFrom &&
+          entry.movedAt <= matureUntil
+        ));
+        if (!stageEntry) continue;
+        const won = dealEntries.some((entry) => (
+          entry.toStageId === successStageId &&
+          entry.movedAt > stageEntry.movedAt &&
+          entry.movedAt < monthStart
+        ));
+        add(`${managerId}:${stageId}`, won);
+        add(`all:${stageId}`, won);
+        add(`${managerId}:all`, won);
+        add('all:all', won);
+      }
+    }
+
+    const getStat = (key: string) => stats.get(key) ?? { sample: 0, wins: 0 };
+    const rate = (stat: { sample: number; wins: number }) => (stat.sample > 0 ? stat.wins / stat.sample : null);
+
+    return {
+      probability: (stageId: string, managerId?: string | null) => {
+        const safeManagerId = managerId ?? 'unassigned';
+        const personal = getStat(`${safeManagerId}:${stageId}`);
+        const personalFallback = getStat(`${safeManagerId}:all`);
+        const team = getStat(`all:${stageId}`);
+        const teamFallback = getStat('all:all');
+        const personalStat = personal.sample > 0 ? personal : personalFallback;
+        const teamStat = team.sample > 0 ? team : teamFallback;
+        const personalRate = rate(personalStat);
+        const teamRate = rate(teamStat);
+
+        if (personalStat.sample >= 10 && personalRate !== null) {
+          return this.stageProbabilityResult(this.clampProbability(personalRate), 'personal', personalStat, teamStat, personalRate, teamRate);
+        }
+        if (personalStat.sample >= 5 && personalRate !== null && teamStat.sample >= 10 && teamRate !== null) {
+          return this.stageProbabilityResult(
+            this.clampProbability((personalRate + teamRate) / 2),
+            'blended',
+            personalStat,
+            teamStat,
+            personalRate,
+            teamRate,
+          );
+        }
+        if (teamStat.sample >= 10 && teamRate !== null) {
+          return this.stageProbabilityResult(this.clampProbability(teamRate), 'team', personalStat, teamStat, personalRate, teamRate);
+        }
+        if (teamStat.sample >= 5 && teamRate !== null) {
+          return this.stageProbabilityResult(
+            this.clampProbability((teamRate + defaultProbability) / 2),
+            'blended',
+            personalStat,
+            teamStat,
+            personalRate,
+            teamRate,
+          );
+        }
+        return this.stageProbabilityResult(defaultProbability, 'default', personalStat, teamStat, personalRate, teamRate);
+      },
+    };
+  }
+
+  private defaultStageProbability(probability: number): StageSuccessProbability {
+    return this.stageProbabilityResult(probability, 'default', { sample: 0, wins: 0 }, { sample: 0, wins: 0 }, null, null);
+  }
+
+  private stageProbabilityResult(
+    probability: number,
+    source: StageSuccessProbability['source'],
+    personal: { sample: number; wins: number },
+    team: { sample: number; wins: number },
+    personalRate: number | null,
+    teamRate: number | null,
+  ): StageSuccessProbability {
+    return {
+      probability,
+      source,
+      personalSample: personal.sample,
+      teamSample: team.sample,
+      personalWins: personal.wins,
+      teamWins: team.wins,
+      personalRate,
+      teamRate,
+    };
+  }
+
+  private clampProbability(value: number) {
+    if (!Number.isFinite(value)) return 0;
+    return Math.min(Math.max(value, 0), 0.98);
+  }
+
   private relativeThreshold(amount?: number, unit?: 'hours' | 'days' | 'weeks' | 'months') {
     if (!amount || amount <= 0 || !unit) return null;
     const date = new Date();
@@ -1761,6 +2013,10 @@ ${sheets}
     bucket.dealIds.add(deal.id);
     bucket.count += 1;
     bucket.samples.push(this.contractDealSample(deal));
+    if (metric.type === 'weighted_stage_sum') {
+      bucket.values.push(Number(deal.__contractExpectedAmount ?? 0));
+      return;
+    }
     const measure = metric.measure ?? 'deal_count';
     if (measure === 'field_sum' || measure === 'field_avg') {
       const fieldId = metric.valueFieldId ?? metric.amountFieldId ?? metric.marginFieldId;
@@ -1777,6 +2033,10 @@ ${sheets}
   ) {
     const measure = metric.measure ?? 'deal_count';
     if (measure === 'field_sum') {
+      bucket.value = Math.round(bucket.values.reduce((sum, value) => sum + value, 0));
+      return;
+    }
+    if (metric.type === 'weighted_stage_sum') {
       bucket.value = Math.round(bucket.values.reduce((sum, value) => sum + value, 0));
       return;
     }
@@ -1806,6 +2066,8 @@ ${sheets}
       dealExternalId: deal.externalId ?? null,
       dealTitle: deal.title,
       amount: Number.isFinite(Number(deal.amount)) ? Number(deal.amount) : null,
+      expectedAmount: Number.isFinite(Number(deal.__contractExpectedAmount)) ? Number(deal.__contractExpectedAmount) : null,
+      probabilityPercent: Number.isFinite(Number(deal.__contractProbabilityPercent)) ? Number(deal.__contractProbabilityPercent) : null,
       stageName: deal.stage?.name ?? null,
       pipelineName: deal.pipeline?.name ?? null,
       updatedAt: deal.updatedAt instanceof Date ? deal.updatedAt.toISOString() : null,
@@ -2185,7 +2447,8 @@ ${sheets}
         samples,
       };
     }
-    return { id: 'summary', label: mode === 'avg' ? 'Среднее' : 'Итого', metrics: result };
+    const label = mode === 'avg' ? 'Среднее' : 'Итого';
+    return { id: 'summary', groupId: 'summary', groupName: label, label, metrics: result };
   }
 
   private async computeConversionReport(filters: ReportFilters, config: ReportConfig, role: UserRole) {
@@ -2767,6 +3030,19 @@ ${sheets}
       refs.quoteStages.map((stage) => stage.id),
       refs.salesWonStage!.id,
     );
+    const salesSuccessStageByPipelineId = { [refs.salesPipeline!.id]: refs.salesWonStage!.id };
+    const invoiceProbability = await this.computeStageSuccessProbabilityModel({
+      pipelineIds: [refs.salesPipeline!.id],
+      stageIds: [refs.invoiceStage!.id],
+      successStageByPipelineId: salesSuccessStageByPipelineId,
+      defaultProbability: 0.9,
+    });
+    const quoteProbability = await this.computeStageSuccessProbabilityModel({
+      pipelineIds: [refs.salesPipeline!.id],
+      stageIds: refs.quoteStages.map((stage) => stage.id),
+      successStageByPipelineId: salesSuccessStageByPipelineId,
+      defaultProbability: 0.3,
+    });
     const repeatSpeeds = await Promise.all(
       refs.repeatPipelines.map(async (pipeline) => ({
         ...pipeline,
@@ -2776,20 +3052,39 @@ ${sheets}
         quoteSpeed: pipeline.quoteStages.length
           ? await this.computeStageToSuccessSpeed(pipeline.id, pipeline.quoteStages.map((stage) => stage.id), pipeline.wonStage.id)
           : null,
+        invoiceProbability: pipeline.invoiceStage
+          ? await this.computeStageSuccessProbabilityModel({
+              pipelineIds: [pipeline.id],
+              stageIds: [pipeline.invoiceStage.id],
+              successStageByPipelineId: { [pipeline.id]: pipeline.wonStage.id },
+              defaultProbability: 0.9,
+            })
+          : null,
+        quoteProbability: pipeline.quoteStages.length
+          ? await this.computeStageSuccessProbabilityModel({
+              pipelineIds: [pipeline.id],
+              stageIds: pipeline.quoteStages.map((stage) => stage.id),
+              successStageByPipelineId: { [pipeline.id]: pipeline.wonStage.id },
+              defaultProbability: 0.3,
+            })
+          : null,
       })),
     );
 
     const buckets = this.createRevenueForecastBuckets();
     const addDeal = (
-      bucketKey: 'alreadyShipped' | 'shippingThisMonth' | 'invoiceThisMonth' | 'quoteThisMonth' | 'repeatSalesThisMonth' | 'notThisMonth',
+      bucketKey: RevenueForecastBucketKey,
       deal: any,
-      probability: number,
+      probability: number | StageSuccessProbability,
       source: string,
       predictedShipAt: Date | null,
       closeDays: number | null,
       shippingRemainingDays: number | null,
     ) => {
-      const revenue = Number(deal.amount ?? 0) * probability;
+      const probabilityValue = typeof probability === 'number' ? probability : probability.probability;
+      const probabilitySource = typeof probability === 'number' ? 'fixed' : probability.source;
+      const probabilitySample = typeof probability === 'number' ? null : probability.personalSample || probability.teamSample;
+      const revenue = Number(deal.amount ?? 0) * probabilityValue;
       const profit = revenue * profitRate;
       const bucket = buckets[bucketKey];
       bucket.count += 1;
@@ -2802,7 +3097,9 @@ ${sheets}
         manager: deal.responsible?.name ?? 'Без менеджера',
         stage: deal.stage?.name ?? '',
         source,
-        probabilityPercent: Math.round(probability * 100),
+        probabilityPercent: Math.round(probabilityValue * 100),
+        probabilitySource,
+        probabilitySample,
         amount: Number(deal.amount ?? 0),
         revenue: Math.round(revenue),
         profit: Math.round(profit),
@@ -2831,7 +3128,7 @@ ${sheets}
       }
     }
     for (const { deal, shippedAt } of alreadyShippedByDeal.values()) {
-      addDeal('alreadyShipped', deal, 1, 'Отгружено', shippedAt, null, 0);
+      addDeal(this.revenueForecastShippingBucket(deal, refs, true), deal, 1, 'Отгружено', shippedAt, null, 0);
     }
 
     const assemblyDeals = (await this.findFilteredDeals(this.fixedPipelineFilters(filters, refs.assemblyPipeline!.id, undefined, { ignoreTeam: true }), role))
@@ -2842,7 +3139,7 @@ ${sheets}
       const elapsedDays = this.absoluteDurationDays(enteredAt, now) ?? 0;
       const remainingDays = Math.max(shippingDays - elapsedDays, 0);
       const predictedShipAt = this.addDays(now, remainingDays);
-      addDeal(predictedShipAt <= monthTo ? 'shippingThisMonth' : 'notThisMonth', deal, 1, 'Сборка', predictedShipAt, null, remainingDays);
+      addDeal(this.revenueForecastShippingBucket(deal, refs, predictedShipAt <= monthTo), deal, 1, 'Сборка', predictedShipAt, null, remainingDays);
     }
 
     const invoiceDeals = await this.findFilteredDeals(
@@ -2853,9 +3150,9 @@ ${sheets}
       const closeDays = invoiceSpeed.average(deal.stageId, deal.responsibleId);
       const predictedShipAt = closeDays == null ? null : this.addDays(now, closeDays + shippingDays);
       addDeal(
-        predictedShipAt && predictedShipAt <= monthTo ? 'invoiceThisMonth' : 'notThisMonth',
+        predictedShipAt && predictedShipAt <= monthTo ? 'salesInvoiceThisMonth' : 'salesNotThisMonth',
         deal,
-        0.9,
+        invoiceProbability.probability(deal.stageId, deal.responsibleId),
         'Счёт отправлен',
         predictedShipAt,
         closeDays,
@@ -2871,9 +3168,9 @@ ${sheets}
       const closeDays = quoteSpeed.average(deal.stageId, deal.responsibleId);
       const predictedShipAt = closeDays == null ? null : this.addDays(now, closeDays + shippingDays);
       addDeal(
-        predictedShipAt && predictedShipAt <= monthTo ? 'quoteThisMonth' : 'notThisMonth',
+        predictedShipAt && predictedShipAt <= monthTo ? 'salesQuoteThisMonth' : 'salesNotThisMonth',
         deal,
-        0.3,
+        quoteProbability.probability(deal.stageId, deal.responsibleId),
         deal.stage?.name ?? 'КП / возражения',
         predictedShipAt,
         closeDays,
@@ -2882,7 +3179,7 @@ ${sheets}
     }
 
     for (const pipeline of repeatSpeeds) {
-      if (pipeline.invoiceStage && pipeline.invoiceSpeed) {
+      if (pipeline.invoiceStage && pipeline.invoiceSpeed && pipeline.invoiceProbability) {
         const deals = await this.findFilteredDeals(
           this.fixedPipelineFilters(filters, pipeline.id, [pipeline.invoiceStage.id]),
           role,
@@ -2891,9 +3188,9 @@ ${sheets}
           const closeDays = pipeline.invoiceSpeed.average(deal.stageId, deal.responsibleId);
           const predictedShipAt = closeDays == null ? null : this.addDays(now, closeDays + shippingDays);
           addDeal(
-            predictedShipAt && predictedShipAt <= monthTo ? 'repeatSalesThisMonth' : 'notThisMonth',
+            predictedShipAt && predictedShipAt <= monthTo ? 'repeatInvoiceThisMonth' : 'repeatNotThisMonth',
             deal,
-            0.9,
+            pipeline.invoiceProbability.probability(deal.stageId, deal.responsibleId),
             `${pipeline.name}: счет отправлен`,
             predictedShipAt,
             closeDays,
@@ -2902,7 +3199,7 @@ ${sheets}
         }
       }
 
-      if (pipeline.quoteStages.length && pipeline.quoteSpeed) {
+      if (pipeline.quoteStages.length && pipeline.quoteSpeed && pipeline.quoteProbability) {
         const deals = await this.findFilteredDeals(
           this.fixedPipelineFilters(filters, pipeline.id, pipeline.quoteStages.map((stage) => stage.id)),
           role,
@@ -2911,9 +3208,9 @@ ${sheets}
           const closeDays = pipeline.quoteSpeed.average(deal.stageId, deal.responsibleId);
           const predictedShipAt = closeDays == null ? null : this.addDays(now, closeDays + shippingDays);
           addDeal(
-            predictedShipAt && predictedShipAt <= monthTo ? 'repeatSalesThisMonth' : 'notThisMonth',
+            predictedShipAt && predictedShipAt <= monthTo ? 'repeatQuoteThisMonth' : 'repeatNotThisMonth',
             deal,
-            0.3,
+            pipeline.quoteProbability.probability(deal.stageId, deal.responsibleId),
             `${pipeline.name}: ${deal.stage?.name ?? 'предложение'}`,
             predictedShipAt,
             closeDays,
@@ -2929,7 +3226,7 @@ ${sheets}
       profit: Math.round(bucket.profit ?? 0),
       deals: bucket.deals.sort((a: any, b: any) => String(a.predictedShipAt ?? '').localeCompare(String(b.predictedShipAt ?? ''))),
     }));
-    const inMonthRows = rows.filter((row) => row.id !== 'notThisMonth');
+    const inMonthRows = rows.filter((row) => !['salesNotThisMonth', 'repeatNotThisMonth'].includes(row.id));
     const summaryProfit = rows.reduce((sum, row) => sum + Number(row.profit ?? 0), 0);
 
     return {
@@ -2952,9 +3249,10 @@ ${sheets}
       },
       assumptions: [
         'Сборка считается с вероятностью 100%.',
-        'Счёт отправлен считается с вероятностью 90%.',
-        'КП презентовано и Есть возражения считаются с вероятностью 30%.',
-        'База и Закрепленные Компании объединены в блок Повторные продажи.',
+        'Счета, КП и возражения взвешиваются по персональной исторической конверсии менеджера.',
+        'Текущий месяц не входит в историческую базу; свежие сделки последних 14 дней перед месяцем не портят выборку.',
+        'Если у менеджера мало данных, берётся конверсия команды, затем базовые 90% для счёта и 30% для КП.',
+        'База и Закрепленные Компании считаются как Повторные продажи.',
       ],
       warnings,
       summary: {
@@ -3086,9 +3384,12 @@ ${sheets}
   }
 
   private async resolveRevenueForecastRefs() {
-    const pipelines = await this.db.pipeline.findMany({
-      include: { stages: { orderBy: { position: 'asc' } } },
-    });
+    const [pipelines, csmGroup] = await Promise.all([
+      this.db.pipeline.findMany({
+        include: { stages: { orderBy: { position: 'asc' } } },
+      }),
+      this.findCrmGroupByName('CSM'),
+    ]);
     const pipelineByName = (needle: string) =>
       pipelines.find((pipeline) => this.normalizeStageName(pipeline.name).includes(this.normalizeStageName(needle))) ?? null;
     const stageByName = (stages: Array<{ id: string; name: string; isWon?: boolean; isLost?: boolean }>, needles: string[]) =>
@@ -3166,6 +3467,7 @@ ${sheets}
       repeatPipelines,
       shippingDoneStage,
       assemblyStages: openAssemblyStages,
+      csmGroup,
     };
   }
 
@@ -3306,55 +3608,84 @@ ${sheets}
 
   private createRevenueForecastBuckets() {
     return {
-      alreadyShipped: {
-        id: 'alreadyShipped',
-        label: 'Уже отгружено',
+      salesShippingThisMonth: {
+        id: 'salesShippingThisMonth',
+        label: 'Продажи: в отгрузке',
         count: 0,
         revenue: 0,
         profit: null as number | null,
         deals: [] as any[],
       },
-      shippingThisMonth: {
-        id: 'shippingThisMonth',
-        label: 'В отгрузке и успеет отгрузиться',
+      salesInvoiceThisMonth: {
+        id: 'salesInvoiceThisMonth',
+        label: 'Продажи: счета, которые успеют купить и отгрузиться',
         count: 0,
         revenue: 0,
         profit: null as number | null,
         deals: [] as any[],
       },
-      invoiceThisMonth: {
-        id: 'invoiceThisMonth',
-        label: 'Счета, которые успеют купить и отгрузиться',
+      salesQuoteThisMonth: {
+        id: 'salesQuoteThisMonth',
+        label: 'Продажи: КП, которые успеют купить и отгрузиться',
         count: 0,
         revenue: 0,
         profit: null as number | null,
         deals: [] as any[],
       },
-      quoteThisMonth: {
-        id: 'quoteThisMonth',
-        label: 'КП, которые успеют купить и отгрузиться',
+      salesNotThisMonth: {
+        id: 'salesNotThisMonth',
+        label: 'Продажи: не успеют отгрузиться',
         count: 0,
         revenue: 0,
         profit: null as number | null,
         deals: [] as any[],
       },
-      repeatSalesThisMonth: {
-        id: 'repeatSalesThisMonth',
-        label: 'Повторные продажи',
+      repeatShippingThisMonth: {
+        id: 'repeatShippingThisMonth',
+        label: 'Повторные продажи: в отгрузке',
         count: 0,
         revenue: 0,
         profit: null as number | null,
         deals: [] as any[],
       },
-      notThisMonth: {
-        id: 'notThisMonth',
-        label: 'Не успеют отгрузиться',
+      repeatInvoiceThisMonth: {
+        id: 'repeatInvoiceThisMonth',
+        label: 'Повторные продажи: счета, которые успеют купить и отгрузиться',
+        count: 0,
+        revenue: 0,
+        profit: null as number | null,
+        deals: [] as any[],
+      },
+      repeatQuoteThisMonth: {
+        id: 'repeatQuoteThisMonth',
+        label: 'Повторные продажи: КП, которые успеют купить и отгрузиться',
+        count: 0,
+        revenue: 0,
+        profit: null as number | null,
+        deals: [] as any[],
+      },
+      repeatNotThisMonth: {
+        id: 'repeatNotThisMonth',
+        label: 'Повторные продажи: не успеют отгрузиться',
         count: 0,
         revenue: 0,
         profit: null as number | null,
         deals: [] as any[],
       },
     };
+  }
+
+  private revenueForecastShippingBucket(deal: any, refs: { csmGroup?: { id: string; name: string } | null }, inMonth: boolean): RevenueForecastBucketKey {
+    const groupId = deal.responsible?.group?.id ?? null;
+    const groupName = this.normalizeStageName(deal.responsible?.group?.name ?? '');
+    const csmGroupName = this.normalizeStageName(refs.csmGroup?.name ?? 'CSM');
+    const isRepeat = Boolean(
+      (refs.csmGroup?.id && groupId === refs.csmGroup.id) ||
+      groupName === csmGroupName ||
+      groupName.includes('csm'),
+    );
+    if (isRepeat) return inMonth ? 'repeatShippingThisMonth' : 'repeatNotThisMonth';
+    return inMonth ? 'salesShippingThisMonth' : 'salesNotThisMonth';
   }
 
   private fixedPipelineFilters(

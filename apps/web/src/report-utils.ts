@@ -42,6 +42,9 @@ export function buildReportPayload(
         fromMetricId: metric.type === 'conversion' ? metric.fromMetricId : undefined,
         toMetricId: metric.type === 'conversion' ? metric.toMetricId : undefined,
         formula: metric.type === 'formula' ? metric.formula : undefined,
+        successStageId: metric.type === 'weighted_stage_sum' ? metric.successStageId || undefined : undefined,
+        successStageByPipelineId: metric.type === 'weighted_stage_sum' ? metric.successStageByPipelineId : undefined,
+        defaultProbability: metric.type === 'weighted_stage_sum' ? metric.defaultProbability : undefined,
         extraFilters: metric.extraFilters
           .filter((filter) => {
             if (filter.subject === 'deal_field') return Boolean(filter.fieldId);

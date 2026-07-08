@@ -5592,6 +5592,8 @@ type ContractDealSample = {
   dealExternalId?: string;
   dealTitle: string;
   amount?: number | null;
+  expectedAmount?: number | null;
+  probabilityPercent?: number | null;
   stageName?: string | null;
   pipelineName?: string | null;
 };
@@ -5764,6 +5766,10 @@ function hasContractDealDrilldown(value: ContractMetricValue | ContractConversio
 }
 
 function formatContractDealSampleMeta(sample: ContractDealSample) {
+  if (Number.isFinite(Number(sample.expectedAmount))) {
+    const probability = Number.isFinite(Number(sample.probabilityPercent)) ? ` · ${sample.probabilityPercent}%` : '';
+    return `${formatMoney(Number(sample.expectedAmount))}${probability}`;
+  }
   if (Number.isFinite(Number(sample.amount))) return formatMoney(Number(sample.amount));
   return sample.stageName ?? '';
 }
@@ -6331,6 +6337,9 @@ function reportToDraft(template: ReportTemplate): ReportDraft {
         fromMetricId: metric.fromMetricId ?? '',
         toMetricId: metric.toMetricId ?? '',
         formula: metric.formula ?? '',
+        successStageId: metric.successStageId ?? '',
+        successStageByPipelineId: metric.successStageByPipelineId,
+        defaultProbability: metric.defaultProbability,
         extraFilters: restoreContractFilters(metric),
       })),
       contractConversions: template.config.contract.conversions ?? [],
