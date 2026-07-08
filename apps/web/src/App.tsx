@@ -5766,11 +5766,13 @@ function hasContractDealDrilldown(value: ContractMetricValue | ContractConversio
 }
 
 function formatContractDealSampleMeta(sample: ContractDealSample) {
-  if (Number.isFinite(Number(sample.expectedAmount))) {
-    const probability = Number.isFinite(Number(sample.probabilityPercent)) ? ` · ${sample.probabilityPercent}%` : '';
+  if (sample.expectedAmount !== null && sample.expectedAmount !== undefined && Number.isFinite(Number(sample.expectedAmount))) {
+    const probability = sample.probabilityPercent !== null && sample.probabilityPercent !== undefined && Number.isFinite(Number(sample.probabilityPercent))
+      ? ` · ${sample.probabilityPercent}%`
+      : '';
     return `${formatMoney(Number(sample.expectedAmount))}${probability}`;
   }
-  if (Number.isFinite(Number(sample.amount))) return formatMoney(Number(sample.amount));
+  if (sample.amount !== null && sample.amount !== undefined && Number.isFinite(Number(sample.amount))) return formatMoney(Number(sample.amount));
   return sample.stageName ?? '';
 }
 
