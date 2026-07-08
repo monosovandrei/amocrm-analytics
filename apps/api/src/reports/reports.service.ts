@@ -66,10 +66,12 @@ type StageSuccessProbabilityModel = {
   probability: (stageId: string, managerId?: string | null) => StageSuccessProbability;
 };
 type RevenueForecastBucketKey =
+  | 'salesShippedThisMonth'
   | 'salesShippingThisMonth'
   | 'salesInvoiceThisMonth'
   | 'salesQuoteThisMonth'
   | 'salesNotThisMonth'
+  | 'repeatShippedThisMonth'
   | 'repeatShippingThisMonth'
   | 'repeatInvoiceThisMonth'
   | 'repeatQuoteThisMonth'
@@ -3128,7 +3130,7 @@ ${sheets}
       }
     }
     for (const { deal, shippedAt } of alreadyShippedByDeal.values()) {
-      addDeal(this.revenueForecastShippingBucket(deal, refs, true), deal, 1, 'Отгружено', shippedAt, null, 0);
+      addDeal(this.revenueForecastShippedBucket(deal, refs), deal, 1, 'Отгружено', shippedAt, null, 0);
     }
 
     const assemblyDeals = (await this.findFilteredDeals(this.fixedPipelineFilters(filters, refs.assemblyPipeline!.id, undefined, { ignoreTeam: true }), role))
@@ -3253,6 +3255,7 @@ ${sheets}
         'Текущий месяц не входит в историческую базу; свежие сделки последних 14 дней перед месяцем не портят выборку.',
         'Если у менеджера мало данных, берётся конверсия команды, затем базовые 90% для счёта и 30% для КП.',
         'База и Закрепленные Компании считаются как Повторные продажи.',
+        'Уже отгруженные сделки показываются отдельной строкой с вероятностью 100%.',
       ],
       warnings,
       summary: {
@@ -3608,6 +3611,14 @@ ${sheets}
 
   private createRevenueForecastBuckets() {
     return {
+      salesShippedThisMonth: {
+        id: 'salesShippedThisMonth',
+        label: 'Продажи: уже отгружено',
+        count: 0,
+        revenue: 0,
+        profit: null as number | null,
+        deals: [] as any[],
+      },
       salesShippingThisMonth: {
         id: 'salesShippingThisMonth',
         label: 'Продажи: в отгрузке',
@@ -3635,6 +3646,14 @@ ${sheets}
       salesNotThisMonth: {
         id: 'salesNotThisMonth',
         label: 'Продажи: не успеют отгрузиться',
+        count: 0,
+        revenue: 0,
+        profit: null as number | null,
+        deals: [] as any[],
+      },
+      repeatShippedThisMonth: {
+        id: 'repeatShippedThisMonth',
+        label: 'Повторные продажи: уже отгружено',
         count: 0,
         revenue: 0,
         profit: null as number | null,
@@ -3675,17 +3694,25 @@ ${sheets}
     };
   }
 
+  private revenueForecastShippedBucket(deal: any, refs: { csmGroup?: { id: string; name: string } | null }): RevenueForecastBucketKey {
+    return this.isRepeatRevenueForecastDeal(deal, refs) ? 'repeatShippedThisMonth' : 'salesShippedThisMonth';
+  }
+
   private revenueForecastShippingBucket(deal: any, refs: { csmGroup?: { id: string; name: string } | null }, inMonth: boolean): RevenueForecastBucketKey {
+    const isRepeat = this.isRepeatRevenueForecastDeal(deal, refs);
+    if (isRepeat) return inMonth ? 'repeatShippingThisMonth' : 'repeatNotThisMonth';
+    return inMonth ? 'salesShippingThisMonth' : 'salesNotThisMonth';
+  }
+
+  private isRepeatRevenueForecastDeal(deal: any, refs: { csmGroup?: { id: string; name: string } | null }) {
     const groupId = deal.responsible?.group?.id ?? null;
     const groupName = this.normalizeStageName(deal.responsible?.group?.name ?? '');
     const csmGroupName = this.normalizeStageName(refs.csmGroup?.name ?? 'CSM');
-    const isRepeat = Boolean(
+    return Boolean(
       (refs.csmGroup?.id && groupId === refs.csmGroup.id) ||
       groupName === csmGroupName ||
       groupName.includes('csm'),
     );
-    if (isRepeat) return inMonth ? 'repeatShippingThisMonth' : 'repeatNotThisMonth';
-    return inMonth ? 'salesShippingThisMonth' : 'salesNotThisMonth';
   }
 
   private fixedPipelineFilters(

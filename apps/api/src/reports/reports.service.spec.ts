@@ -521,6 +521,32 @@ describe('ReportsService data contract', () => {
     expect(weightedTotal.formula).not.toContain('Счета x 90%');
   });
 
+  it('keeps already shipped forecast buckets separate for sales and repeat sales', () => {
+    const buckets = (service as any).createRevenueForecastBuckets();
+    const refs = { csmGroup: { id: 'group-csm', name: 'CSM' } };
+    const salesDeal = { responsible: { group: { id: 'group-sales', name: 'Sales' } } };
+    const repeatDeal = { responsible: { group: { id: 'group-csm', name: 'CSM' } } };
+
+    expect(Object.keys(buckets)).toEqual([
+      'salesShippedThisMonth',
+      'salesShippingThisMonth',
+      'salesInvoiceThisMonth',
+      'salesQuoteThisMonth',
+      'salesNotThisMonth',
+      'repeatShippedThisMonth',
+      'repeatShippingThisMonth',
+      'repeatInvoiceThisMonth',
+      'repeatQuoteThisMonth',
+      'repeatNotThisMonth',
+    ]);
+    expect(buckets.salesShippedThisMonth.label).toBe('Продажи: уже отгружено');
+    expect(buckets.repeatShippedThisMonth.label).toBe('Повторные продажи: уже отгружено');
+    expect((service as any).revenueForecastShippedBucket(salesDeal, refs)).toBe('salesShippedThisMonth');
+    expect((service as any).revenueForecastShippedBucket(repeatDeal, refs)).toBe('repeatShippedThisMonth');
+    expect((service as any).revenueForecastShippingBucket(salesDeal, refs, true)).toBe('salesShippingThisMonth');
+    expect((service as any).revenueForecastShippingBucket(repeatDeal, refs, true)).toBe('repeatShippingThisMonth');
+  });
+
   it('counts only the first-ever transition into a selected stage', async () => {
     const result = await service.compute(
       {
