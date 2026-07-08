@@ -544,7 +544,7 @@ export class ReportsService {
         label: 'Итого взвешенно',
         type: 'formula',
         display: 'money',
-        formula: '[КП x 30%] + [Счета x 90%] + [Сборка x 100%]',
+        formula: weightedTotalParts.join(' + '),
       },
     ];
 
@@ -860,7 +860,7 @@ export class ReportsService {
           metric: 'contract',
           display: 'table',
           description: 'Взвешенная сумма по КП, счетам и сборке CSM',
-          conditionLabel: 'База + Закрепленные компании: КП x 30%, счета x 90%, сборка x 100%',
+          conditionLabel: 'База + Закрепленные компании: КП и счета по персональной конверсии, сборка x 100%',
           filters: { pipelineIds: csmPipelines, groupIds: [refs.csmGroup.id] },
           contract: weightedContract,
           size: 'lg',

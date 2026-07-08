@@ -502,6 +502,25 @@ describe('ReportsService data contract', () => {
     );
   });
 
+  it('keeps sales weighted total formula aligned with current metric labels', async () => {
+    const templates = await (service as any).buildSalesReportTemplates();
+    const template = templates.find((item: any) => item.config?.builtinKey === 'sales_weighted_funnel');
+    const metrics = template.config.contract.metrics;
+    const weightedTotal = metrics.find((metric: any) => metric.id === 'weighted_total');
+    const metricLabels = new Set(metrics.map((metric: any) => metric.label));
+    const formulaRefs = [...weightedTotal.formula.matchAll(/\[([^\]]+)\]/g)].map((match) => match[1]);
+
+    expect(formulaRefs).toEqual([
+      'КП презентовано x конверсия',
+      'Есть возражения x конверсия',
+      'Счета x конверсия',
+      'Сборка x 100%',
+    ]);
+    expect(formulaRefs.every((label) => metricLabels.has(label))).toBe(true);
+    expect(weightedTotal.formula).not.toContain('КП x 30%');
+    expect(weightedTotal.formula).not.toContain('Счета x 90%');
+  });
+
   it('counts only the first-ever transition into a selected stage', async () => {
     const result = await service.compute(
       {
@@ -693,6 +712,30 @@ describe('ReportsService data contract', () => {
 
 function createPrismaMock() {
   const templates: any[] = [];
+  const reportPipelines = [
+    {
+      id: 'pipe-sales',
+      externalId: '1278508',
+      name: 'Воронка Продажи',
+      isArchived: false,
+      stages: [
+        { ...stages.qualified, externalId: '20959402', name: 'Назначен ответственный' },
+        { ...stages.kp, externalId: '20959408', name: 'КП презентовано' },
+        { id: 'stage-objections', externalId: '57732446', name: 'Есть возражения', pipelineId: 'pipe-sales', isWon: false, isLost: false },
+        { ...stages.invoice, externalId: '20959411', name: 'Счет отправлен' },
+        { ...stages.paid, externalId: '142', name: 'Счет оплачен' },
+      ],
+    },
+    {
+      id: 'pipe-assembly',
+      externalId: '1278793',
+      name: 'Воронка Сборка',
+      isArchived: false,
+      stages: [
+        { id: 'stage-assembly', externalId: 'assembly-1', name: 'Сборка', pipelineId: 'pipe-assembly', isWon: false, isLost: false },
+      ],
+    },
+  ];
   return {
     $transaction: jest.fn(function (this: any, callback: any) {
       return callback(this);
@@ -701,6 +744,15 @@ function createPrismaMock() {
     $queryRaw: jest.fn(() => Promise.resolve([])),
     amoConnection: {
       findFirst: jest.fn(() => Promise.resolve(null)),
+    },
+    crmGroup: {
+      findMany: jest.fn(() => Promise.resolve([{ id: 'group-sales', name: 'Sales' }])),
+    },
+    customFieldDefinition: {
+      findMany: jest.fn(() => Promise.resolve([{ externalId: '809047', name: 'Маркетинг' }])),
+    },
+    pipeline: {
+      findMany: jest.fn(() => Promise.resolve(reportPipelines)),
     },
     reportTemplate: {
       create: jest.fn(({ data }: any) => {
