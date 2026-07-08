@@ -664,6 +664,55 @@ describe('ReportsService data contract', () => {
     expect(probability.probability).toBeCloseTo(0.6, 6);
   });
 
+  it('counts CSM success across sibling repeat-sale pipelines', async () => {
+    const now = new Date('2026-07-08T12:00:00.000Z');
+    const basePipelineId = 'pipeline-base';
+    const assignedPipelineId = 'pipeline-assigned';
+    const offerStageId = 'stage-base-offer';
+    const assignedSuccessStageId = 'stage-assigned-paid';
+    const managerId = 'manager-csm';
+    const stageEntries = Array.from({ length: 10 }, (_, index) => ({
+      dealId: `deal-csm-${index}`,
+      toStageId: offerStageId,
+      movedAt: new Date(`2026-06-${18 + index}T10:00:00.000Z`),
+      deal: { pipelineId: assignedPipelineId, responsibleId: managerId },
+    }));
+    const successEntries = stageEntries.slice(0, 7).map((entry, index) => ({
+      dealId: entry.dealId,
+      toStageId: assignedSuccessStageId,
+      movedAt: new Date(`2026-06-${20 + index}T10:00:00.000Z`),
+      deal: { pipelineId: assignedPipelineId, responsibleId: managerId },
+    }));
+    const db = {
+      pipelineStage: {
+        findMany: jest.fn().mockResolvedValue([
+          { id: offerStageId, pipelineId: basePipelineId },
+          { id: assignedSuccessStageId, pipelineId: assignedPipelineId },
+        ]),
+      },
+      dealStageHistory: {
+        findMany: jest.fn().mockResolvedValue([...stageEntries, ...successEntries]),
+      },
+    };
+    const localService = new ReportsService(db as any, audit as any);
+
+    const model = await (localService as any).computeStageSuccessProbabilityModel({
+      pipelineIds: [basePipelineId],
+      stageIds: [offerStageId],
+      successStageIdsByPipelineId: { [basePipelineId]: [assignedSuccessStageId] },
+      defaultProbability: 0.3,
+      now,
+    });
+
+    const probability = model.probability(offerStageId, managerId);
+    expect(probability).toMatchObject({
+      source: 'personal',
+      personalSample: 10,
+      personalWins: 7,
+    });
+    expect(probability.probability).toBeCloseTo(0.7, 6);
+  });
+
   it('counts only the first-ever transition into a selected stage', async () => {
     const result = await service.compute(
       {
