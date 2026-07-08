@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
+  CSSProperties,
   Dispatch,
   FormEvent,
   MouseEvent as ReactMouseEvent,
@@ -5697,20 +5698,20 @@ function ContractDealDrilldown({
   sections: Array<{ label?: string; count?: number; samples: ContractDealSample[] }>;
 }) {
   const triggerRef = useRef<HTMLSpanElement>(null);
-  const [align, setAlign] = useState<'left' | 'right'>('left');
+  const [popoverOffset, setPopoverOffset] = useState(0);
   const placePopover = useCallback(() => {
     const rect = triggerRef.current?.getBoundingClientRect();
     if (!rect || typeof window === 'undefined') return;
     const width = Math.min(380, window.innerWidth - 56);
-    const fitsRight = rect.left + width <= window.innerWidth - 16;
-    const fitsLeft = rect.right - width >= 16;
-    setAlign(!fitsRight && fitsLeft ? 'right' : 'left');
+    const viewportLeft = Math.min(Math.max(rect.left, 16), window.innerWidth - width - 16);
+    setPopoverOffset(Math.round(viewportLeft - rect.left));
   }, []);
 
   return (
     <span
       ref={triggerRef}
-      className={`drilldown-popover-trigger drilldown-popover-${align}`}
+      className="drilldown-popover-trigger"
+      style={{ '--drilldown-popover-left': `${popoverOffset}px` } as CSSProperties}
       tabIndex={0}
       onFocus={placePopover}
       onMouseEnter={placePopover}

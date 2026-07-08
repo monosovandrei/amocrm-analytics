@@ -1529,14 +1529,9 @@ button:disabled {
     transform 120ms ease;
 }
 
-.drilldown-popover-trigger.drilldown-popover-left .duration-popover {
+.drilldown-popover-trigger .duration-popover {
   right: auto;
-  left: 0;
-}
-
-.drilldown-popover-trigger.drilldown-popover-right .duration-popover {
-  right: 0;
-  left: auto;
+  left: var(--drilldown-popover-left, 0);
 }
 
 .duration-popover-trigger:hover .duration-popover,
