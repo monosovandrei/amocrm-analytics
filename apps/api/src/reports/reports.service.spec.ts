@@ -572,6 +572,12 @@ describe('ReportsService data contract', () => {
       deal: { pipelineId, responsibleId: managerId },
     };
     const db = {
+      pipelineStage: {
+        findMany: jest.fn().mockResolvedValue([
+          { id: stageId, pipelineId },
+          { id: successStageId, pipelineId },
+        ]),
+      },
       dealStageHistory: {
         findMany: jest.fn().mockResolvedValue([...stageEntries, ...successEntries, outOfWindowEntry]),
       },
@@ -593,6 +599,7 @@ describe('ReportsService data contract', () => {
           gte: new Date('2026-06-08T12:00:00.000Z'),
           lte: now,
         },
+        deal: { deletedAt: null },
       }),
     }));
     expect(probability).toMatchObject({
@@ -601,6 +608,60 @@ describe('ReportsService data contract', () => {
       personalWins: 4,
     });
     expect(probability.probability).toBeCloseTo(0.4, 6);
+  });
+
+  it('uses historical sales stages even when a won deal is no longer in the sales pipeline', async () => {
+    const now = new Date('2026-07-08T12:00:00.000Z');
+    const salesPipelineId = 'pipeline-sales';
+    const currentPipelineId = 'pipeline-assembly';
+    const stageId = 'stage-kp-sales';
+    const successStageId = 'stage-won-sales';
+    const managerId = 'manager-sales';
+    const stageEntries = Array.from({ length: 10 }, (_, index) => ({
+      dealId: `deal-moved-${index}`,
+      toStageId: stageId,
+      movedAt: new Date(`2026-06-${18 + index}T10:00:00.000Z`),
+      deal: { pipelineId: currentPipelineId, responsibleId: managerId },
+    }));
+    const successEntries = stageEntries.slice(0, 6).map((entry, index) => ({
+      dealId: entry.dealId,
+      toStageId: successStageId,
+      movedAt: new Date(`2026-06-${20 + index}T10:00:00.000Z`),
+      deal: { pipelineId: currentPipelineId, responsibleId: managerId },
+    }));
+    const db = {
+      pipelineStage: {
+        findMany: jest.fn().mockResolvedValue([
+          { id: stageId, pipelineId: salesPipelineId },
+          { id: successStageId, pipelineId: salesPipelineId },
+        ]),
+      },
+      dealStageHistory: {
+        findMany: jest.fn().mockResolvedValue([...stageEntries, ...successEntries]),
+      },
+    };
+    const localService = new ReportsService(db as any, audit as any);
+
+    const model = await (localService as any).computeStageSuccessProbabilityModel({
+      pipelineIds: [salesPipelineId],
+      stageIds: [stageId],
+      successStageIdsByPipelineId: { [salesPipelineId]: [successStageId] },
+      defaultProbability: 0.3,
+      now,
+    });
+
+    const probability = model.probability(stageId, managerId);
+    expect(db.dealStageHistory.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        deal: { deletedAt: null },
+      }),
+    }));
+    expect(probability).toMatchObject({
+      source: 'personal',
+      personalSample: 10,
+      personalWins: 6,
+    });
+    expect(probability.probability).toBeCloseTo(0.6, 6);
   });
 
   it('counts only the first-ever transition into a selected stage', async () => {

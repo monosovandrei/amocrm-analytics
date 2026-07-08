@@ -482,8 +482,8 @@ export class ReportsService {
       conversionMetric('conv_kp_to_invoice', 'Конверсия КП -> счёт', 'kp_presented', 'invoice_sent'),
       stageMetric('invoice_sent', 'Счета выставили', [refs.stages.invoice.id]),
       conversionMetric('conv_invoice_to_paid', 'Конверсия счёт -> оплата', 'invoice_sent', 'paid'),
-      stageMetric('paid', 'Оплаты получили', [refs.stages.paid.id]),
-      stageMetric('payment_amount', 'Сумма оплат', [refs.stages.paid.id], 'money', 'field_sum'),
+      stageMetric('paid', 'Оплаты получили', refs.stages.success.map((stage) => stage.id)),
+      stageMetric('payment_amount', 'Сумма оплат', refs.stages.success.map((stage) => stage.id), 'money', 'field_sum'),
       {
         id: 'avg_check',
         type: 'formula',
@@ -509,7 +509,7 @@ export class ReportsService {
         display: 'money',
         pipelineId: refs.salesPipeline.id,
         stageIds: [refs.stages.kp.id],
-        successStageId: refs.stages.paid.id,
+        successStageIds: refs.stages.success.map((stage) => stage.id),
         defaultProbability: 0.3,
       },
       ...(refs.stages.objections ? [
@@ -522,7 +522,7 @@ export class ReportsService {
           display: 'money',
           pipelineId: refs.salesPipeline.id,
           stageIds: [refs.stages.objections.id],
-          successStageId: refs.stages.paid.id,
+          successStageIds: refs.stages.success.map((stage) => stage.id),
           defaultProbability: 0.3,
         } satisfies DataContractMetric,
       ] : []),
@@ -535,7 +535,7 @@ export class ReportsService {
         display: 'money',
         pipelineId: refs.salesPipeline.id,
         stageIds: [refs.stages.invoice.id],
-        successStageId: refs.stages.paid.id,
+        successStageIds: refs.stages.success.map((stage) => stage.id),
         defaultProbability: 0.9,
       },
       currentStageMetric('count_assembly', 'Сделок в сборке', assemblyStageIds, 'number', 'deal_count', refs.assemblyPipeline?.id ?? ''),
@@ -1760,11 +1760,11 @@ ${sheets}
     if (deals.length === 0) return deals;
     const stageIds = metric.stageIds?.filter(Boolean) ?? [];
     const pipelineIds = [...new Set(deals.map((deal) => deal.pipelineId).filter(Boolean))];
-    const successStageByPipelineId = this.metricSuccessStageByPipelineId(metric, pipelineIds);
+    const successStageIdsByPipelineId = this.metricSuccessStageIdsByPipelineId(metric, pipelineIds);
     const model = await this.computeStageSuccessProbabilityModel({
       pipelineIds,
       stageIds,
-      successStageByPipelineId,
+      successStageIdsByPipelineId,
       defaultProbability: metric.defaultProbability ?? 0,
     });
 
@@ -1779,27 +1779,46 @@ ${sheets}
     });
   }
 
-  private metricSuccessStageByPipelineId(metric: DataContractMetric, pipelineIds: string[]) {
-    const byPipeline = { ...(metric.successStageByPipelineId ?? {}) };
-    if (metric.successStageId) {
-      if (metric.pipelineId) byPipeline[metric.pipelineId] = metric.successStageId;
-      for (const pipelineId of pipelineIds) {
-        if (!byPipeline[pipelineId]) byPipeline[pipelineId] = metric.successStageId;
+  private metricSuccessStageIdsByPipelineId(metric: DataContractMetric, pipelineIds: string[]) {
+    const byPipeline = new Map<string, Set<string>>();
+    const add = (pipelineId: string | undefined, stageId: string | undefined) => {
+      if (!pipelineId || !stageId) return;
+      if (!byPipeline.has(pipelineId)) byPipeline.set(pipelineId, new Set<string>());
+      byPipeline.get(pipelineId)!.add(stageId);
+    };
+    for (const [pipelineId, stageIds] of Object.entries(metric.successStageIdsByPipelineId ?? {})) {
+      for (const stageId of stageIds ?? []) add(pipelineId, stageId);
+    }
+    for (const [pipelineId, stageId] of Object.entries(metric.successStageByPipelineId ?? {})) {
+      add(pipelineId, stageId);
+    }
+    if (metric.successStageIds?.length) {
+      const targetPipelineIds = metric.pipelineId ? [metric.pipelineId] : pipelineIds;
+      for (const pipelineId of targetPipelineIds) {
+        for (const stageId of metric.successStageIds) add(pipelineId, stageId);
       }
     }
-    return byPipeline;
+    if (metric.successStageId) {
+      if (metric.pipelineId) add(metric.pipelineId, metric.successStageId);
+      for (const pipelineId of pipelineIds) {
+        if (!byPipeline.has(pipelineId)) add(pipelineId, metric.successStageId);
+      }
+    }
+    return Object.fromEntries([...byPipeline.entries()].map(([pipelineId, stageIds]) => [pipelineId, [...stageIds]]));
   }
 
   private async computeStageSuccessProbabilityModel(options: {
     pipelineIds: string[];
     stageIds: string[];
-    successStageByPipelineId: Record<string, string>;
+    successStageByPipelineId?: Record<string, string>;
+    successStageIdsByPipelineId?: Record<string, string[]>;
     defaultProbability: number;
     now?: Date;
   }): Promise<StageSuccessProbabilityModel> {
     const pipelineIds = [...new Set(options.pipelineIds.filter(Boolean))];
     const stageIds = [...new Set(options.stageIds.filter(Boolean))];
-    const successStageIds = [...new Set(Object.values(options.successStageByPipelineId).filter(Boolean))];
+    const successStageIdsByPipelineId = this.normalizeSuccessStageIdsByPipelineId(options);
+    const successStageIds = [...new Set(Object.values(successStageIdsByPipelineId).flat().filter(Boolean))];
     const defaultProbability = this.clampProbability(options.defaultProbability);
     if (!pipelineIds.length || !stageIds.length || !successStageIds.length) {
       return { probability: () => this.defaultStageProbability(defaultProbability) };
@@ -1808,11 +1827,16 @@ ${sheets}
     const now = options.now ?? new Date();
     const periodFrom = this.addDays(now, -30);
     const periodTo = now;
+    const stageRows = await this.db.pipelineStage.findMany({
+      where: { id: { in: [...stageIds, ...successStageIds] } },
+      select: { id: true, pipelineId: true },
+    });
+    const pipelineByStageId = new Map(stageRows.map((stage) => [stage.id, stage.pipelineId]));
     const entries = await this.db.dealStageHistory.findMany({
       where: {
         toStageId: { in: [...stageIds, ...successStageIds] },
         movedAt: { gte: periodFrom, lte: periodTo },
-        deal: { pipelineId: { in: pipelineIds }, deletedAt: null },
+        deal: { deletedAt: null },
       },
       orderBy: [{ dealId: 'asc' }, { movedAt: 'asc' }],
       select: {
@@ -1837,11 +1861,12 @@ ${sheets}
     }
 
     for (const dealEntries of byDeal.values()) {
-      const pipelineId = dealEntries[0]?.deal.pipelineId;
-      const successStageId = pipelineId ? options.successStageByPipelineId[pipelineId] : null;
-      if (!successStageId) continue;
       const managerId = dealEntries[0]?.deal.responsibleId ?? 'unassigned';
       for (const stageId of stageIds) {
+        const pipelineId = pipelineByStageId.get(stageId);
+        if (!pipelineId || !pipelineIds.includes(pipelineId)) continue;
+        const pipelineSuccessStageIds = successStageIdsByPipelineId[pipelineId] ?? [];
+        if (!pipelineSuccessStageIds.length) continue;
         const stageEntry = dealEntries.find((entry) => (
           entry.toStageId === stageId &&
           entry.movedAt >= periodFrom &&
@@ -1849,7 +1874,7 @@ ${sheets}
         ));
         if (!stageEntry) continue;
         const won = dealEntries.some((entry) => (
-          entry.toStageId === successStageId &&
+          pipelineSuccessStageIds.includes(entry.toStageId) &&
           entry.movedAt > stageEntry.movedAt &&
           entry.movedAt <= periodTo
         ));
@@ -1904,6 +1929,21 @@ ${sheets}
         return this.stageProbabilityResult(defaultProbability, 'default', personalStat, teamStat, personalRate, teamRate);
       },
     };
+  }
+
+  private normalizeSuccessStageIdsByPipelineId(options: {
+    successStageByPipelineId?: Record<string, string>;
+    successStageIdsByPipelineId?: Record<string, string[]>;
+  }) {
+    const normalized: Record<string, string[]> = {};
+    for (const [pipelineId, stageIds] of Object.entries(options.successStageIdsByPipelineId ?? {})) {
+      normalized[pipelineId] = [...new Set((stageIds ?? []).filter(Boolean))];
+    }
+    for (const [pipelineId, stageId] of Object.entries(options.successStageByPipelineId ?? {})) {
+      if (!stageId) continue;
+      normalized[pipelineId] = [...new Set([...(normalized[pipelineId] ?? []), stageId])];
+    }
+    return normalized;
   }
 
   private defaultStageProbability(probability: number): StageSuccessProbability {
@@ -3025,23 +3065,24 @@ ${sheets}
     }
 
     const shippingDays = shippingCycle.avgDays ?? 0;
-    const invoiceSpeed = await this.computeStageToSuccessSpeed(refs.salesPipeline!.id, [refs.invoiceStage!.id], refs.salesWonStage!.id);
+    const salesWonStageIds = refs.salesWonStages.map((stage) => stage.id);
+    const invoiceSpeed = await this.computeStageToSuccessSpeed(refs.salesPipeline!.id, [refs.invoiceStage!.id], salesWonStageIds);
     const quoteSpeed = await this.computeStageToSuccessSpeed(
       refs.salesPipeline!.id,
       refs.quoteStages.map((stage) => stage.id),
-      refs.salesWonStage!.id,
+      salesWonStageIds,
     );
-    const salesSuccessStageByPipelineId = { [refs.salesPipeline!.id]: refs.salesWonStage!.id };
+    const salesSuccessStageIdsByPipelineId = { [refs.salesPipeline!.id]: salesWonStageIds };
     const invoiceProbability = await this.computeStageSuccessProbabilityModel({
       pipelineIds: [refs.salesPipeline!.id],
       stageIds: [refs.invoiceStage!.id],
-      successStageByPipelineId: salesSuccessStageByPipelineId,
+      successStageIdsByPipelineId: salesSuccessStageIdsByPipelineId,
       defaultProbability: 0.9,
     });
     const quoteProbability = await this.computeStageSuccessProbabilityModel({
       pipelineIds: [refs.salesPipeline!.id],
       stageIds: refs.quoteStages.map((stage) => stage.id),
-      successStageByPipelineId: salesSuccessStageByPipelineId,
+      successStageIdsByPipelineId: salesSuccessStageIdsByPipelineId,
       defaultProbability: 0.3,
     });
     const repeatSpeeds = await Promise.all(
@@ -3416,7 +3457,8 @@ ${sheets}
       );
     });
     const quoteStages = quoteLikeStages(salesStages);
-    const salesWonStage = salesStages.find((stage) => this.isBusinessWonStage(stage)) ?? null;
+    const salesWonStages = this.businessWonStages(salesStages);
+    const salesWonStage = salesWonStages[0] ?? null;
     const shippingDoneStage =
       assemblyStages.find((stage) => this.normalizeStageName(stage.name).includes('отгруж')) ??
       assemblyStages.find((stage) => this.isBusinessWonStage(stage)) ??
@@ -3464,6 +3506,7 @@ ${sheets}
       salesPipeline,
       assemblyPipeline,
       salesWonStage,
+      salesWonStages,
       invoiceStage,
       quoteStages,
       repeatPipelines,
@@ -3523,6 +3566,7 @@ ${sheets}
       stageByName(salesStages, ['счет', 'оплачен']) ??
       salesStages.find((stage) => this.isBusinessWonStage(stage)) ??
       null;
+    const success = this.businessWonStages(salesStages);
     if (!assigned || !kp || !invoice || !paid) return null;
 
     const assemblyStages = (assemblyPipeline?.stages ?? [])
@@ -3543,6 +3587,7 @@ ${sheets}
         objections,
         invoice,
         paid,
+        success: success.length ? success : [paid],
       },
     };
   }
@@ -3769,11 +3814,12 @@ ${sheets}
     };
   }
 
-  private async computeStageToSuccessSpeed(pipelineId: string, fromStageIds: string[], successStageId: string) {
+  private async computeStageToSuccessSpeed(pipelineId: string, fromStageIds: string[], successStageId: string | string[]) {
+    const successStageIds = Array.isArray(successStageId) ? successStageId.filter(Boolean) : [successStageId].filter(Boolean);
     const entries = await this.db.dealStageHistory.findMany({
       where: {
-        toStageId: { in: [...fromStageIds, successStageId] },
-        deal: { pipelineId, deletedAt: null },
+        toStageId: { in: [...fromStageIds, ...successStageIds] },
+        deal: { deletedAt: null },
       },
       orderBy: [{ dealId: 'asc' }, { movedAt: 'asc' }],
       select: {
@@ -3783,6 +3829,11 @@ ${sheets}
         deal: { select: { responsibleId: true } },
       },
     });
+    const fromStageRows = await this.db.pipelineStage.findMany({
+      where: { id: { in: fromStageIds } },
+      select: { id: true, pipelineId: true },
+    });
+    const validFromStageIds = new Set(fromStageRows.filter((stage) => stage.pipelineId === pipelineId).map((stage) => stage.id));
     const values = new Map<string, number[]>();
     const add = (key: string, value: number) => {
       if (!values.has(key)) values.set(key, []);
@@ -3794,10 +3845,11 @@ ${sheets}
       byDeal.get(entry.dealId)!.push(entry);
     }
     for (const dealEntries of byDeal.values()) {
-      const successEntry = dealEntries.find((entry) => entry.toStageId === successStageId);
+      const successEntry = dealEntries.find((entry) => successStageIds.includes(entry.toStageId));
       if (!successEntry) continue;
       const managerId = successEntry.deal.responsibleId ?? 'unassigned';
       for (const stageId of fromStageIds) {
+        if (!validFromStageIds.has(stageId)) continue;
         const stageEntry = [...dealEntries]
           .reverse()
           .find((entry) => entry.toStageId === stageId && entry.movedAt < successEntry.movedAt);
@@ -4039,6 +4091,14 @@ ${sheets}
     if (stage.isWon) return true;
     const name = this.normalizeStageName(stage.name);
     return name.includes('оплачен') || name.includes('успеш');
+  }
+
+  private businessWonStages<T extends { id: string; isWon?: boolean; name?: string }>(stages: T[]) {
+    const byId = new Map<string, T>();
+    for (const stage of stages) {
+      if (this.isBusinessWonStage(stage)) byId.set(stage.id, stage);
+    }
+    return [...byId.values()];
   }
 
   private isBusinessLostStage(stage: { isLost?: boolean; name?: string }) {

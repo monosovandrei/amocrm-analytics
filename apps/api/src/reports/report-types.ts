@@ -57,7 +57,9 @@ export interface DataContractMetric {
   marginFieldId?: string;
   formula?: string;
   successStageId?: string;
+  successStageIds?: string[];
   successStageByPipelineId?: Record<string, string>;
+  successStageIdsByPipelineId?: Record<string, string[]>;
   defaultProbability?: number;
   extraFilters?: DataContractFilter[];
   createdWithinAmount?: number;
