@@ -547,6 +547,62 @@ describe('ReportsService data contract', () => {
     expect((service as any).revenueForecastShippingBucket(repeatDeal, refs, true)).toBe('repeatShippingThisMonth');
   });
 
+  it('calculates stage success probability from the last 30 days', async () => {
+    const now = new Date('2026-07-08T12:00:00.000Z');
+    const pipelineId = 'pipeline-sales';
+    const stageId = 'stage-kp-30d';
+    const successStageId = 'stage-paid-30d';
+    const managerId = 'manager-30d';
+    const stageEntries = Array.from({ length: 10 }, (_, index) => ({
+      dealId: `deal-30d-${index}`,
+      toStageId: stageId,
+      movedAt: new Date(`2026-06-${18 + index}T10:00:00.000Z`),
+      deal: { pipelineId, responsibleId: managerId },
+    }));
+    const successEntries = stageEntries.slice(0, 4).map((entry, index) => ({
+      dealId: entry.dealId,
+      toStageId: successStageId,
+      movedAt: new Date(`2026-06-${20 + index}T10:00:00.000Z`),
+      deal: { pipelineId, responsibleId: managerId },
+    }));
+    const outOfWindowEntry = {
+      dealId: 'deal-old',
+      toStageId: stageId,
+      movedAt: new Date('2026-05-20T10:00:00.000Z'),
+      deal: { pipelineId, responsibleId: managerId },
+    };
+    const db = {
+      dealStageHistory: {
+        findMany: jest.fn().mockResolvedValue([...stageEntries, ...successEntries, outOfWindowEntry]),
+      },
+    };
+    const localService = new ReportsService(db as any, audit as any);
+
+    const model = await (localService as any).computeStageSuccessProbabilityModel({
+      pipelineIds: [pipelineId],
+      stageIds: [stageId],
+      successStageByPipelineId: { [pipelineId]: successStageId },
+      defaultProbability: 0.3,
+      now,
+    });
+
+    const probability = model.probability(stageId, managerId);
+    expect(db.dealStageHistory.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        movedAt: {
+          gte: new Date('2026-06-08T12:00:00.000Z'),
+          lte: now,
+        },
+      }),
+    }));
+    expect(probability).toMatchObject({
+      source: 'personal',
+      personalSample: 10,
+      personalWins: 4,
+    });
+    expect(probability.probability).toBeCloseTo(0.4, 6);
+  });
+
   it('counts only the first-ever transition into a selected stage', async () => {
     const result = await service.compute(
       {

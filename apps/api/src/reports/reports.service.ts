@@ -1806,13 +1806,12 @@ ${sheets}
     }
 
     const now = options.now ?? new Date();
-    const monthStart = this.startOfMoscowMonth(now);
-    const trainingFrom = this.addDays(monthStart, -90);
-    const matureUntil = this.addDays(monthStart, -14);
+    const periodFrom = this.addDays(now, -30);
+    const periodTo = now;
     const entries = await this.db.dealStageHistory.findMany({
       where: {
         toStageId: { in: [...stageIds, ...successStageIds] },
-        movedAt: { gte: trainingFrom, lt: monthStart },
+        movedAt: { gte: periodFrom, lte: periodTo },
         deal: { pipelineId: { in: pipelineIds }, deletedAt: null },
       },
       orderBy: [{ dealId: 'asc' }, { movedAt: 'asc' }],
@@ -1845,14 +1844,14 @@ ${sheets}
       for (const stageId of stageIds) {
         const stageEntry = dealEntries.find((entry) => (
           entry.toStageId === stageId &&
-          entry.movedAt >= trainingFrom &&
-          entry.movedAt <= matureUntil
+          entry.movedAt >= periodFrom &&
+          entry.movedAt <= periodTo
         ));
         if (!stageEntry) continue;
         const won = dealEntries.some((entry) => (
           entry.toStageId === successStageId &&
           entry.movedAt > stageEntry.movedAt &&
-          entry.movedAt < monthStart
+          entry.movedAt <= periodTo
         ));
         add(`${managerId}:${stageId}`, won);
         add(`all:${stageId}`, won);
@@ -3252,7 +3251,7 @@ ${sheets}
       assumptions: [
         'Сборка считается с вероятностью 100%.',
         'Счета, КП и возражения взвешиваются по персональной исторической конверсии менеджера.',
-        'Текущий месяц не входит в историческую базу; свежие сделки последних 14 дней перед месяцем не портят выборку.',
+        'Конверсии считаются по переходам за последние 30 дней.',
         'Если у менеджера мало данных, берётся конверсия команды, затем базовые 90% для счёта и 30% для КП.',
         'База и Закрепленные Компании считаются как Повторные продажи.',
         'Уже отгруженные сделки показываются отдельной строкой с вероятностью 100%.',
