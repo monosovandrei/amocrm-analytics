@@ -5696,8 +5696,25 @@ function ContractDealDrilldown({
   meta: string;
   sections: Array<{ label?: string; count?: number; samples: ContractDealSample[] }>;
 }) {
+  const triggerRef = useRef<HTMLSpanElement>(null);
+  const [align, setAlign] = useState<'left' | 'right'>('left');
+  const placePopover = useCallback(() => {
+    const rect = triggerRef.current?.getBoundingClientRect();
+    if (!rect || typeof window === 'undefined') return;
+    const width = Math.min(380, window.innerWidth - 56);
+    const fitsRight = rect.left + width <= window.innerWidth - 16;
+    const fitsLeft = rect.right - width >= 16;
+    setAlign(!fitsRight && fitsLeft ? 'right' : 'left');
+  }, []);
+
   return (
-    <span className="drilldown-popover-trigger" tabIndex={0}>
+    <span
+      ref={triggerRef}
+      className={`drilldown-popover-trigger drilldown-popover-${align}`}
+      tabIndex={0}
+      onFocus={placePopover}
+      onMouseEnter={placePopover}
+    >
       {trigger}
       <span className="duration-popover">
         <span className="deal-cycle-tooltip-title">{title}</span>

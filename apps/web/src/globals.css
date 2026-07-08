@@ -1529,6 +1529,16 @@ button:disabled {
     transform 120ms ease;
 }
 
+.drilldown-popover-trigger.drilldown-popover-left .duration-popover {
+  right: auto;
+  left: 0;
+}
+
+.drilldown-popover-trigger.drilldown-popover-right .duration-popover {
+  right: 0;
+  left: auto;
+}
+
 .duration-popover-trigger:hover .duration-popover,
 .duration-popover-trigger:focus .duration-popover,
 .duration-popover-trigger:focus-within .duration-popover,
