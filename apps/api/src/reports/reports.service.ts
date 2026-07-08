@@ -751,6 +751,7 @@ export class ReportsService {
         display: 'money',
         stageIds: csmOfferStageIds,
         successStageIdsByPipelineId: csmSuccessStageIdsByPipelineId,
+        probabilityStageScope: 'metric',
         defaultProbability: 0.3,
       },
       {
@@ -776,6 +777,7 @@ export class ReportsService {
         display: 'money',
         stageIds: csmInvoiceStageIds,
         successStageIdsByPipelineId: csmSuccessStageIdsByPipelineId,
+        probabilityStageScope: 'metric',
         defaultProbability: 0.9,
       },
       {
@@ -1771,6 +1773,7 @@ ${sheets}
       pipelineIds,
       stageIds,
       successStageIdsByPipelineId,
+      groupStageIds: metric.probabilityStageScope === 'metric',
       defaultProbability: metric.defaultProbability ?? 0,
     });
 
@@ -1818,6 +1821,7 @@ ${sheets}
     stageIds: string[];
     successStageByPipelineId?: Record<string, string>;
     successStageIdsByPipelineId?: Record<string, string[]>;
+    groupStageIds?: boolean;
     defaultProbability: number;
     now?: Date;
   }): Promise<StageSuccessProbabilityModel> {
@@ -1868,6 +1872,28 @@ ${sheets}
 
     for (const dealEntries of byDeal.values()) {
       const managerId = dealEntries[0]?.deal.responsibleId ?? 'unassigned';
+      if (options.groupStageIds) {
+        const stageEntry = dealEntries.find((entry) => (
+          stageIds.includes(entry.toStageId) &&
+          entry.movedAt >= periodFrom &&
+          entry.movedAt <= periodTo
+        ));
+        if (!stageEntry) continue;
+        const pipelineId = pipelineByStageId.get(stageEntry.toStageId);
+        if (!pipelineId || !pipelineIds.includes(pipelineId)) continue;
+        const pipelineSuccessStageIds = successStageIdsByPipelineId[pipelineId] ?? [];
+        if (!pipelineSuccessStageIds.length) continue;
+        const won = dealEntries.some((entry) => (
+          pipelineSuccessStageIds.includes(entry.toStageId) &&
+          entry.movedAt > stageEntry.movedAt &&
+          entry.movedAt <= periodTo
+        ));
+        add(`${managerId}:metric`, won);
+        add('all:metric', won);
+        add(`${managerId}:all`, won);
+        add('all:all', won);
+        continue;
+      }
       for (const stageId of stageIds) {
         const pipelineId = pipelineByStageId.get(stageId);
         if (!pipelineId || !pipelineIds.includes(pipelineId)) continue;
@@ -1897,9 +1923,10 @@ ${sheets}
     return {
       probability: (stageId: string, managerId?: string | null) => {
         const safeManagerId = managerId ?? 'unassigned';
-        const personal = getStat(`${safeManagerId}:${stageId}`);
+        const probabilityStageId = options.groupStageIds ? 'metric' : stageId;
+        const personal = getStat(`${safeManagerId}:${probabilityStageId}`);
         const personalFallback = getStat(`${safeManagerId}:all`);
-        const team = getStat(`all:${stageId}`);
+        const team = getStat(`all:${probabilityStageId}`);
         const teamFallback = getStat('all:all');
         const personalStat = personal.sample > 0 ? personal : personalFallback;
         const teamStat = team.sample > 0 ? team : teamFallback;

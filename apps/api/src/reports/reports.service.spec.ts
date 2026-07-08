@@ -713,6 +713,68 @@ describe('ReportsService data contract', () => {
     expect(probability.probability).toBeCloseTo(0.7, 6);
   });
 
+  it('merges sibling CSM stages into one metric-level probability sample', async () => {
+    const now = new Date('2026-07-08T12:00:00.000Z');
+    const basePipelineId = 'pipeline-base';
+    const assignedPipelineId = 'pipeline-assigned';
+    const baseOfferStageId = 'stage-base-offer';
+    const assignedOfferStageId = 'stage-assigned-offer';
+    const baseSuccessStageId = 'stage-base-paid';
+    const managerId = 'manager-csm';
+    const stageEntries = Array.from({ length: 10 }, (_, index) => ({
+      dealId: `deal-csm-merged-${index}`,
+      toStageId: baseOfferStageId,
+      movedAt: new Date(`2026-06-${18 + index}T10:00:00.000Z`),
+      deal: { pipelineId: assignedPipelineId, responsibleId: managerId },
+    }));
+    const duplicateSiblingStageEntry = {
+      dealId: 'deal-csm-merged-0',
+      toStageId: assignedOfferStageId,
+      movedAt: new Date('2026-06-19T10:00:00.000Z'),
+      deal: { pipelineId: assignedPipelineId, responsibleId: managerId },
+    };
+    const successEntries = stageEntries.slice(0, 6).map((entry, index) => ({
+      dealId: entry.dealId,
+      toStageId: baseSuccessStageId,
+      movedAt: new Date(`2026-06-${20 + index}T10:00:00.000Z`),
+      deal: { pipelineId: assignedPipelineId, responsibleId: managerId },
+    }));
+    const db = {
+      pipelineStage: {
+        findMany: jest.fn().mockResolvedValue([
+          { id: baseOfferStageId, pipelineId: basePipelineId },
+          { id: assignedOfferStageId, pipelineId: assignedPipelineId },
+          { id: baseSuccessStageId, pipelineId: basePipelineId },
+        ]),
+      },
+      dealStageHistory: {
+        findMany: jest.fn().mockResolvedValue([...stageEntries, duplicateSiblingStageEntry, ...successEntries]),
+      },
+    };
+    const localService = new ReportsService(db as any, audit as any);
+
+    const model = await (localService as any).computeStageSuccessProbabilityModel({
+      pipelineIds: [basePipelineId, assignedPipelineId],
+      stageIds: [baseOfferStageId, assignedOfferStageId],
+      successStageIdsByPipelineId: {
+        [basePipelineId]: [baseSuccessStageId],
+        [assignedPipelineId]: [baseSuccessStageId],
+      },
+      groupStageIds: true,
+      defaultProbability: 0.3,
+      now,
+    });
+
+    const probability = model.probability(baseOfferStageId, managerId);
+    expect(probability).toMatchObject({
+      source: 'personal',
+      personalSample: 10,
+      personalWins: 6,
+    });
+    expect(probability.probability).toBeCloseTo(0.6, 6);
+    expect(model.probability(assignedOfferStageId, managerId).probability).toBeCloseTo(0.6, 6);
+  });
+
   it('counts only the first-ever transition into a selected stage', async () => {
     const result = await service.compute(
       {
