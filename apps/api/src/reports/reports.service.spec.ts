@@ -552,6 +552,7 @@ describe('ReportsService data contract', () => {
     const pipelineId = 'pipeline-sales';
     const stageId = 'stage-kp-30d';
     const successStageId = 'stage-paid-30d';
+    const lossStageId = 'stage-lost-30d';
     const managerId = 'manager-30d';
     const stageEntries = Array.from({ length: 10 }, (_, index) => ({
       dealId: `deal-30d-${index}`,
@@ -561,8 +562,16 @@ describe('ReportsService data contract', () => {
     }));
     const successEntries = stageEntries.slice(0, 4).map((entry, index) => ({
       dealId: entry.dealId,
+      fromStageId: stageId,
       toStageId: successStageId,
       movedAt: new Date(`2026-06-${20 + index}T10:00:00.000Z`),
+      deal: { pipelineId, responsibleId: managerId },
+    }));
+    const lossEntries = stageEntries.slice(4).map((entry, index) => ({
+      dealId: entry.dealId,
+      fromStageId: stageId,
+      toStageId: lossStageId,
+      movedAt: new Date(`2026-06-${24 + index}T10:00:00.000Z`),
       deal: { pipelineId, responsibleId: managerId },
     }));
     const outOfWindowEntry = {
@@ -574,12 +583,15 @@ describe('ReportsService data contract', () => {
     const db = {
       pipelineStage: {
         findMany: jest.fn().mockResolvedValue([
-          { id: stageId, pipelineId },
-          { id: successStageId, pipelineId },
+          { id: stageId, pipelineId, name: 'KP', isLost: false, pipeline: { name: 'Sales' } },
+          { id: successStageId, pipelineId, name: 'Paid', isLost: false, pipeline: { name: 'Sales' } },
+          { id: lossStageId, pipelineId, name: 'Lost', isLost: true, pipeline: { name: 'Sales' } },
         ]),
       },
       dealStageHistory: {
-        findMany: jest.fn().mockResolvedValue([...stageEntries, ...successEntries, outOfWindowEntry]),
+        findMany: jest.fn()
+          .mockResolvedValueOnce([...successEntries, ...lossEntries])
+          .mockResolvedValueOnce([...stageEntries, ...successEntries, ...lossEntries, outOfWindowEntry]),
       },
     };
     const localService = new ReportsService(db as any, audit as any);
@@ -773,6 +785,72 @@ describe('ReportsService data contract', () => {
     });
     expect(probability.probability).toBeCloseTo(0.6, 6);
     expect(model.probability(assignedOfferStageId, managerId).probability).toBeCloseTo(0.6, 6);
+  });
+
+  it('uses terminal outcomes and treats Base free-base returns as losses', async () => {
+    const now = new Date('2026-07-08T12:00:00.000Z');
+    const basePipelineId = 'pipeline-base';
+    const offerStageId = 'stage-base-offer';
+    const successStageId = 'stage-base-paid';
+    const freeBaseStageId = 'stage-free-base';
+    const managerId = 'manager-csm';
+    const successEntries = Array.from({ length: 6 }, (_, index) => ({
+      dealId: `deal-paid-without-history-${index}`,
+      fromStageId: null,
+      toStageId: successStageId,
+      movedAt: new Date(`2026-06-${18 + index}T10:00:00.000Z`),
+      deal: { pipelineId: basePipelineId, responsibleId: managerId },
+    }));
+    const freeBaseEntries = Array.from({ length: 4 }, (_, index) => ({
+      dealId: `deal-returned-free-base-${index}`,
+      fromStageId: offerStageId,
+      toStageId: freeBaseStageId,
+      movedAt: new Date(`2026-06-${24 + index}T10:00:00.000Z`),
+      deal: { pipelineId: basePipelineId, responsibleId: managerId },
+    }));
+    const historyEntries = [
+      ...successEntries,
+      ...freeBaseEntries.map((entry) => ({
+        dealId: entry.dealId,
+        fromStageId: null,
+        toStageId: offerStageId,
+        movedAt: new Date(entry.movedAt.getTime() - 60_000),
+      })),
+      ...freeBaseEntries,
+    ];
+    const db = {
+      pipelineStage: {
+        findMany: jest.fn().mockResolvedValue([
+          { id: offerStageId, pipelineId: basePipelineId, name: 'сделано предложение', isLost: false, pipeline: { name: 'База' } },
+          { id: successStageId, pipelineId: basePipelineId, name: 'Счет оплачен', isLost: false, pipeline: { name: 'База' } },
+          { id: freeBaseStageId, pipelineId: basePipelineId, name: 'свободная база', isLost: false, pipeline: { name: 'База' } },
+        ]),
+      },
+      dealStageHistory: {
+        findMany: jest.fn()
+          .mockResolvedValueOnce([...successEntries, ...freeBaseEntries])
+          .mockResolvedValueOnce(historyEntries),
+      },
+    };
+    const localService = new ReportsService(db as any, audit as any);
+
+    const model = await (localService as any).computeStageSuccessProbabilityModel({
+      pipelineIds: [basePipelineId],
+      stageIds: [offerStageId],
+      successStageIdsByPipelineId: { [basePipelineId]: [successStageId] },
+      reachedStageIds: [offerStageId],
+      inferSuccessAsReached: true,
+      defaultProbability: 0.3,
+      now,
+    });
+
+    const probability = model.probability(offerStageId, managerId);
+    expect(probability).toMatchObject({
+      source: 'personal',
+      personalSample: 10,
+      personalWins: 6,
+    });
+    expect(probability.probability).toBeCloseTo(0.6, 6);
   });
 
   it('counts only the first-ever transition into a selected stage', async () => {

@@ -493,6 +493,11 @@ export class ReportsService {
       },
     ];
     const assemblyStageIds = refs.assemblyStages.map((stage) => stage.id);
+    const salesKpReachedStageIds = [
+      refs.stages.kp.id,
+      ...(refs.stages.objections ? [refs.stages.objections.id] : []),
+      refs.stages.invoice.id,
+    ];
     const weightedTotalParts = [
       '[КП презентовано x конверсия]',
       ...(refs.stages.objections ? ['[Есть возражения x конверсия]'] : []),
@@ -509,6 +514,8 @@ export class ReportsService {
         display: 'money',
         pipelineId: refs.salesPipeline.id,
         stageIds: [refs.stages.kp.id],
+        probabilityReachedStageIds: salesKpReachedStageIds,
+        inferSuccessAsReached: true,
         successStageIds: refs.stages.success.map((stage) => stage.id),
         defaultProbability: 0.3,
       },
@@ -522,6 +529,7 @@ export class ReportsService {
           display: 'money',
           pipelineId: refs.salesPipeline.id,
           stageIds: [refs.stages.objections.id],
+          probabilityReachedStageIds: [refs.stages.objections.id],
           successStageIds: refs.stages.success.map((stage) => stage.id),
           defaultProbability: 0.3,
         } satisfies DataContractMetric,
@@ -535,6 +543,8 @@ export class ReportsService {
         display: 'money',
         pipelineId: refs.salesPipeline.id,
         stageIds: [refs.stages.invoice.id],
+        probabilityReachedStageIds: [refs.stages.invoice.id],
+        inferSuccessAsReached: true,
         successStageIds: refs.stages.success.map((stage) => stage.id),
         defaultProbability: 0.9,
       },
@@ -698,6 +708,7 @@ export class ReportsService {
     const csmPipelines = [refs.basePipeline.id, refs.assignedPipeline.id];
     const csmOfferStageIds = [refs.baseStages.offer.id, refs.assignedStages.offer.id];
     const csmInvoiceStageIds = [refs.baseStages.invoice.id, refs.assignedStages.invoice.id];
+    const csmKpReachedStageIds = [...csmOfferStageIds, ...csmInvoiceStageIds];
     const csmSuccessStageIds = [
       ...new Set([
         ...refs.baseStages.success.map((stage) => stage.id),
@@ -750,6 +761,8 @@ export class ReportsService {
         type: 'weighted_stage_sum',
         display: 'money',
         stageIds: csmOfferStageIds,
+        probabilityReachedStageIds: csmKpReachedStageIds,
+        inferSuccessAsReached: true,
         successStageIdsByPipelineId: csmSuccessStageIdsByPipelineId,
         probabilityStageScope: 'metric',
         defaultProbability: 0.3,
@@ -776,6 +789,8 @@ export class ReportsService {
         type: 'weighted_stage_sum',
         display: 'money',
         stageIds: csmInvoiceStageIds,
+        probabilityReachedStageIds: csmInvoiceStageIds,
+        inferSuccessAsReached: true,
         successStageIdsByPipelineId: csmSuccessStageIdsByPipelineId,
         probabilityStageScope: 'metric',
         defaultProbability: 0.9,
@@ -1774,6 +1789,8 @@ ${sheets}
       stageIds,
       successStageIdsByPipelineId,
       groupStageIds: metric.probabilityStageScope === 'metric',
+      reachedStageIds: metric.probabilityReachedStageIds,
+      inferSuccessAsReached: metric.inferSuccessAsReached,
       defaultProbability: metric.defaultProbability ?? 0,
     });
 
@@ -1822,11 +1839,14 @@ ${sheets}
     successStageByPipelineId?: Record<string, string>;
     successStageIdsByPipelineId?: Record<string, string[]>;
     groupStageIds?: boolean;
+    reachedStageIds?: string[];
+    inferSuccessAsReached?: boolean;
     defaultProbability: number;
     now?: Date;
   }): Promise<StageSuccessProbabilityModel> {
     const pipelineIds = [...new Set(options.pipelineIds.filter(Boolean))];
     const stageIds = [...new Set(options.stageIds.filter(Boolean))];
+    const reachedStageIds = [...new Set([...(options.reachedStageIds ?? []), ...stageIds].filter(Boolean))];
     const successStageIdsByPipelineId = this.normalizeSuccessStageIdsByPipelineId(options);
     const successStageIds = [...new Set(Object.values(successStageIdsByPipelineId).flat().filter(Boolean))];
     const defaultProbability = this.clampProbability(options.defaultProbability);
@@ -1838,22 +1858,61 @@ ${sheets}
     const periodFrom = this.addDays(now, -30);
     const periodTo = now;
     const stageRows = await this.db.pipelineStage.findMany({
-      where: { id: { in: [...stageIds, ...successStageIds] } },
-      select: { id: true, pipelineId: true },
+      where: {
+        OR: [
+          { id: { in: [...reachedStageIds, ...successStageIds] } },
+          { pipelineId: { in: pipelineIds } },
+        ],
+      },
+      select: {
+        id: true,
+        pipelineId: true,
+        name: true,
+        isLost: true,
+        pipeline: { select: { name: true } },
+      },
     });
     const pipelineByStageId = new Map(stageRows.map((stage) => [stage.id, stage.pipelineId]));
-    const entries = await this.db.dealStageHistory.findMany({
+    const lossStageIds = this.probabilityLossStageIds(stageRows, pipelineIds);
+    const terminalStageIds = [...new Set([...successStageIds, ...lossStageIds])];
+    if (!terminalStageIds.length) {
+      return { probability: () => this.defaultStageProbability(defaultProbability) };
+    }
+
+    const terminalEntries = await this.db.dealStageHistory.findMany({
       where: {
-        toStageId: { in: [...stageIds, ...successStageIds] },
+        toStageId: { in: terminalStageIds },
         movedAt: { gte: periodFrom, lte: periodTo },
         deal: { deletedAt: null },
       },
       orderBy: [{ dealId: 'asc' }, { movedAt: 'asc' }],
       select: {
         dealId: true,
+        fromStageId: true,
         toStageId: true,
         movedAt: true,
         deal: { select: { pipelineId: true, responsibleId: true } },
+      },
+    });
+    if (!terminalEntries.length) {
+      return { probability: () => this.defaultStageProbability(defaultProbability) };
+    }
+
+    const lastTerminalByDeal = new Map<string, (typeof terminalEntries)[number]>();
+    for (const entry of terminalEntries) {
+      lastTerminalByDeal.set(entry.dealId, entry);
+    }
+    const historyEntries = await this.db.dealStageHistory.findMany({
+      where: {
+        dealId: { in: [...lastTerminalByDeal.keys()] },
+        movedAt: { lte: periodTo },
+      },
+      orderBy: [{ dealId: 'asc' }, { movedAt: 'asc' }],
+      select: {
+        dealId: true,
+        fromStageId: true,
+        toStageId: true,
+        movedAt: true,
       },
     });
 
@@ -1864,30 +1923,18 @@ ${sheets}
       if (win) stat.wins += 1;
       stats.set(key, stat);
     };
-    const byDeal = new Map<string, typeof entries>();
-    for (const entry of entries) {
+    const byDeal = new Map<string, typeof historyEntries>();
+    for (const entry of historyEntries) {
       if (!byDeal.has(entry.dealId)) byDeal.set(entry.dealId, []);
       byDeal.get(entry.dealId)!.push(entry);
     }
 
-    for (const dealEntries of byDeal.values()) {
-      const managerId = dealEntries[0]?.deal.responsibleId ?? 'unassigned';
+    for (const terminalEntry of lastTerminalByDeal.values()) {
+      const managerId = terminalEntry.deal.responsibleId ?? 'unassigned';
+      const dealEntries = (byDeal.get(terminalEntry.dealId) ?? []).filter((entry) => entry.movedAt <= terminalEntry.movedAt);
+      const won = successStageIds.includes(terminalEntry.toStageId);
       if (options.groupStageIds) {
-        const stageEntry = dealEntries.find((entry) => (
-          stageIds.includes(entry.toStageId) &&
-          entry.movedAt >= periodFrom &&
-          entry.movedAt <= periodTo
-        ));
-        if (!stageEntry) continue;
-        const pipelineId = pipelineByStageId.get(stageEntry.toStageId);
-        if (!pipelineId || !pipelineIds.includes(pipelineId)) continue;
-        const pipelineSuccessStageIds = successStageIdsByPipelineId[pipelineId] ?? [];
-        if (!pipelineSuccessStageIds.length) continue;
-        const won = dealEntries.some((entry) => (
-          pipelineSuccessStageIds.includes(entry.toStageId) &&
-          entry.movedAt > stageEntry.movedAt &&
-          entry.movedAt <= periodTo
-        ));
+        if (!this.probabilityStageReached(dealEntries, terminalEntry, reachedStageIds, won, Boolean(options.inferSuccessAsReached))) continue;
         add(`${managerId}:metric`, won);
         add('all:metric', won);
         add(`${managerId}:all`, won);
@@ -1897,19 +1944,7 @@ ${sheets}
       for (const stageId of stageIds) {
         const pipelineId = pipelineByStageId.get(stageId);
         if (!pipelineId || !pipelineIds.includes(pipelineId)) continue;
-        const pipelineSuccessStageIds = successStageIdsByPipelineId[pipelineId] ?? [];
-        if (!pipelineSuccessStageIds.length) continue;
-        const stageEntry = dealEntries.find((entry) => (
-          entry.toStageId === stageId &&
-          entry.movedAt >= periodFrom &&
-          entry.movedAt <= periodTo
-        ));
-        if (!stageEntry) continue;
-        const won = dealEntries.some((entry) => (
-          pipelineSuccessStageIds.includes(entry.toStageId) &&
-          entry.movedAt > stageEntry.movedAt &&
-          entry.movedAt <= periodTo
-        ));
+        if (!this.probabilityStageReached(dealEntries, terminalEntry, reachedStageIds, won, Boolean(options.inferSuccessAsReached))) continue;
         add(`${managerId}:${stageId}`, won);
         add(`all:${stageId}`, won);
         add(`${managerId}:all`, won);
@@ -1962,6 +1997,36 @@ ${sheets}
         return this.stageProbabilityResult(defaultProbability, 'default', personalStat, teamStat, personalRate, teamRate);
       },
     };
+  }
+
+  private probabilityLossStageIds(
+    stages: Array<{ id: string; pipelineId: string; name: string; isLost: boolean; pipeline?: { name: string } | null }>,
+    pipelineIds: string[],
+  ) {
+    return stages
+      .filter((stage) => pipelineIds.includes(stage.pipelineId))
+      .filter((stage) => stage.isLost || this.isBaseFreeBaseStage(stage))
+      .map((stage) => stage.id);
+  }
+
+  private isBaseFreeBaseStage(stage: { name: string; pipeline?: { name: string } | null }) {
+    const stageName = this.normalizeStageName(stage.name);
+    const pipelineName = this.normalizeStageName(stage.pipeline?.name ?? '');
+    return pipelineName === this.normalizeStageName('База') && stageName.includes(this.normalizeStageName('Свободная база'));
+  }
+
+  private probabilityStageReached(
+    dealEntries: Array<{ fromStageId?: string | null; toStageId: string; movedAt: Date }>,
+    terminalEntry: { fromStageId?: string | null; toStageId: string },
+    reachedStageIds: string[],
+    won: boolean,
+    inferSuccessAsReached: boolean,
+  ) {
+    if (won && inferSuccessAsReached) return true;
+    return dealEntries.some((entry) => (
+      reachedStageIds.includes(entry.toStageId) ||
+      (entry.fromStageId ? reachedStageIds.includes(entry.fromStageId) : false)
+    )) || (terminalEntry.fromStageId ? reachedStageIds.includes(terminalEntry.fromStageId) : false);
   }
 
   private normalizeSuccessStageIdsByPipelineId(options: {

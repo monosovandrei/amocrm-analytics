@@ -61,6 +61,8 @@ export interface DataContractMetric {
   successStageByPipelineId?: Record<string, string>;
   successStageIdsByPipelineId?: Record<string, string[]>;
   probabilityStageScope?: 'stage' | 'metric';
+  probabilityReachedStageIds?: string[];
+  inferSuccessAsReached?: boolean;
   defaultProbability?: number;
   extraFilters?: DataContractFilter[];
   createdWithinAmount?: number;
