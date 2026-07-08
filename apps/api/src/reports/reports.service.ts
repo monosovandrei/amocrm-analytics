@@ -698,10 +698,11 @@ export class ReportsService {
     const csmPipelines = [refs.basePipeline.id, refs.assignedPipeline.id];
     const csmOfferStageIds = [refs.baseStages.offer.id, refs.assignedStages.offer.id];
     const csmInvoiceStageIds = [refs.baseStages.invoice.id, refs.assignedStages.invoice.id];
-    const csmSuccessStageByPipelineId = {
-      [refs.basePipeline.id]: refs.baseStages.paid.id,
-      [refs.assignedPipeline.id]: refs.assignedStages.paid.id,
+    const csmSuccessStageIdsByPipelineId = {
+      [refs.basePipeline.id]: refs.baseStages.success.map((stage) => stage.id),
+      [refs.assignedPipeline.id]: refs.assignedStages.success.map((stage) => stage.id),
     };
+    const csmSuccessStageIds = Object.values(csmSuccessStageIdsByPipelineId).flat();
     const assemblyStageIds = refs.assemblyStages.map((stage) => stage.id);
     const funnelMetrics: DataContractMetric[] = [
       metric('taken_to_work', 'Взяли в работу', [refs.baseStages.work.id, refs.assignedStages.work.id]),
@@ -710,7 +711,7 @@ export class ReportsService {
       conversion('conv_offer_to_invoice', 'Конверсия КП -> счёт', 'offer_made', 'invoice_sent'),
       metric('invoice_sent', 'Счета отправили', [refs.baseStages.invoice.id, refs.assignedStages.invoice.id]),
       conversion('conv_invoice_to_paid', 'Конверсия счёт -> оплата', 'invoice_sent', 'paid'),
-      metric('paid', 'Оплаченные счета', [refs.baseStages.paid.id, refs.assignedStages.paid.id]),
+      metric('paid', 'Оплаченные счета', csmSuccessStageIds),
       {
         id: 'paid_amount',
         label: 'Сумма оплаченных счетов',
@@ -718,7 +719,7 @@ export class ReportsService {
         measure: 'field_sum',
         display: 'money',
         pipelineId: csmPipelines[0],
-        stageIds: [refs.baseStages.paid.id, refs.assignedStages.paid.id],
+        stageIds: csmSuccessStageIds,
       },
     ];
     const weightedMetrics: DataContractMetric[] = [
@@ -744,7 +745,7 @@ export class ReportsService {
         type: 'weighted_stage_sum',
         display: 'money',
         stageIds: csmOfferStageIds,
-        successStageByPipelineId: csmSuccessStageByPipelineId,
+        successStageIdsByPipelineId: csmSuccessStageIdsByPipelineId,
         defaultProbability: 0.3,
       },
       {
@@ -769,7 +770,7 @@ export class ReportsService {
         type: 'weighted_stage_sum',
         display: 'money',
         stageIds: csmInvoiceStageIds,
-        successStageByPipelineId: csmSuccessStageByPipelineId,
+        successStageIdsByPipelineId: csmSuccessStageIdsByPipelineId,
         defaultProbability: 0.9,
       },
       {
@@ -3089,16 +3090,20 @@ ${sheets}
       refs.repeatPipelines.map(async (pipeline) => ({
         ...pipeline,
         invoiceSpeed: pipeline.invoiceStage
-          ? await this.computeStageToSuccessSpeed(pipeline.id, [pipeline.invoiceStage.id], pipeline.wonStage.id)
+          ? await this.computeStageToSuccessSpeed(pipeline.id, [pipeline.invoiceStage.id], pipeline.wonStages.map((stage) => stage.id))
           : null,
         quoteSpeed: pipeline.quoteStages.length
-          ? await this.computeStageToSuccessSpeed(pipeline.id, pipeline.quoteStages.map((stage) => stage.id), pipeline.wonStage.id)
+          ? await this.computeStageToSuccessSpeed(
+              pipeline.id,
+              pipeline.quoteStages.map((stage) => stage.id),
+              pipeline.wonStages.map((stage) => stage.id),
+            )
           : null,
         invoiceProbability: pipeline.invoiceStage
           ? await this.computeStageSuccessProbabilityModel({
               pipelineIds: [pipeline.id],
               stageIds: [pipeline.invoiceStage.id],
-              successStageByPipelineId: { [pipeline.id]: pipeline.wonStage.id },
+              successStageIdsByPipelineId: { [pipeline.id]: pipeline.wonStages.map((stage) => stage.id) },
               defaultProbability: 0.9,
             })
           : null,
@@ -3106,7 +3111,7 @@ ${sheets}
           ? await this.computeStageSuccessProbabilityModel({
               pipelineIds: [pipeline.id],
               stageIds: pipeline.quoteStages.map((stage) => stage.id),
-              successStageByPipelineId: { [pipeline.id]: pipeline.wonStage.id },
+              successStageIdsByPipelineId: { [pipeline.id]: pipeline.wonStages.map((stage) => stage.id) },
               defaultProbability: 0.3,
             })
           : null,
@@ -3470,11 +3475,13 @@ ${sheets}
       invoiceStage: { id: string; name: string; isWon?: boolean; isLost?: boolean } | null;
       quoteStages: Array<{ id: string; name: string; isWon?: boolean; isLost?: boolean }>;
       wonStage: { id: string; name: string; isWon?: boolean; isLost?: boolean };
+      wonStages: Array<{ id: string; name: string; isWon?: boolean; isLost?: boolean }>;
     }> = [];
     for (const pipeline of [basePipeline, assignedCompaniesPipeline]) {
       if (!pipeline) continue;
       const stages = pipeline.stages ?? [];
-      const wonStage = stages.find((stage) => this.isBusinessWonStage(stage));
+      const wonStages = this.businessWonStages(stages);
+      const wonStage = wonStages[0] ?? null;
       if (!wonStage) continue;
       repeatPipelines.push({
         id: pipeline.id,
@@ -3482,6 +3489,7 @@ ${sheets}
         invoiceStage: stageByName(stages, ['счет', 'отправ']),
         quoteStages: quoteLikeStages(stages),
         wonStage,
+        wonStages,
       });
     }
 
@@ -3622,8 +3630,9 @@ ${sheets}
         stageByName(stages, ['оплачено']) ??
         stages.find((stage) => this.isBusinessWonStage(stage)) ??
         null;
+      const success = this.businessWonStages(stages);
       if (!work || !offer || !invoice || !paid) return null;
-      return { work, offer, invoice, paid };
+      return { work, offer, invoice, paid, success: success.length ? success : [paid] };
     };
 
     const baseStages = resolveStages(basePipeline.stages);
