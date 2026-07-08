@@ -332,6 +332,9 @@ describe('ReportsService data contract', () => {
     expect(row.metrics.invoiceAmount).toMatchObject({ value: 500, unit: 'money', dealCount: 1 });
     expect(row.metrics.avgMargin).toMatchObject({ value: 600, unit: 'money', dealCount: 3 });
     expect(row.metrics.conversion).toMatchObject({ value: 66.67, unit: 'percent', dealCount: 2 });
+    expect(row.metrics.created.samples.map((sample: any) => sample.dealId)).toEqual(['deal-3', 'deal-2', 'deal-1']);
+    expect(row.metrics.conversion.fromSamples.map((sample: any) => sample.dealId)).toEqual(['deal-3', 'deal-2', 'deal-1']);
+    expect(row.metrics.conversion.toSamples.map((sample: any) => sample.dealId)).toEqual(['deal-2', 'deal-1']);
     expect(row.durations.kpDuration).toMatchObject({ sampleSize: 2 });
     expect(row.durations.kpDuration.avgDays).toBeCloseTo(0.770833, 6);
   });

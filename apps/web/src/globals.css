@@ -1484,19 +1484,22 @@ button:disabled {
   font-weight: 800;
 }
 
-.report-matrix td.duration-popover-cell {
+.report-matrix td.duration-popover-cell,
+.report-matrix td.drilldown-popover-cell {
   overflow: visible;
   position: relative;
 }
 
-.duration-popover-trigger {
+.duration-popover-trigger,
+.drilldown-popover-trigger {
   position: relative;
   display: inline-flex;
   cursor: default;
   outline: none;
 }
 
-.duration-popover-trigger:focus {
+.duration-popover-trigger:focus,
+.drilldown-popover-trigger:focus {
   outline: 2px solid var(--pb-primary);
   outline-offset: 2px;
 }
@@ -1528,7 +1531,10 @@ button:disabled {
 
 .duration-popover-trigger:hover .duration-popover,
 .duration-popover-trigger:focus .duration-popover,
-.duration-popover-trigger:focus-within .duration-popover {
+.duration-popover-trigger:focus-within .duration-popover,
+.drilldown-popover-trigger:hover .duration-popover,
+.drilldown-popover-trigger:focus .duration-popover,
+.drilldown-popover-trigger:focus-within .duration-popover {
   opacity: 1;
   pointer-events: auto;
   transform: translateY(0);
@@ -2417,6 +2423,29 @@ button:disabled {
   overflow-y: auto;
 }
 
+.deal-cycle-tooltip-section {
+  display: grid;
+}
+
+.deal-cycle-tooltip-section + .deal-cycle-tooltip-section {
+  margin-top: 6px;
+}
+
+.deal-cycle-tooltip-section-title {
+  border-top: 1px solid var(--pb-border);
+  color: var(--pb-text-secondary);
+  font-size: 12px;
+  font-weight: 900;
+  padding: 7px 0 2px;
+}
+
+.deal-cycle-tooltip-empty {
+  border-top: 1px solid var(--pb-border);
+  color: var(--pb-text-secondary);
+  font-size: 12px;
+  padding: 7px 0;
+}
+
 .deal-cycle-tooltip-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -2424,6 +2453,10 @@ button:disabled {
   border-top: 1px solid var(--pb-border);
   padding: 7px 0;
   font-size: 12px;
+}
+
+.deal-cycle-tooltip-section-title + .deal-cycle-tooltip-row {
+  border-top: 0;
 }
 
 .deal-cycle-tooltip-row span {

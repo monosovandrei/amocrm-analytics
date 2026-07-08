@@ -5439,10 +5439,13 @@ function ReportResultDetails({
                 <th title={metric.label}>{metric.label}</th>
                 {columns.map((column) => {
                   const source = column.summary ? column.summary.metrics : column.row?.metrics;
-                  const value = (source as Record<string, any>)?.[metric.id] ?? {};
+                  const value = ((source as Record<string, ContractMetricValue>)?.[metric.id] ?? {}) as ContractMetricValue;
                   return (
-                    <td key={`${column.id}-${metric.id}`} className={column.summary ? 'summary-col mono-num' : 'mono-num'}>
-                      {formatMetricValue(value.value, value.unit ?? metric.display)}
+                    <td
+                      key={`${column.id}-${metric.id}`}
+                      className={`${column.summary ? 'summary-col mono-num' : 'mono-num'}${hasContractDealDrilldown(value) ? ' drilldown-popover-cell' : ''}`}
+                    >
+                      <ContractMetricCell amoDomain={amoDomain} metric={metric} value={value} />
                     </td>
                   );
                 })}
@@ -5453,10 +5456,13 @@ function ReportResultDetails({
                 <th title={conversion.label}>{conversion.label}</th>
                 {columns.map((column) => {
                   if (column.summary) return <td key={`${column.id}-${conversion.id}`} className="summary-col muted">-</td>;
-                  const value = (column.row?.conversions as Record<string, any>)?.[conversion.id] ?? {};
+                  const value = ((column.row?.conversions as Record<string, ContractConversionValue>)?.[conversion.id] ?? {}) as ContractConversionValue;
                   return (
-                    <td key={`${column.id}-${conversion.id}`} className="mono-num">
-                      {value.conversion == null ? 'нет данных' : `${formatNumber(value.conversion)}%`}
+                    <td
+                      key={`${column.id}-${conversion.id}`}
+                      className={`mono-num${hasContractDealDrilldown(value) ? ' drilldown-popover-cell' : ''}`}
+                    >
+                      <ContractConversionCell amoDomain={amoDomain} value={value} />
                     </td>
                   );
                 })}
@@ -5580,11 +5586,39 @@ function ReportResultDetails({
   return <div className="muted text-sm">Всего сделок: {(result.summary?.count ?? 0) as number}</div>;
 }
 
-type ContractDurationSample = {
+type ContractDealSample = {
   dealId: string;
   dealExternalId?: string;
   dealTitle: string;
+  amount?: number | null;
+  stageName?: string | null;
+  pipelineName?: string | null;
+};
+
+type ContractDurationSample = ContractDealSample & {
   durationDays: number;
+};
+
+type ContractMetricValue = {
+  value?: number | null;
+  unit?: string;
+  dealCount?: number;
+  sampleSize?: number;
+  samples?: ContractDealSample[];
+  from?: number;
+  to?: number;
+  fromSamples?: ContractDealSample[];
+  toSamples?: ContractDealSample[];
+};
+
+type ContractConversionValue = {
+  conversion?: number | null;
+  from?: number;
+  to?: number;
+  sampleSize?: number;
+  samples?: ContractDealSample[];
+  fromSamples?: ContractDealSample[];
+  toSamples?: ContractDealSample[];
 };
 
 type ContractDurationValue = {
@@ -5592,6 +5626,129 @@ type ContractDurationValue = {
   sampleSize?: number;
   samples?: ContractDurationSample[];
 };
+
+function ContractMetricCell({
+  amoDomain,
+  metric,
+  value,
+}: {
+  amoDomain: string;
+  metric: ContractMetricPayload;
+  value: ContractMetricValue;
+}) {
+  const label = formatMetricValue(value.value, value.unit ?? metric.display);
+  if (!hasContractDealDrilldown(value)) return <>{label}</>;
+
+  if (metric.type === 'conversion') {
+    return (
+      <ContractDealDrilldown
+        amoDomain={amoDomain}
+        trigger={label}
+        title="Сделки в конверсии"
+        meta={`База: ${formatNumber(value.from ?? 0)} · дошли: ${formatNumber(value.to ?? 0)}`}
+        sections={[
+          { label: 'База конверсии', count: value.from ?? value.fromSamples?.length ?? 0, samples: value.fromSamples ?? [] },
+          { label: 'Дошли до шага', count: value.to ?? value.toSamples?.length ?? 0, samples: value.toSamples ?? [] },
+        ]}
+      />
+    );
+  }
+
+  return (
+    <ContractDealDrilldown
+      amoDomain={amoDomain}
+      trigger={label}
+      title="Сделки в расчёте"
+      meta={`В расчёте: ${formatNumber(value.sampleSize ?? value.dealCount ?? value.samples?.length ?? 0)} сделок`}
+      sections={[{ samples: value.samples ?? [] }]}
+    />
+  );
+}
+
+function ContractConversionCell({ amoDomain, value }: { amoDomain: string; value: ContractConversionValue }) {
+  const label = value.conversion == null ? 'нет данных' : `${formatNumber(value.conversion)}%`;
+  if (!hasContractDealDrilldown(value)) return <>{label}</>;
+
+  return (
+    <ContractDealDrilldown
+      amoDomain={amoDomain}
+      trigger={label}
+      title="Сделки в конверсии"
+      meta={`База: ${formatNumber(value.from ?? 0)} · дошли: ${formatNumber(value.to ?? 0)}`}
+      sections={[
+        { label: 'База конверсии', count: value.from ?? value.fromSamples?.length ?? 0, samples: value.fromSamples ?? [] },
+        { label: 'Дошли до шага', count: value.to ?? value.toSamples?.length ?? 0, samples: value.toSamples ?? [] },
+      ]}
+    />
+  );
+}
+
+function ContractDealDrilldown({
+  amoDomain,
+  trigger,
+  title,
+  meta,
+  sections,
+}: {
+  amoDomain: string;
+  trigger: string;
+  title: string;
+  meta: string;
+  sections: Array<{ label?: string; count?: number; samples: ContractDealSample[] }>;
+}) {
+  return (
+    <span className="drilldown-popover-trigger" tabIndex={0}>
+      {trigger}
+      <span className="duration-popover">
+        <span className="deal-cycle-tooltip-title">{title}</span>
+        <span className="deal-cycle-tooltip-meta">{meta}</span>
+        <span className="deal-cycle-tooltip-list">
+          {sections.map((section, sectionIndex) => (
+            <span key={`${section.label ?? 'deals'}-${sectionIndex}`} className="deal-cycle-tooltip-section">
+              {section.label && (
+                <span className="deal-cycle-tooltip-section-title">
+                  {section.label}: {formatNumber(section.count ?? section.samples.length)}
+                </span>
+              )}
+              {section.samples.length === 0 ? (
+                <span className="deal-cycle-tooltip-empty">Нет сделок</span>
+              ) : (
+                section.samples.map((sample, index) => {
+                  const dealUrl = buildAmoDealUrl(amoDomain, sample.dealExternalId);
+                  return (
+                    <span key={`${sample.dealId}-${index}`} className="deal-cycle-tooltip-row">
+                      {dealUrl ? (
+                        <a className="deal-cycle-tooltip-link" href={dealUrl} target="_blank" rel="noreferrer" title={sample.dealTitle}>
+                          {sample.dealTitle}
+                        </a>
+                      ) : (
+                        <span title={sample.dealTitle}>{sample.dealTitle}</span>
+                      )}
+                      <strong>{formatContractDealSampleMeta(sample)}</strong>
+                    </span>
+                  );
+                })
+              )}
+            </span>
+          ))}
+        </span>
+      </span>
+    </span>
+  );
+}
+
+function hasContractDealDrilldown(value: ContractMetricValue | ContractConversionValue) {
+  return Boolean(
+    value.samples?.length ||
+      value.fromSamples?.length ||
+      value.toSamples?.length,
+  );
+}
+
+function formatContractDealSampleMeta(sample: ContractDealSample) {
+  if (Number.isFinite(Number(sample.amount))) return formatMoney(Number(sample.amount));
+  return sample.stageName ?? '';
+}
 
 function ContractDurationCell({ amoDomain, value }: { amoDomain: string; value: ContractDurationValue }) {
   const samples = value.samples ?? [];

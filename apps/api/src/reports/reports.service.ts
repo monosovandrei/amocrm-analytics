@@ -33,6 +33,23 @@ type BuiltinReportTemplate = {
   sourceType: ReportSourceType;
   config: ReportConfig;
 };
+type ContractDealSample = {
+  dealId: string;
+  dealExternalId?: string | null;
+  dealTitle: string;
+  amount: number | null;
+  stageName?: string | null;
+  pipelineName?: string | null;
+  updatedAt?: string | null;
+};
+type ContractBucket = {
+  count: number;
+  values: number[];
+  dealIds: Set<string>;
+  samples: ContractDealSample[];
+  value: number | null;
+  unit: string;
+};
 
 function stableStringify(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
@@ -1205,10 +1222,7 @@ ${sheets}
 
     const groupBy = contract.groupBy ?? 'manager';
     const groups = new Map<string, { id: string; name: string }>();
-    const metricResults = new Map<
-      string,
-      Map<string, { count: number; values: number[]; dealIds: Set<string>; value: number | null; unit: string }>
-    >();
+    const metricResults = new Map<string, Map<string, ContractBucket>>();
     if (groupBy === 'none') groups.set('all', { id: 'all', name: 'Отдел' });
     if (groupBy === 'manager') {
       const managers = await this.visibleManagers(role, filters.groupIds, filters.managerIds);
@@ -1216,8 +1230,8 @@ ${sheets}
     }
 
     for (const metric of contract.metrics ?? []) {
-      const byGroup = new Map<string, { count: number; values: number[]; dealIds: Set<string>; value: number | null; unit: string }>();
-      byGroup.set('all', { count: 0, values: [], dealIds: new Set<string>(), value: null, unit: this.metricUnit(metric) });
+      const byGroup = new Map<string, ContractBucket>();
+      byGroup.set('all', this.emptyContractBucket(metric));
 
       if (metric.type === 'conversion' || metric.type === 'formula') {
         metricResults.set(metric.id, byGroup);
@@ -1234,7 +1248,7 @@ ${sheets}
         this.addDealToContractBucket(byGroup.get('all')!, deal, metric);
         if (groupId !== 'all') {
           if (!byGroup.has(groupId)) {
-            byGroup.set(groupId, { count: 0, values: [], dealIds: new Set<string>(), value: null, unit: this.metricUnit(metric) });
+            byGroup.set(groupId, this.emptyContractBucket(metric));
           }
           this.addDealToContractBucket(byGroup.get(groupId)!, deal, metric);
         }
@@ -1252,18 +1266,29 @@ ${sheets}
           const value = metricResults.get(metric.id)?.get(group.id) ?? {
             count: 0,
             dealIds: new Set<string>(),
+            samples: [],
             values: [],
             value: this.emptyMetricValue(metric),
             unit: this.metricUnit(metric),
           };
 
           if (metric.type === 'conversion') {
-            const from = metricResults.get(metric.fromMetricId ?? '')?.get(group.id)?.count ?? 0;
-            const to = metricResults.get(metric.toMetricId ?? '')?.get(group.id)?.count ?? 0;
+            const fromBucket = metricResults.get(metric.fromMetricId ?? '')?.get(group.id);
+            const toBucket = metricResults.get(metric.toMetricId ?? '')?.get(group.id);
+            const from = fromBucket?.count ?? 0;
+            const to = toBucket?.count ?? 0;
             value.count = to;
             value.value = from > 0 ? Number(((to / from) * 100).toFixed(2)) : null;
             value.unit = 'percent';
           }
+
+          const samples = this.contractDealSamples(value.samples);
+          const fromSamples = metric.type === 'conversion'
+            ? this.contractDealSamples(metricResults.get(metric.fromMetricId ?? '')?.get(group.id)?.samples)
+            : [];
+          const toSamples = metric.type === 'conversion'
+            ? this.contractDealSamples(metricResults.get(metric.toMetricId ?? '')?.get(group.id)?.samples)
+            : [];
 
           return [
             metric.id,
@@ -1273,6 +1298,16 @@ ${sheets}
               value: value.value,
               unit: value.unit,
               dealCount: value.count,
+              sampleSize: metric.type === 'conversion' ? toSamples.length : samples.length,
+              samples: metric.type === 'conversion' ? toSamples : samples,
+              ...(metric.type === 'conversion'
+                ? {
+                    from: metricResults.get(metric.fromMetricId ?? '')?.get(group.id)?.count ?? 0,
+                    to: metricResults.get(metric.toMetricId ?? '')?.get(group.id)?.count ?? 0,
+                    fromSamples,
+                    toSamples,
+                  }
+                : {}),
             },
           ];
         }),
@@ -1280,8 +1315,12 @@ ${sheets}
 
       const conversions = Object.fromEntries(
         (contract.conversions ?? []).map((conversion) => {
-          const from = metricResults.get(conversion.fromMetricId)?.get(group.id)?.count ?? 0;
-          const to = metricResults.get(conversion.toMetricId)?.get(group.id)?.count ?? 0;
+          const fromBucket = metricResults.get(conversion.fromMetricId)?.get(group.id);
+          const toBucket = metricResults.get(conversion.toMetricId)?.get(group.id);
+          const fromSamples = this.contractDealSamples(fromBucket?.samples);
+          const toSamples = this.contractDealSamples(toBucket?.samples);
+          const from = fromBucket?.count ?? 0;
+          const to = toBucket?.count ?? 0;
           return [
             conversion.id,
             {
@@ -1290,6 +1329,10 @@ ${sheets}
               from,
               to,
               conversion: from > 0 ? Number(((to / from) * 100).toFixed(2)) : null,
+              sampleSize: toSamples.length,
+              samples: toSamples,
+              fromSamples,
+              toSamples,
             },
           ];
         }),
@@ -1710,13 +1753,14 @@ ${sheets}
   }
 
   private addDealToContractBucket(
-    bucket: { count: number; values: number[]; dealIds: Set<string>; value: number | null; unit: string },
+    bucket: ContractBucket,
     deal: any,
     metric: DataContractMetric,
   ) {
     if (bucket.dealIds.has(deal.id)) return;
     bucket.dealIds.add(deal.id);
     bucket.count += 1;
+    bucket.samples.push(this.contractDealSample(deal));
     const measure = metric.measure ?? 'deal_count';
     if (measure === 'field_sum' || measure === 'field_avg') {
       const fieldId = metric.valueFieldId ?? metric.amountFieldId ?? metric.marginFieldId;
@@ -1728,7 +1772,7 @@ ${sheets}
   }
 
   private finalizeContractBucket(
-    bucket: { count: number; values: number[]; dealIds: Set<string>; value: number | null; unit: string },
+    bucket: ContractBucket,
     metric: DataContractMetric,
   ) {
     const measure = metric.measure ?? 'deal_count';
@@ -1743,6 +1787,41 @@ ${sheets}
       return;
     }
     bucket.value = bucket.count;
+  }
+
+  private emptyContractBucket(metric: DataContractMetric): ContractBucket {
+    return {
+      count: 0,
+      values: [],
+      dealIds: new Set<string>(),
+      samples: [],
+      value: null,
+      unit: this.metricUnit(metric),
+    };
+  }
+
+  private contractDealSample(deal: any): ContractDealSample {
+    return {
+      dealId: deal.id,
+      dealExternalId: deal.externalId ?? null,
+      dealTitle: deal.title,
+      amount: Number.isFinite(Number(deal.amount)) ? Number(deal.amount) : null,
+      stageName: deal.stage?.name ?? null,
+      pipelineName: deal.pipeline?.name ?? null,
+      updatedAt: deal.updatedAt instanceof Date ? deal.updatedAt.toISOString() : null,
+    };
+  }
+
+  private contractDealSamples(samples: ContractDealSample[] = []) {
+    const unique = new Map<string, ContractDealSample>();
+    for (const sample of samples) {
+      if (!unique.has(sample.dealId)) unique.set(sample.dealId, sample);
+    }
+    return [...unique.values()].sort((a, b) => {
+      const byDate = Date.parse(b.updatedAt ?? '') - Date.parse(a.updatedAt ?? '');
+      if (Number.isFinite(byDate) && byDate !== 0) return byDate;
+      return a.dealTitle.localeCompare(b.dealTitle, 'ru');
+    });
   }
 
   private metricUnit(metric: DataContractMetric) {
@@ -2055,24 +2134,33 @@ ${sheets}
         continue;
       }
       if (metric.type === 'conversion' && mode === 'sum') {
-        const from = rows
-          .filter((row) => row.groupId !== 'all')
+        const sourceRows = rows.filter((row) => row.groupId !== 'all');
+        const from = sourceRows
           .map((row) => Number(row.metrics?.[metric.fromMetricId ?? '']?.dealCount ?? row.metrics?.[metric.fromMetricId ?? '']?.value))
           .filter((value) => Number.isFinite(value))
           .reduce((total, value) => total + value, 0);
-        const to = rows
-          .filter((row) => row.groupId !== 'all')
+        const to = sourceRows
           .map((row) => Number(row.metrics?.[metric.toMetricId ?? '']?.dealCount ?? row.metrics?.[metric.toMetricId ?? '']?.value))
           .filter((value) => Number.isFinite(value))
           .reduce((total, value) => total + value, 0);
+        const fromSamples = this.contractDealSamples(sourceRows.flatMap((row) => row.metrics?.[metric.fromMetricId ?? '']?.samples ?? []));
+        const toSamples = this.contractDealSamples(sourceRows.flatMap((row) => row.metrics?.[metric.toMetricId ?? '']?.samples ?? []));
         result[metric.id] = {
           id: metric.id,
           label: metric.label,
           value: from > 0 ? Number(((to / from) * 100).toFixed(2)) : null,
           unit: 'percent',
+          dealCount: to,
+          sampleSize: toSamples.length,
+          samples: toSamples,
+          from,
+          to,
+          fromSamples,
+          toSamples,
         };
         continue;
       }
+      const sourceRows = rows.filter((row) => row.groupId !== 'all');
       const values = rows
         .filter((row) => row.groupId !== 'all')
         .map((row) => Number(row.metrics?.[metric.id]?.value))
@@ -2082,11 +2170,19 @@ ${sheets}
         continue;
       }
       const sum = values.reduce((total, value) => total + value, 0);
+      const samples = this.contractDealSamples(sourceRows.flatMap((row) => row.metrics?.[metric.id]?.samples ?? []));
+      const dealCount = sourceRows
+        .map((row) => Number(row.metrics?.[metric.id]?.dealCount ?? 0))
+        .filter((value) => Number.isFinite(value))
+        .reduce((total, value) => total + value, 0);
       result[metric.id] = {
         id: metric.id,
         label: metric.label,
         value: mode === 'avg' ? Number((sum / values.length).toFixed(2)) : Number(sum.toFixed(2)),
         unit: metric.display ?? this.metricUnit(metric),
+        dealCount,
+        sampleSize: samples.length,
+        samples,
       };
     }
     return { id: 'summary', label: mode === 'avg' ? 'Среднее' : 'Итого', metrics: result };
