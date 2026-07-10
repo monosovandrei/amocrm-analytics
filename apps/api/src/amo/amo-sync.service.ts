@@ -435,8 +435,13 @@ export class AmoSyncService {
     const webhookSubscriptionLagSeconds = webhookSubscriptionEnsuredAt
       ? Math.max(0, Math.floor((Date.now() - webhookSubscriptionEnsuredAt.getTime()) / 1000))
       : null;
+    const lastWebhookLagSeconds = lastWebhook?.receivedAt
+      ? Math.max(0, Math.floor((Date.now() - lastWebhook.receivedAt.getTime()) / 1000))
+      : null;
+    const hasRecentWebhook = lastWebhookLagSeconds !== null && lastWebhookLagSeconds < 30 * 60;
     const webhookSubscriptionStale =
       syncMode === 'WEBHOOK' &&
+      !hasRecentWebhook &&
       (!webhookSubscriptionEnsuredAt || webhookSubscriptionLagSeconds === null || webhookSubscriptionLagSeconds > 30 * 60);
     const webhookArrivedAfterSubscriptionError =
       Boolean(lastWebhook?.receivedAt) &&
