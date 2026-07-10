@@ -103,6 +103,16 @@ type EmailThreadStateView = {
   deal: EmailThreadDraft['deal'];
 };
 
+const EMAIL_THREAD_CREATE_BATCH_SIZE = 200;
+const EMAIL_THREAD_SOURCE_LOOKUP_BATCH_SIZE = 500;
+const EMAIL_EVENT_SCAN_BATCH_SIZE = 500;
+const EMAIL_THREAD_DRAFT_MESSAGE_LIMIT = 60;
+const EMAIL_THREAD_STATE_MESSAGE_LIMIT = 20;
+const EMAIL_THREAD_SUBJECT_LIMIT = 500;
+const EMAIL_THREAD_SUMMARY_LIMIT = 1000;
+const EMAIL_THREAD_BODY_LIMIT = 4000;
+const EMAIL_THREAD_PARTY_LIMIT = 500;
+
 const EMAIL_PIPELINE_GROUPS: Array<{ key: EmailPipelineKey; label: string }> = [
   { key: 'sales', label: 'Продажи' },
   { key: 'base', label: 'База' },
@@ -509,14 +519,18 @@ export class PlatformService {
 
   async rebuildEmailThreadStates() {
     const drafts = await this.buildEmailThreadDrafts();
-    const rows = drafts
-      .map((draft) => this.emailThreadStateData(draft))
-      .filter((row): row is Prisma.EmailThreadStateCreateManyInput => Boolean(row));
+    const rowsByKey = new Map<string, Prisma.EmailThreadStateCreateManyInput>();
+    for (const draft of drafts) {
+      const row = this.emailThreadStateData(draft);
+      if (!row) continue;
+      rowsByKey.set(`${row.dealId}:${row.threadId}`, row);
+    }
+    const rows = [...rowsByKey.values()];
 
-    await this.prisma.$transaction([
-      this.prisma.emailThreadState.deleteMany(),
-      ...(rows.length ? [this.prisma.emailThreadState.createMany({ data: rows })] : []),
-    ]);
+    await this.prisma.emailThreadState.deleteMany();
+    for (const chunk of this.chunks(rows, EMAIL_THREAD_CREATE_BATCH_SIZE)) {
+      await this.prisma.emailThreadState.createMany({ data: chunk, skipDuplicates: true });
+    }
 
     return {
       total: rows.length,
@@ -2064,9 +2078,26 @@ export class PlatformService {
       WHERE type = 'amomail_message' AND ${noteEntityWhere}
       ORDER BY "createdAt" ASC
     `);
-    const notes = noteRows.length
-      ? await this.prisma.note.findMany({
-        where: { id: { in: noteRows.map((row) => row.id) } },
+
+    const ensureDraft = (deal: EmailThreadDraft['deal'], threadId: string) => {
+      const key = `${deal.id}:${threadId}`;
+      let draft = drafts.get(key);
+      if (!draft) {
+        draft = {
+          deal,
+          threadId,
+          messages: [],
+        };
+        drafts.set(key, draft);
+        if (!draftsByDealId.has(deal.id)) draftsByDealId.set(deal.id, []);
+        draftsByDealId.get(deal.id)?.push(draft);
+      }
+      return draft;
+    };
+
+    for (const noteIdChunk of this.chunks(noteRows.map((row) => row.id), EMAIL_THREAD_SOURCE_LOOKUP_BATCH_SIZE)) {
+      const notes = await this.prisma.note.findMany({
+        where: { id: { in: noteIdChunk } },
         orderBy: { createdAt: 'asc' },
         select: {
           externalId: true,
@@ -2089,138 +2120,134 @@ export class PlatformService {
             },
           },
         },
-      })
-      : [];
+      });
 
-    const ensureDraft = (deal: EmailThreadDraft['deal'], threadId: string) => {
-      const key = `${deal.id}:${threadId}`;
-      let draft = drafts.get(key);
-      if (!draft) {
-        draft = {
-          deal,
-          threadId,
-          messages: [],
-        };
-        drafts.set(key, draft);
-        if (!draftsByDealId.has(deal.id)) draftsByDealId.set(deal.id, []);
-        draftsByDealId.get(deal.id)?.push(draft);
-      }
-      return draft;
-    };
-
-    for (const note of notes) {
-      const targetDeals = new Map<string, EmailThreadDraft['deal']>();
-      if (note.deal && !note.deal.deletedAt && !note.deal.stage?.isWon && !note.deal.stage?.isLost) {
-        targetDeals.set(note.deal.id, note.deal);
-      }
-
-      const noteEntityId = this.emailNoteEntityId(note.raw);
-      if (noteEntityId) {
-        const leadDeal = openDealsById.get(leadExternalToDealId.get(noteEntityId) ?? '');
-        if (leadDeal) targetDeals.set(leadDeal.id, leadDeal);
-        for (const dealId of contactExternalToDealIds.get(noteEntityId) ?? []) {
-          const contactDeal = openDealsById.get(dealId);
-          if (contactDeal) targetDeals.set(contactDeal.id, contactDeal);
+      for (const note of notes) {
+        const targetDeals = new Map<string, EmailThreadDraft['deal']>();
+        if (note.deal && !note.deal.deletedAt && !note.deal.stage?.isWon && !note.deal.stage?.isLost) {
+          targetDeals.set(note.deal.id, note.deal);
         }
-      }
 
-      if (targetDeals.size === 0) continue;
+        const noteEntityId = this.emailNoteEntityId(note.raw);
+        if (noteEntityId) {
+          const leadDeal = openDealsById.get(leadExternalToDealId.get(noteEntityId) ?? '');
+          if (leadDeal) targetDeals.set(leadDeal.id, leadDeal);
+          for (const dealId of contactExternalToDealIds.get(noteEntityId) ?? []) {
+            const contactDeal = openDealsById.get(dealId);
+            if (contactDeal) targetDeals.set(contactDeal.id, contactDeal);
+          }
+        }
 
-      const params = this.emailNoteParams(note.raw, note.text);
-      const threadId = params.threadId || `note:${note.externalId}`;
+        if (targetDeals.size === 0) continue;
 
-      storedNoteIds.add(note.externalId);
+        const params = this.emailNoteParams(note.raw, note.text);
+        const threadId = params.threadId || `note:${note.externalId}`;
 
-      for (const deal of targetDeals.values()) {
-        const direction = this.emailDirection(params, internalEmailDomains);
-        const ownDraft = ensureDraft(deal, threadId);
-        const targetDrafts = direction === 'incoming'
-          ? [ownDraft]
-          : (draftsByDealId.get(deal.id)?.length ? draftsByDealId.get(deal.id) ?? [] : [ownDraft]);
+        storedNoteIds.add(note.externalId);
 
-        for (const draft of targetDrafts) draft.messages.push({
-          id: `note:${note.externalId}:${draft.threadId}:${deal.id}`,
-          noteExternalId: note.externalId,
-          direction,
-          createdAt: note.createdAt,
-          subject: params.subject,
-          summary: params.summary,
-          body: params.body,
-          from: params.from,
-          to: params.to,
-          attachCount: params.attachCount,
-          deliveryStatus: params.deliveryStatus,
-          source: 'note',
-        });
+        for (const deal of targetDeals.values()) {
+          const direction = this.emailDirection(params, internalEmailDomains);
+          const ownDraft = ensureDraft(deal, threadId);
+          const targetDrafts = direction === 'incoming'
+            ? [ownDraft]
+            : (draftsByDealId.get(deal.id)?.length ? draftsByDealId.get(deal.id) ?? [] : [ownDraft]);
+
+          for (const draft of targetDrafts) {
+            this.appendEmailDraftMessage(draft, {
+              id: `note:${note.externalId}:${draft.threadId}:${deal.id}`,
+              noteExternalId: note.externalId,
+              direction,
+              createdAt: note.createdAt,
+              subject: params.subject,
+              summary: params.summary,
+              body: params.body,
+              from: params.from,
+              to: params.to,
+              attachCount: params.attachCount,
+              deliveryStatus: params.deliveryStatus,
+              source: 'note',
+            });
+          }
+        }
       }
     }
 
-    const mailEvents = await this.prisma.crmEvent.findMany({
-      where: { type: { in: ['incoming_mail', 'outgoing_mail'] } },
-      orderBy: { createdAt: 'asc' },
-      select: {
-        externalId: true,
-        type: true,
-        createdAt: true,
-        raw: true,
-      },
-    });
-    const eventNoteIds = [...new Set(mailEvents.map((event) => this.emailEventNoteId(event.raw)).filter(Boolean))] as string[];
-    const eventNotes = eventNoteIds.length
-      ? await this.prisma.note.findMany({
-        where: { externalId: { in: eventNoteIds } },
-        select: { externalId: true, raw: true, text: true },
-      })
-      : [];
-    const eventNotesByExternalId = new Map(eventNotes.map((note) => [note.externalId, note]));
+    let eventCursor: { id: string } | undefined;
+    while (true) {
+      const mailEvents = await this.prisma.crmEvent.findMany({
+        where: { type: { in: ['incoming_mail', 'outgoing_mail'] } },
+        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+        take: EMAIL_EVENT_SCAN_BATCH_SIZE,
+        ...(eventCursor ? { cursor: eventCursor, skip: 1 } : {}),
+        select: {
+          id: true,
+          externalId: true,
+          type: true,
+          createdAt: true,
+          raw: true,
+        },
+      });
+      if (!mailEvents.length) break;
 
-    for (const event of mailEvents) {
-      const noteExternalId = this.emailEventNoteId(event.raw);
-      if (noteExternalId && storedNoteIds.has(noteExternalId)) continue;
-      const eventNote = noteExternalId ? eventNotesByExternalId.get(noteExternalId) : null;
-      const eventParams = this.emailNoteParams(eventNote?.raw, eventNote?.text);
+      const eventNoteIds = [...new Set(mailEvents.map((event) => this.emailEventNoteId(event.raw)).filter(Boolean))] as string[];
+      const eventNotes = eventNoteIds.length
+        ? await this.prisma.note.findMany({
+          where: { externalId: { in: eventNoteIds } },
+          select: { externalId: true, raw: true, text: true },
+        })
+        : [];
+      const eventNotesByExternalId = new Map(eventNotes.map((note) => [note.externalId, note]));
 
-      const entity = this.emailEventEntity(event.raw);
-      const dealIds = new Set<string>();
-      if (entity.type === 'lead') {
-        const dealId = leadExternalToDealId.get(entity.id);
-        if (dealId) dealIds.add(dealId);
-      }
-      if (entity.type === 'contact') {
-        for (const dealId of contactExternalToDealIds.get(entity.id) ?? []) dealIds.add(dealId);
-      }
+      for (const event of mailEvents) {
+        const noteExternalId = this.emailEventNoteId(event.raw);
+        if (noteExternalId && storedNoteIds.has(noteExternalId)) continue;
+        const eventNote = noteExternalId ? eventNotesByExternalId.get(noteExternalId) : null;
+        const eventParams = this.emailNoteParams(eventNote?.raw, eventNote?.text);
 
-      for (const dealId of dealIds) {
-        const deal = openDealsById.get(dealId);
-        if (!deal) continue;
+        const entity = this.emailEventEntity(event.raw);
+        const dealIds = new Set<string>();
+        if (entity.type === 'lead') {
+          const dealId = leadExternalToDealId.get(entity.id);
+          if (dealId) dealIds.add(dealId);
+        }
+        if (entity.type === 'contact') {
+          for (const dealId of contactExternalToDealIds.get(entity.id) ?? []) dealIds.add(dealId);
+        }
 
-        const direction = this.emailDirection(eventParams, internalEmailDomains, event.type);
-        const threadId = this.emailEventThreadId(entity, deal.externalId);
-        const targetDrafts = direction === 'incoming'
-          ? [ensureDraft(deal, threadId)]
-          : (draftsByDealId.get(dealId)?.length ? draftsByDealId.get(dealId) ?? [] : [ensureDraft(deal, threadId)]);
+        for (const dealId of dealIds) {
+          const deal = openDealsById.get(dealId);
+          if (!deal) continue;
 
-        for (const draft of targetDrafts) {
-          if (direction === 'outgoing') {
-            const firstMessage = draft.messages[0];
-            if (firstMessage && event.createdAt < firstMessage.createdAt) continue;
+          const direction = this.emailDirection(eventParams, internalEmailDomains, event.type);
+          const threadId = this.emailEventThreadId(entity, deal.externalId);
+          const targetDrafts = direction === 'incoming'
+            ? [ensureDraft(deal, threadId)]
+            : (draftsByDealId.get(dealId)?.length ? draftsByDealId.get(dealId) ?? [] : [ensureDraft(deal, threadId)]);
+
+          for (const draft of targetDrafts) {
+            if (direction === 'outgoing') {
+              const firstMessage = draft.messages[0];
+              if (firstMessage && event.createdAt < firstMessage.createdAt) continue;
+            }
+            this.appendEmailDraftMessage(draft, {
+              id: `event:${event.externalId}:${dealId}`,
+              noteExternalId: direction === 'incoming' ? `event:${event.externalId}` : noteExternalId,
+              direction,
+              createdAt: event.createdAt,
+              subject: eventParams.subject,
+              summary: eventParams.summary ?? (direction === 'incoming' ? 'Входящее письмо в amoCRM' : 'Исходящее письмо в amoCRM'),
+              body: eventParams.body,
+              from: eventParams.from,
+              to: eventParams.to,
+              attachCount: eventParams.attachCount,
+              deliveryStatus: eventParams.deliveryStatus,
+              source: 'event',
+            });
           }
-          draft.messages.push({
-            id: `event:${event.externalId}:${dealId}`,
-            noteExternalId: direction === 'incoming' ? `event:${event.externalId}` : noteExternalId,
-            direction,
-            createdAt: event.createdAt,
-            subject: eventParams.subject,
-            summary: eventParams.summary ?? (direction === 'incoming' ? 'Входящее письмо в amoCRM' : 'Исходящее письмо в amoCRM'),
-            body: eventParams.body,
-            from: eventParams.from,
-            to: eventParams.to,
-            attachCount: eventParams.attachCount,
-            deliveryStatus: eventParams.deliveryStatus,
-            source: 'event',
-          });
         }
       }
+
+      eventCursor = { id: mailEvents[mailEvents.length - 1].id };
     }
 
     this.closeEmailDraftsByDealReplies(draftsByDealId);
@@ -2253,11 +2280,18 @@ export class PlatformService {
         const closingOutgoing = outgoingMessages.find((message) => message.createdAt > lastIncoming.createdAt);
         if (!closingOutgoing) continue;
 
-        draft.messages.push({
+        this.appendEmailDraftMessage(draft, {
           ...closingOutgoing,
           id: `${closingOutgoing.id}:closes:${draft.threadId}`,
         });
       }
+    }
+  }
+
+  private appendEmailDraftMessage(draft: EmailThreadDraft, message: EmailMessageItem) {
+    draft.messages.push(message);
+    if (draft.messages.length > EMAIL_THREAD_DRAFT_MESSAGE_LIMIT) {
+      draft.messages.splice(0, draft.messages.length - EMAIL_THREAD_DRAFT_MESSAGE_LIMIT);
     }
   }
 
@@ -2282,11 +2316,11 @@ export class PlatformService {
       lastIncomingAt: lastIncoming?.createdAt ?? null,
       lastOutgoingAt: lastOutgoing?.createdAt ?? null,
       lastMessageAt: lastMessage.createdAt,
-      subject: displayMessage.subject,
-      summary: displayMessage.summary,
-      body: displayMessage.body,
-      from: displayMessage.from,
-      to: displayMessage.to,
+      subject: this.truncateEmailText(displayMessage.subject, EMAIL_THREAD_SUBJECT_LIMIT),
+      summary: this.truncateEmailText(displayMessage.summary, EMAIL_THREAD_SUMMARY_LIMIT),
+      body: this.truncateEmailText(displayMessage.body, EMAIL_THREAD_BODY_LIMIT),
+      from: this.truncateEmailText(displayMessage.from, EMAIL_THREAD_PARTY_LIMIT),
+      to: this.truncateEmailText(displayMessage.to, EMAIL_THREAD_PARTY_LIMIT),
       attachCount: displayMessage.attachCount,
       deliveryStatus: displayMessage.deliveryStatus,
       messages: this.emailThreadStateMessages(messages) as Prisma.InputJsonValue,
@@ -2295,16 +2329,16 @@ export class PlatformService {
   }
 
   private emailThreadStateMessages(messages: EmailMessageItem[]) {
-    return messages.map((message) => ({
+    return messages.slice(-EMAIL_THREAD_STATE_MESSAGE_LIMIT).map((message) => ({
       id: message.id,
       noteExternalId: message.noteExternalId ?? null,
       direction: message.direction,
       createdAt: message.createdAt.toISOString(),
-      subject: message.subject,
-      summary: message.summary,
-      body: message.body,
-      from: message.from,
-      to: message.to,
+      subject: this.truncateEmailText(message.subject, EMAIL_THREAD_SUBJECT_LIMIT),
+      summary: this.truncateEmailText(message.summary, EMAIL_THREAD_SUMMARY_LIMIT),
+      body: this.truncateEmailText(message.body, EMAIL_THREAD_BODY_LIMIT),
+      from: this.truncateEmailText(message.from, EMAIL_THREAD_PARTY_LIMIT),
+      to: this.truncateEmailText(message.to, EMAIL_THREAD_PARTY_LIMIT),
       attachCount: message.attachCount,
       deliveryStatus: message.deliveryStatus,
       source: message.source,
@@ -2360,11 +2394,11 @@ export class PlatformService {
         id: String(message.id ?? ''),
         direction: message.direction === 'outgoing' ? 'outgoing' : 'incoming',
         createdAt: String(message.createdAt ?? ''),
-        subject: this.cleanEmailText(message.subject),
-        summary: this.cleanEmailText(message.summary),
-        body: typeof message.body === 'string' ? message.body : null,
-        from: this.cleanEmailText(message.from),
-        to: this.cleanEmailText(message.to),
+        subject: this.truncateEmailText(this.cleanEmailText(message.subject), EMAIL_THREAD_SUBJECT_LIMIT),
+        summary: this.truncateEmailText(this.cleanEmailText(message.summary), EMAIL_THREAD_SUMMARY_LIMIT),
+        body: this.truncateEmailText(typeof message.body === 'string' ? message.body : null, EMAIL_THREAD_BODY_LIMIT),
+        from: this.truncateEmailText(this.cleanEmailText(message.from), EMAIL_THREAD_PARTY_LIMIT),
+        to: this.truncateEmailText(this.cleanEmailText(message.to), EMAIL_THREAD_PARTY_LIMIT),
         attachCount: Math.max(0, Number(message.attachCount ?? 0) || 0),
         deliveryStatus: this.cleanEmailText(message.deliveryStatus),
         source: message.source === 'event' ? 'event' : 'note',
@@ -2414,15 +2448,15 @@ export class PlatformService {
       summary: lastIncoming.summary,
       attachCount: lastIncoming.attachCount,
       dealUrl: this.dealUrl(domain, draft.deal.externalId),
-      messages: draft.messages.map((message) => ({
+      messages: draft.messages.slice(-EMAIL_THREAD_STATE_MESSAGE_LIMIT).map((message) => ({
         id: message.id,
         direction: message.direction,
         createdAt: message.createdAt.toISOString(),
-        subject: message.subject,
-        summary: message.summary,
-        body: message.body,
-        from: message.from,
-        to: message.to,
+        subject: this.truncateEmailText(message.subject, EMAIL_THREAD_SUBJECT_LIMIT),
+        summary: this.truncateEmailText(message.summary, EMAIL_THREAD_SUMMARY_LIMIT),
+        body: this.truncateEmailText(message.body, EMAIL_THREAD_BODY_LIMIT),
+        from: this.truncateEmailText(message.from, EMAIL_THREAD_PARTY_LIMIT),
+        to: this.truncateEmailText(message.to, EMAIL_THREAD_PARTY_LIMIT),
         attachCount: message.attachCount,
         deliveryStatus: message.deliveryStatus,
         source: message.source,
@@ -2432,18 +2466,21 @@ export class PlatformService {
 
   private emailNoteParams(raw: unknown, storedText?: string | null) {
     const params = (raw as { params?: Record<string, any> } | null)?.params ?? {};
-    const body = this.cleanEmailBody(storedText ?? params.text ?? params.body ?? params.html);
+    const body = this.truncateEmailText(
+      this.cleanEmailBody(storedText ?? params.text ?? params.body ?? params.html),
+      EMAIL_THREAD_BODY_LIMIT,
+    );
     const from = this.emailParty(params.from);
     const to = this.emailParty(params.to);
     return {
       income: typeof params.income === 'boolean' ? params.income : null,
       threadId: params.thread_id == null ? null : String(params.thread_id),
-      subject: this.cleanEmailText(params.subject),
-      summary: this.cleanEmailText(params.content_summary ?? body),
+      subject: this.truncateEmailText(this.cleanEmailText(params.subject), EMAIL_THREAD_SUBJECT_LIMIT),
+      summary: this.truncateEmailText(this.cleanEmailText(params.content_summary ?? body), EMAIL_THREAD_SUMMARY_LIMIT),
       body,
-      from: from.label,
+      from: this.truncateEmailText(from.label, EMAIL_THREAD_PARTY_LIMIT),
       fromEmail: from.email,
-      to: to.label,
+      to: this.truncateEmailText(to.label, EMAIL_THREAD_PARTY_LIMIT),
       toEmail: to.email,
       attachCount: Math.max(0, Number(params.attach_cnt ?? 0) || 0),
       deliveryStatus: params.delivery?.status == null ? null : String(params.delivery.status),
@@ -2517,6 +2554,19 @@ export class PlatformService {
     const atIndex = value?.lastIndexOf('@') ?? -1;
     if (!value || atIndex < 0 || atIndex === value.length - 1) return null;
     return value.slice(atIndex + 1);
+  }
+
+  private truncateEmailText(value: string | null | undefined, limit: number) {
+    if (!value) return null;
+    return value.length > limit ? `${value.slice(0, limit)}...` : value;
+  }
+
+  private chunks<T>(items: T[], size: number) {
+    const result: T[][] = [];
+    for (let index = 0; index < items.length; index += size) {
+      result.push(items.slice(index, index + size));
+    }
+    return result;
   }
 
   private cleanEmailText(value: unknown) {
