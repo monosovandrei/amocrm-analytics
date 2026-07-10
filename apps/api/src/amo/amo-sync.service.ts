@@ -19,6 +19,8 @@ type WebhookEventGroup = {
   payloads: Prisma.JsonValue[];
 };
 
+const WEBHOOK_EVENT_BATCH_SIZE = 100;
+
 @Injectable()
 export class AmoSyncService {
   private static readonly DEFAULT_STALE_SYNC_JOB_MS = 6 * 60 * 60 * 1000;
@@ -651,13 +653,12 @@ export class AmoSyncService {
           status: { in: ['received', 'error'] },
         },
         orderBy: { receivedAt: 'asc' },
-        take: 500,
+        take: WEBHOOK_EVENT_BATCH_SIZE,
       });
 
       const client = await this.amo.getClient(job.connection);
       const maps = this.emptyMaps();
       await this.hydrateMetadataMaps(maps);
-      await this.hydrateExistingEntityMaps(maps);
 
       const earliestEventAt = events[0]?.receivedAt ?? startedAt;
       const groups = this.groupWebhookEvents(events);
