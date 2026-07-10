@@ -761,8 +761,14 @@ export class AmoSyncService {
 
   private async rebuildEmailThreadStates(stats: Record<string, number>) {
     const result = await this.platform.rebuildEmailThreadStates();
+    this.compactHeapAfterHeavySync();
     stats.emailThreadStates = result.total;
     stats.pendingEmailThreadStates = result.pending;
+  }
+
+  private compactHeapAfterHeavySync() {
+    const gc = (globalThis as typeof globalThis & { gc?: () => void }).gc;
+    if (typeof gc === 'function') gc();
   }
 
   private async hydrateMetadataMaps(maps: AmoSyncMaps) {
