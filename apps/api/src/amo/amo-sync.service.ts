@@ -687,8 +687,10 @@ export class AmoSyncService {
         const eventSyncFrom = Math.floor((earliestEventAt.getTime() - 5 * 60_000) / 1000);
         await this.syncWebhookRelatedNotes(client, groups, stats, eventSyncFrom);
         await this.syncWebhookRelatedEvents(client, maps, groups, stats, eventSyncFrom);
-        await this.touchJob(jobId, 'email_thread_state');
-        await this.rebuildEmailThreadStates(stats);
+        if ((stats.webhookEmailNotes ?? 0) > 0 || (stats.webhookMailEvents ?? 0) > 0) {
+          await this.touchJob(jobId, 'email_thread_state');
+          await this.rebuildEmailThreadStates(stats);
+        }
         await this.processCrmNotifications(stats, new Date(eventSyncFrom * 1000), client.domain);
       }
 
@@ -2229,11 +2231,13 @@ export class AmoSyncService {
     if (updatedSince) params['filter[updated_at][from]'] = updatedSince;
 
     let total = 0;
+    let emailTotal = 0;
     for (const leadExternalId of leadExternalIds) {
       try {
         await client.paginateBatch<any>(`/leads/${leadExternalId}/notes`, 'notes', params, async (notes) => {
           for (const note of notes) {
             await this.upsertNote('leads', note);
+            if (note.note_type === 'amomail_message') emailTotal += 1;
           }
           total += notes.length;
         });
@@ -2247,6 +2251,7 @@ export class AmoSyncService {
         await client.paginateBatch<any>(`/contacts/${contactExternalId}/notes`, 'notes', params, async (notes) => {
           for (const note of notes) {
             await this.upsertNote('contacts', note);
+            if (note.note_type === 'amomail_message') emailTotal += 1;
           }
           total += notes.length;
         });
@@ -2257,6 +2262,7 @@ export class AmoSyncService {
     }
 
     stats.webhookNotes = total;
+    stats.webhookEmailNotes = emailTotal;
   }
 
   private async upsertNote(source: string, note: any) {
@@ -2329,6 +2335,7 @@ export class AmoSyncService {
     if (entityGroups.every((group) => group.ids.length === 0)) return;
 
     let total = 0;
+    let mailTotal = 0;
     for (const group of entityGroups) {
       for (const externalId of group.ids) {
         const params: Record<string, string | number> = {
@@ -2357,12 +2364,14 @@ export class AmoSyncService {
 
         for (const event of eventsById.values()) {
           await this.upsertCrmEvent(event, maps);
+          if (this.isEmailCrmEvent(event)) mailTotal += 1;
         }
         total += eventsById.size;
       }
     }
 
     stats.webhookEventsSynced = total;
+    stats.webhookMailEvents = mailTotal;
   }
 
   private async upsertCrmEvent(event: any, maps: AmoSyncMaps) {
@@ -2412,6 +2421,10 @@ export class AmoSyncService {
       if (clean) eventTypes.add(clean);
     }
     return [...eventTypes];
+  }
+
+  private isEmailCrmEvent(event: any) {
+    return event?.type === 'incoming_mail' || event?.type === 'outgoing_mail';
   }
 
   private async backfillStageHistoryFromStoredEvents(
