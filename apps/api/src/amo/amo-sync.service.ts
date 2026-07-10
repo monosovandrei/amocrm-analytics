@@ -629,6 +629,8 @@ export class AmoSyncService {
         data: { status: 'ERROR', lastError: error.message },
       });
       throw error;
+    } finally {
+      this.compactHeapAfterHeavySync();
     }
   }
 
