@@ -366,6 +366,22 @@ export class AmoSyncService {
     }
   }
 
+  async processCrmStateNotifications() {
+    const connection = await this.amo.getActiveConnectionOrFail();
+    if (!connection.lastFullSyncAt) return { status: 'waiting_initial_snapshot' };
+
+    const client = await this.amo.getClient(connection);
+    const stats: Record<string, number> = {};
+    await this.processCrmNotifications(
+      stats,
+      new Date(Date.now() - 15 * 60_000),
+      client.domain,
+      { includeEventDriven: false, includeStateScans: true },
+    );
+    this.compactHeapAfterHeavySync();
+    return { status: 'ok', stats };
+  }
+
   async getHealth() {
     const connection = await this.prisma.amoConnection.findFirst({ orderBy: { createdAt: 'desc' } });
     if (!connection) {
@@ -751,7 +767,12 @@ export class AmoSyncService {
 
         const eventSyncFrom = Math.floor((earliestEventAt.getTime() - 5 * 60_000) / 1000);
         await this.touchJob(jobId, 'crm_notifications');
-        await this.processCrmNotifications(stats, new Date(eventSyncFrom * 1000), client.domain);
+        await this.processCrmNotifications(
+          stats,
+          new Date(eventSyncFrom * 1000),
+          client.domain,
+          { includeStateScans: false },
+        );
       }
 
       const finishedAt = new Date();
@@ -1258,9 +1279,14 @@ export class AmoSyncService {
     ];
   }
 
-  private async processCrmNotifications(stats: Record<string, number>, since: Date, domain: string) {
+  private async processCrmNotifications(
+    stats: Record<string, number>,
+    since: Date,
+    domain: string,
+    options: { includeEventDriven?: boolean; includeStateScans?: boolean } = {},
+  ) {
     try {
-      const result = await this.crmEventNotifications.processRecentAmoEvents({ since, domain });
+      const result = await this.crmEventNotifications.processRecentAmoEvents({ since, domain, ...options });
       stats.notificationsChecked = result.checked;
       stats.paymentNotifications = result.payment;
       stats.workAcceptedNotifications = result.workAccepted;

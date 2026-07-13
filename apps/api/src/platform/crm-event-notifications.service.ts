@@ -83,15 +83,21 @@ export class CrmEventNotificationsService {
     private readonly telegram: TelegramService,
   ) {}
 
-  async processRecentAmoEvents(options: { since?: Date; domain?: string } = {}) {
+  async processRecentAmoEvents(
+    options: { since?: Date; domain?: string; includeEventDriven?: boolean; includeStateScans?: boolean } = {},
+  ) {
     const since = options.since ?? new Date(Date.now() - 15 * 60_000);
     const domain = options.domain ?? (await this.resolveAmoDomain());
-    const workField = await this.resolveLeadCustomFieldByName('\u0412\u0437\u044f\u0442\u044c \u0432 \u0440\u0430\u0431\u043e\u0442\u0443');
+    const includeEventDriven = options.includeEventDriven ?? true;
+    const includeStateScans = options.includeStateScans ?? true;
+    const workField = includeEventDriven || includeStateScans
+      ? await this.resolveLeadCustomFieldByName('\u0412\u0437\u044f\u0442\u044c \u0432 \u0440\u0430\u0431\u043e\u0442\u0443')
+      : null;
     const eventTypes = ['lead_status_changed', 'task_deadline_changed'];
     if (workField) eventTypes.push(`custom_field_${workField.externalId}_value_changed`);
 
     const [events, paidStages, users] = await Promise.all([
-      this.prisma.crmEvent.findMany({
+      includeEventDriven ? this.prisma.crmEvent.findMany({
         where: {
           createdAt: { gte: since },
           type: { in: eventTypes },
@@ -116,8 +122,8 @@ export class CrmEventNotificationsService {
         },
         orderBy: { createdAt: 'asc' },
         take: 500,
-      }),
-      this.resolvePaymentStages(),
+      }) : Promise.resolve([]),
+      includeEventDriven ? this.resolvePaymentStages() : Promise.resolve(new Map<string, StageWithPipeline>()),
       this.prisma.user.findMany({
         where: { isActive: true },
         select: {
@@ -155,71 +161,75 @@ export class CrmEventNotificationsService {
     const leaders = this.salesLeaderUsers(users);
     const csmLeaders = this.csmLeaderUsers(users);
 
-    for (const event of events) {
-      try {
-        if (event.type === 'lead_status_changed') {
-          if (!event.deal) continue;
-          const paidStage = this.stageFromStatusEvent(event.valueAfter, paidStages);
-          if (paidStage) {
-            const sent = await this.notifyPayment(event, paidStage, users, domain);
-            if (sent) result.payment += 1;
-            else result.skipped += 1;
+    if (includeEventDriven) {
+      for (const event of events) {
+        try {
+          if (event.type === 'lead_status_changed') {
+            if (!event.deal) continue;
+            const paidStage = this.stageFromStatusEvent(event.valueAfter, paidStages);
+            if (paidStage) {
+              const sent = await this.notifyPayment(event, paidStage, users, domain);
+              if (sent) result.payment += 1;
+              else result.skipped += 1;
+              continue;
+            }
             continue;
           }
-          continue;
-        }
 
-        if (workField && event.type === `custom_field_${workField.externalId}_value_changed`) {
-          if (!this.customFieldIsEnabled(event.valueAfter) || !event.deal) continue;
-          const sent = await this.notifyWorkAccepted(event, leaders, domain);
-          if (sent) result.workAccepted += 1;
-          else result.skipped += 1;
+          if (workField && event.type === `custom_field_${workField.externalId}_value_changed`) {
+            if (!this.customFieldIsEnabled(event.valueAfter) || !event.deal) continue;
+            const sent = await this.notifyWorkAccepted(event, leaders, domain);
+            if (sent) result.workAccepted += 1;
+            else result.skipped += 1;
+          }
+        } catch (error: any) {
+          this.logger.warn(`CRM notification failed for event ${event.externalId}: ${error.message}`);
+          result.skipped += 1;
         }
-      } catch (error: any) {
-        this.logger.warn(`CRM notification failed for event ${event.externalId}: ${error.message}`);
-        result.skipped += 1;
       }
+
+      const massTaskMove = await this.notifyMassTaskDeadlineChanges(events, leaders, 'sales', 'amo_task_mass_reschedule');
+      result.taskMassMove += massTaskMove.sent;
+      result.skipped += massTaskMove.skipped;
+
+      const csmTaskMassMove = await this.notifyMassTaskDeadlineChanges(events, csmLeaders, 'csm', 'amo_csm_task_mass_reschedule');
+      result.csmTaskMassMove += csmTaskMassMove.sent;
+      result.skipped += csmTaskMassMove.skipped;
+
+      const dealMassMove = await this.notifyMassDealStageChanges(events, leaders, 'sales', 'amo_deal_mass_move');
+      result.dealMassMove += dealMassMove.sent;
+      result.skipped += dealMassMove.skipped;
+
+      const csmDealMassMove = await this.notifyMassDealStageChanges(events, csmLeaders, 'csm', 'amo_csm_deal_mass_move');
+      result.csmDealMassMove += csmDealMassMove.sent;
+      result.skipped += csmDealMassMove.skipped;
     }
 
-    if (workField) {
-      const dueResult = await this.notifyDueWorkAcceptedDeals(workField.externalId, leaders, domain);
-      result.dueWorkAcceptedChecked = dueResult.checked;
-      result.workAccepted += dueResult.sent;
-      result.skipped += dueResult.skipped;
+    if (includeStateScans) {
+      if (workField) {
+        const dueResult = await this.notifyDueWorkAcceptedDeals(workField.externalId, leaders, domain);
+        result.dueWorkAcceptedChecked = dueResult.checked;
+        result.workAccepted += dueResult.sent;
+        result.skipped += dueResult.skipped;
+      }
+
+      const csmOverdueTasks = await this.notifyCsmOverdueTasks(csmLeaders);
+      result.csmOverdueTasks += csmOverdueTasks.sent;
+      result.skipped += csmOverdueTasks.skipped;
+
+      const csmDailyZeroMetrics = await this.notifyCsmDailyZeroFunnelMetrics(users);
+      result.csmZeroTakenToWork += csmDailyZeroMetrics.zeroTakenToWork;
+      result.csmZeroOfferMade += csmDailyZeroMetrics.zeroOfferMade;
+      result.skipped += csmDailyZeroMetrics.skipped;
+
+      const stateAlerts = await this.notifyStateBasedAlerts(users, leaders, domain);
+      result.assignedLeadNew += stateAlerts.assignedLeadNew;
+      result.assignedLeadReminder += stateAlerts.assignedLeadReminder;
+      result.invoiceNoPayment += stateAlerts.invoiceNoPayment;
+      result.proposalStale += stateAlerts.proposalStale;
+      result.highValueIdle += stateAlerts.highValueIdle;
+      result.skipped += stateAlerts.skipped;
     }
-
-    const massTaskMove = await this.notifyMassTaskDeadlineChanges(events, leaders, 'sales', 'amo_task_mass_reschedule');
-    result.taskMassMove += massTaskMove.sent;
-    result.skipped += massTaskMove.skipped;
-
-    const csmTaskMassMove = await this.notifyMassTaskDeadlineChanges(events, csmLeaders, 'csm', 'amo_csm_task_mass_reschedule');
-    result.csmTaskMassMove += csmTaskMassMove.sent;
-    result.skipped += csmTaskMassMove.skipped;
-
-    const dealMassMove = await this.notifyMassDealStageChanges(events, leaders, 'sales', 'amo_deal_mass_move');
-    result.dealMassMove += dealMassMove.sent;
-    result.skipped += dealMassMove.skipped;
-
-    const csmDealMassMove = await this.notifyMassDealStageChanges(events, csmLeaders, 'csm', 'amo_csm_deal_mass_move');
-    result.csmDealMassMove += csmDealMassMove.sent;
-    result.skipped += csmDealMassMove.skipped;
-
-    const csmOverdueTasks = await this.notifyCsmOverdueTasks(csmLeaders);
-    result.csmOverdueTasks += csmOverdueTasks.sent;
-    result.skipped += csmOverdueTasks.skipped;
-
-    const csmDailyZeroMetrics = await this.notifyCsmDailyZeroFunnelMetrics(users);
-    result.csmZeroTakenToWork += csmDailyZeroMetrics.zeroTakenToWork;
-    result.csmZeroOfferMade += csmDailyZeroMetrics.zeroOfferMade;
-    result.skipped += csmDailyZeroMetrics.skipped;
-
-    const stateAlerts = await this.notifyStateBasedAlerts(users, leaders, domain);
-    result.assignedLeadNew += stateAlerts.assignedLeadNew;
-    result.assignedLeadReminder += stateAlerts.assignedLeadReminder;
-    result.invoiceNoPayment += stateAlerts.invoiceNoPayment;
-    result.proposalStale += stateAlerts.proposalStale;
-    result.highValueIdle += stateAlerts.highValueIdle;
-    result.skipped += stateAlerts.skipped;
 
     return result;
   }

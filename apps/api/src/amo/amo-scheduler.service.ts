@@ -11,6 +11,8 @@ export class AmoSchedulerService {
   private webhookBusy = false;
   private webhookSubscriptionBusy = false;
   private emailNotesBusy = false;
+  private crmStateNotificationsBusy = false;
+  private lastCrmStateNotificationsAt = Date.now();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -126,6 +128,30 @@ export class AmoSchedulerService {
     }
   }
 
+  @Interval(60_000)
+  async processCrmStateNotifications() {
+    if (this.crmStateNotificationsBusy) return;
+    const intervalSeconds = this.getCrmStateNotificationsIntervalSeconds();
+    if (intervalSeconds <= 0) return;
+    if (Date.now() - this.lastCrmStateNotificationsAt < intervalSeconds * 1000) return;
+
+    const connection = await this.prisma.amoConnection.findFirst({
+      where: { status: { in: ['ACTIVE', 'ERROR', 'SYNCING'] } },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (!connection?.lastFullSyncAt) return;
+
+    this.crmStateNotificationsBusy = true;
+    try {
+      await this.sync.processCrmStateNotifications();
+      this.lastCrmStateNotificationsAt = Date.now();
+    } catch (error: any) {
+      this.logger.warn(`CRM state notifications failed: ${error.message}`);
+    } finally {
+      this.crmStateNotificationsBusy = false;
+    }
+  }
+
   private getSyncIntervalMinutes() {
     const rawInterval = this.config.get<string>('AMOCRM_SYNC_INTERVAL_MINUTES');
     if (!rawInterval) return 0;
@@ -148,6 +174,14 @@ export class AmoSchedulerService {
 
     const parsed = Number(rawInterval);
     return Number.isFinite(parsed) ? Math.max(0, parsed) : 60;
+  }
+
+  private getCrmStateNotificationsIntervalSeconds() {
+    const rawInterval = this.config.get<string>('AMOCRM_CRM_STATE_NOTIFICATIONS_INTERVAL_SECONDS');
+    if (!rawInterval) return 300;
+
+    const parsed = Number(rawInterval);
+    return Number.isFinite(parsed) ? Math.max(0, parsed) : 300;
   }
 
   private getConfigDate(config: unknown, key: string) {
