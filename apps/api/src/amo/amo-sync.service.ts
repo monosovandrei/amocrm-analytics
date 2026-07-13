@@ -727,16 +727,30 @@ export class AmoSyncService {
         }
       }
 
-      if (actionableGroups.length > 0 && client) {
-        await this.reconcileLeadSlaDeals(client, maps, stats);
+      const leadSideEffectGroups = actionableGroups.filter((group) => this.webhookGroupNeedsLeadSideEffects(group));
+      const communicationGroups = actionableGroups.filter((group) => this.webhookGroupNeedsCommunicationSync(group));
+
+      if ((leadSideEffectGroups.length > 0 || communicationGroups.length > 0) && client) {
+        if (leadSideEffectGroups.length > 0) {
+          await this.touchJob(jobId, 'lead_sla_reconcile');
+          await this.reconcileLeadSlaDeals(client, maps, stats);
+        }
+
         const eventSyncFrom = Math.floor((earliestEventAt.getTime() - 5 * 60_000) / 1000);
-        await this.syncWebhookRelatedNotes(client, actionableGroups, stats, eventSyncFrom);
-        await this.syncWebhookRelatedEvents(client, maps, actionableGroups, stats, eventSyncFrom);
+        if (communicationGroups.length > 0) {
+          await this.touchJob(jobId, 'webhook_related_notes');
+          await this.syncWebhookRelatedNotes(client, communicationGroups, stats, eventSyncFrom);
+          await this.touchJob(jobId, 'webhook_related_events');
+          await this.syncWebhookRelatedEvents(client, maps, communicationGroups, stats, eventSyncFrom);
+        }
         if ((stats.webhookEmailNotes ?? 0) > 0 || (stats.webhookMailEvents ?? 0) > 0) {
           await this.touchJob(jobId, 'email_thread_state');
           await this.rebuildEmailThreadStates(stats);
         }
-        await this.processCrmNotifications(stats, new Date(eventSyncFrom * 1000), client.domain);
+        if (leadSideEffectGroups.length > 0) {
+          await this.touchJob(jobId, 'crm_notifications');
+          await this.processCrmNotifications(stats, new Date(eventSyncFrom * 1000), client.domain);
+        }
       }
 
       const finishedAt = new Date();
@@ -944,6 +958,19 @@ export class AmoSyncService {
     }
 
     stats.webhookSkippedUnsupported = (stats.webhookSkippedUnsupported ?? 0) + 1;
+  }
+
+  private webhookGroupNeedsLeadSideEffects(group: WebhookEventGroup) {
+    return group.entity === 'leads' || group.entity === 'tasks';
+  }
+
+  private webhookGroupNeedsCommunicationSync(group: WebhookEventGroup) {
+    if (group.entity === 'leads') return true;
+    if (group.entity !== 'contacts') return false;
+    return group.actions.some((action) => {
+      const clean = String(action ?? '').toLowerCase();
+      return clean.includes('note') || clean.includes('message') || clean.includes('mail');
+    });
   }
 
   private async markWebhookEntityDeleted(entity: string, externalId: string, stats: Record<string, number>) {
