@@ -77,6 +77,13 @@ type RevenueForecastBucketKey =
   | 'repeatQuoteThisMonth'
   | 'repeatNotThisMonth';
 
+const LOSS_REASON_CUSTOM_FIELD_NAMES = new Set(['причина отказа', 'причины отказа'].map(normalizeCustomFieldName));
+const MISSING_LOSS_REASON_LABEL = 'Не указано';
+
+function normalizeCustomFieldName(value: unknown) {
+  return String(value ?? '').trim().toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ');
+}
+
 function stableStringify(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map((item) => stableStringify(item)).join(',')}]`;
@@ -2845,7 +2852,7 @@ ${sheets}
       };
     }
 
-    const dealWhere = await this.buildDealWhere(filters, role, { ignoreStage: true });
+    const dealWhere = await this.buildDealWhere(filters, role, { ignoreStage: true, ignoreLossReason: true });
     const entries = await this.db.dealStageHistory.findMany({
       where: this.compactWhere({
         toStageId: { in: lostStageIds },
@@ -2881,8 +2888,7 @@ ${sheets}
       const deal = entry.deal;
       const managerId = deal?.responsibleId;
       if (!managerId || !managerIds.has(managerId)) continue;
-      const reasonId = deal.lossReason?.id ?? deal.lossReasonId ?? 'no_reason';
-      const reasonName = deal.lossReason?.name ?? 'Без причины';
+      const { reasonId, reasonName } = this.lossReasonFromCustomField(deal?.customFields as Record<string, any>);
       if (!valuesByReason.has(reasonId)) {
         valuesByReason.set(reasonId, {
           reasonId,
@@ -4248,7 +4254,7 @@ ${sheets}
   private async buildDealWhere(
     filters: ReportFilters,
     role: UserRole,
-    options: { ignorePipeline?: boolean; ignoreStage?: boolean } = {},
+    options: { ignorePipeline?: boolean; ignoreStage?: boolean; ignoreLossReason?: boolean } = {},
   ) {
     const where: Record<string, any> = { deletedAt: null };
 
@@ -4259,7 +4265,7 @@ ${sheets}
       if (filters.excludeStageIds?.length) where.stageId.notIn = filters.excludeStageIds;
     }
     if (filters.managerIds?.length) where.responsibleId = { in: filters.managerIds };
-    if (filters.lossReasonIds?.length) where.lossReasonId = { in: filters.lossReasonIds };
+    if (!options.ignoreLossReason && filters.lossReasonIds?.length) where.lossReasonId = { in: filters.lossReasonIds };
     if (filters.amountFrom !== undefined || filters.amountTo !== undefined) {
       where.amount = {};
       if (filters.amountFrom !== undefined) where.amount.gte = filters.amountFrom;
@@ -4288,6 +4294,42 @@ ${sheets}
     if (groupIds?.length) where.groupId = { in: groupIds };
     if (managerIds?.length) where.id = { in: managerIds };
     return this.db.crmUser.findMany({ where, select: { id: true, name: true }, orderBy: { name: 'asc' } });
+  }
+
+  private lossReasonFromCustomField(customFields?: Record<string, any> | null) {
+    for (const [fieldId, field] of Object.entries(customFields ?? {})) {
+      if (!field || typeof field !== 'object') continue;
+      if (!LOSS_REASON_CUSTOM_FIELD_NAMES.has(normalizeCustomFieldName((field as any).name))) continue;
+      const reasonName = this.customFieldTextValue((field as any).value ?? (field as any).values);
+      if (reasonName) {
+        return {
+          reasonId: `custom:${normalizeCustomFieldName(reasonName)}`,
+          reasonName,
+        };
+      }
+    }
+    return {
+      reasonId: 'custom:not_set',
+      reasonName: MISSING_LOSS_REASON_LABEL,
+    };
+  }
+
+  private customFieldTextValue(value: unknown): string | null {
+    const values = this.customFieldScalarValues(value)
+      .map((item) => item.trim())
+      .filter(Boolean);
+    const uniqueValues = [...new Set(values)];
+    return uniqueValues.length ? uniqueValues.join(', ') : null;
+  }
+
+  private customFieldScalarValues(value: unknown): string[] {
+    if (Array.isArray(value)) return value.flatMap((item) => this.customFieldScalarValues(item));
+    if (value && typeof value === 'object') {
+      const record = value as Record<string, unknown>;
+      return this.customFieldScalarValues(record.value ?? record.text ?? record.enum_id ?? null);
+    }
+    if (value === null || value === undefined) return [];
+    return [String(value)];
   }
 
   private matchesCustomFieldFilters(

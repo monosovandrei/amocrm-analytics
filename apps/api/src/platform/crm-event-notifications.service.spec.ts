@@ -153,7 +153,7 @@ describe('CrmEventNotificationsService payment notification routing', () => {
     });
 
     await service.sendConfiguredNotification(
-      'amo_loss_without_reason',
+      'amo_deal_mass_move',
       'message',
       {},
       'event-key',

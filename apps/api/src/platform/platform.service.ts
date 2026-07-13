@@ -42,6 +42,7 @@ const TELEGRAM_DELIVERY_MODES: TelegramDeliveryMode[] = [
   'disabled',
 ];
 const PERSONAL_TELEGRAM_EVENTS = new Set(['amo_new_assigned_lead', 'amo_assigned_lead_10m', 'amo_take_to_work_enabled']);
+const OBSOLETE_TELEGRAM_TEMPLATE_EVENT_TYPES = ['amo_loss_without_reason'];
 
 type EmailDirection = 'incoming' | 'outgoing';
 type EmailPipelineKey = 'sales' | 'base' | 'assignedCompanies';
@@ -541,7 +542,11 @@ export class PlatformService {
   async listTelegramTemplates(actor: AuthUser) {
     this.ensureTelegramOwner(actor);
     await this.ensureTelegramTemplates();
-    const templates = await this.prisma.notificationTemplate.findMany({ orderBy: { name: 'asc' } });
+    const activeEventTypes = this.defaultTelegramTemplates().map((template) => template.eventType);
+    const templates = await this.prisma.notificationTemplate.findMany({
+      where: { eventType: { in: activeEventTypes } },
+      orderBy: { name: 'asc' },
+    });
     return templates.map((template) => this.serializeTelegramTemplate(template));
   }
 
@@ -591,6 +596,9 @@ export class PlatformService {
   }
 
   private async ensureTelegramTemplates() {
+    await this.prisma.notificationTemplate.deleteMany({
+      where: { eventType: { in: OBSOLETE_TELEGRAM_TEMPLATE_EVENT_TYPES } },
+    });
     for (const template of this.defaultTelegramTemplates()) {
       await this.prisma.notificationTemplate.upsert({
         where: { eventType: template.eventType },
@@ -636,12 +644,6 @@ export class PlatformService {
         eventType: 'amo_deal_mass_move',
         name: '\u041c\u0430\u0441\u0441\u043e\u0432\u044b\u0439 \u043f\u0435\u0440\u0435\u043d\u043e\u0441 \u0441\u0434\u0435\u043b\u043e\u043a',
         body: '{manager} \u043f\u0435\u0440\u0435\u043d\u0435\u0441 {dealCount} \u0441\u0434\u0435\u043b\u043e\u043a, \u043f\u0440\u043e\u0432\u0435\u0440\u044c.',
-        isActive: true,
-      },
-      {
-        eventType: 'amo_loss_without_reason',
-        name: '\u041e\u0442\u043a\u0430\u0437 \u0431\u0435\u0437 \u043f\u0440\u0438\u0447\u0438\u043d\u044b',
-        body: '\u0421\u0434\u0435\u043b\u043a\u0430 \u0437\u0430\u043a\u0440\u044b\u0442\u0430 \u0432 \u043e\u0442\u043a\u0430\u0437 \u0431\u0435\u0437 \u043f\u0440\u0438\u0447\u0438\u043d\u044b.\n\u0421\u0434\u0435\u043b\u043a\u0430: {deal}\n\u041c\u0435\u043d\u0435\u0434\u0436\u0435\u0440: {manager}\n\u0421\u0443\u043c\u043c\u0430: {amount}\n\u0421\u0441\u044b\u043b\u043a\u0430: {dealUrl}',
         isActive: true,
       },
       {

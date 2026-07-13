@@ -99,9 +99,14 @@ const deals = [
     responsible: managers.second,
     pipeline: { id: 'pipe-sales', name: 'Продажи' },
     stage: stages.lost,
-    lossReasonId: lossReasons.price.id,
-    lossReason: lossReasons.price,
-    customFields: { sla: { value: 40 }, margin: { value: 1500 }, source: { value: 'Принят' } },
+    lossReasonId: null,
+    lossReason: null,
+    customFields: {
+      sla: { value: 40 },
+      margin: { value: 1500 },
+      source: { value: 'Принят' },
+      loss_reason_field: { name: 'Причины отказа', value: lossReasons.price.name },
+    },
     createdAt: new Date('2026-03-01T10:00:00.000Z'),
     updatedAt: new Date('2026-03-05T10:00:00.000Z'),
     closedAt: new Date('2026-03-05T10:00:00.000Z'),
@@ -938,7 +943,7 @@ describe('ReportsService data contract', () => {
     });
     expect((result as any).rows).toEqual([
       {
-        reasonId: lossReasons.price.id,
+        reasonId: 'custom:дорого',
         reasonName: lossReasons.price.name,
         total: 1,
         totalPercent: 100,

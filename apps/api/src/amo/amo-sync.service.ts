@@ -1204,7 +1204,6 @@ export class AmoSyncService {
       stats.dealMassMoveNotifications = result.dealMassMove;
       stats.csmTaskMassMoveNotifications = result.csmTaskMassMove;
       stats.csmDealMassMoveNotifications = result.csmDealMassMove;
-      stats.lossWithoutReasonNotifications = result.lossWithoutReason;
       stats.csmOverdueTaskNotifications = result.csmOverdueTasks;
       stats.csmZeroTakenToWorkNotifications = result.csmZeroTakenToWork;
       stats.csmZeroOfferMadeNotifications = result.csmZeroOfferMade;

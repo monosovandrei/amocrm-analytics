@@ -90,7 +90,7 @@ export class CrmEventNotificationsService {
     const eventTypes = ['lead_status_changed', 'task_deadline_changed'];
     if (workField) eventTypes.push(`custom_field_${workField.externalId}_value_changed`);
 
-    const [events, paidStages, lostStages, users] = await Promise.all([
+    const [events, paidStages, users] = await Promise.all([
       this.prisma.crmEvent.findMany({
         where: {
           createdAt: { gte: since },
@@ -102,7 +102,6 @@ export class CrmEventNotificationsService {
               responsible: { include: { group: true } },
               pipeline: true,
               stage: true,
-              lossReason: true,
             },
           },
         },
@@ -110,7 +109,6 @@ export class CrmEventNotificationsService {
         take: 500,
       }),
       this.resolvePaymentStages(),
-      this.resolveLostStages(),
       this.prisma.user.findMany({
         where: { isActive: true },
         select: {
@@ -138,7 +136,6 @@ export class CrmEventNotificationsService {
       dealMassMove: 0,
       csmTaskMassMove: 0,
       csmDealMassMove: 0,
-      lossWithoutReason: 0,
       csmOverdueTasks: 0,
       csmZeroTakenToWork: 0,
       csmZeroOfferMade: 0,
@@ -159,13 +156,6 @@ export class CrmEventNotificationsService {
             if (sent) result.payment += 1;
             else result.skipped += 1;
             continue;
-          }
-
-          const lostStage = this.stageFromStatusEvent(event.valueAfter, lostStages);
-          if (lostStage) {
-            const sent = await this.notifyLossWithoutReason(event, lostStage, leaders, domain);
-            if (sent === true) result.lossWithoutReason += 1;
-            else if (sent === false) result.skipped += 1;
           }
           continue;
         }
@@ -309,53 +299,6 @@ export class CrmEventNotificationsService {
       undefined,
       `${eventKey}:payment-route`,
     );
-  }
-
-  private async notifyLossWithoutReason(event: any, stage: StageWithPipeline, leaders: AppUser[], domain: string) {
-    const deal = event.deal;
-    if (!this.isSalesPipeline(stage.pipeline.name)) return null;
-    if (!this.dealHasNoLossReason(deal)) return null;
-
-    const reason = deal.lossReason?.name ?? 'Без причины';
-    const payload = {
-      type: 'amo_loss_without_reason',
-      eventId: event.externalId,
-      dealId: deal.id,
-      dealExternalId: deal.externalId,
-      managerCrmUserId: deal.responsibleId,
-      stageId: stage.id,
-      reason,
-    };
-    const message = await this.renderNotification('amo_loss_without_reason', payload.type, {
-      amount: this.formatMoney(deal.amount),
-      deal: deal.title,
-      dealUrl: this.dealUrl(domain, deal.externalId),
-      group: deal.responsible?.group?.name ?? '-',
-      manager: deal.responsible?.name ?? '-',
-      pipeline: stage.pipeline.name,
-      reason,
-      stage: stage.name,
-    });
-    const eventKey = `amo:loss-without-reason:${event.externalId}:${deal.id}`;
-    const configuredDeliveries = await this.sendConfiguredNotification('amo_loss_without_reason', message, payload, eventKey);
-    if (configuredDeliveries) return configuredDeliveries.some((delivery) => delivery?.status === 'SENT');
-
-    if (!leaders.length) {
-      await this.recordSkipped(`${eventKey}:no-leader`, message, {
-        ...payload,
-        reason: 'Нет активного РОПа Sales в платформе',
-      });
-      return false;
-    }
-
-    const deliveries = await this.telegram.sendDirectMessageToUsers(
-      leaders.map((leader) => leader.id),
-      message,
-      payload,
-      undefined,
-      eventKey,
-    );
-    return deliveries.some((delivery) => delivery?.status === 'SENT');
   }
 
   private async notifyWorkAccepted(event: any, leaders: AppUser[], domain: string) {
@@ -1526,9 +1469,6 @@ export class CrmEventNotificationsService {
     if (type === 'amo_deal_mass_move') {
       return '{manager} \u043f\u0435\u0440\u0435\u043d\u0435\u0441 {dealCount} \u0441\u0434\u0435\u043b\u043e\u043a, \u043f\u0440\u043e\u0432\u0435\u0440\u044c.';
     }
-    if (type === 'amo_loss_without_reason') {
-      return '\u0421\u0434\u0435\u043b\u043a\u0430 \u0437\u0430\u043a\u0440\u044b\u0442\u0430 \u0432 \u043e\u0442\u043a\u0430\u0437 \u0431\u0435\u0437 \u043f\u0440\u0438\u0447\u0438\u043d\u044b.\n\u0421\u0434\u0435\u043b\u043a\u0430: {deal}\n\u041c\u0435\u043d\u0435\u0434\u0436\u0435\u0440: {manager}\n\u0421\u0443\u043c\u043c\u0430: {amount}\n\u0421\u0441\u044b\u043b\u043a\u0430: {dealUrl}';
-    }
     if (type === 'amo_csm_task_mass_reschedule') {
       return '{manager} \u043f\u0435\u0440\u0435\u043d\u0435\u0441 {taskCount} \u0437\u0430\u0434\u0430\u0447, \u043f\u0440\u043e\u0432\u0435\u0440\u044c.';
     }
@@ -1565,14 +1505,6 @@ export class CrmEventNotificationsService {
     });
     const paidStages = stages.filter((stage) => this.isPaymentStage(stage.name));
     return new Map(paidStages.map((stage) => [`${stage.pipeline.externalId}_${stage.externalId}`, stage]));
-  }
-
-  private async resolveLostStages() {
-    const stages = await this.prisma.pipelineStage.findMany({
-      include: { pipeline: true },
-    });
-    const lostStages = stages.filter((stage) => stage.isLost || this.isLostStage(stage.name));
-    return new Map(lostStages.map((stage) => [`${stage.pipeline.externalId}_${stage.externalId}`, stage]));
   }
 
   private async resolveLeadCustomFieldByName(name: string) {
@@ -1630,19 +1562,6 @@ export class CrmEventNotificationsService {
       normalized === 'paid' ||
       normalized === 'paid!' ||
       normalized.includes(this.normalizeText('\u043e\u043f\u043b\u0430\u0447\u0435\u043d\u043e'));
-  }
-
-  private isLostStage(name: string) {
-    const normalized = this.normalizeText(name);
-    return normalized.includes(this.normalizeText('\u043e\u0442\u043a\u0430\u0437')) ||
-      normalized.includes(this.normalizeText('\u043d\u0435 \u0440\u0435\u0430\u043b\u0438\u0437\u043e\u0432\u0430\u043d\u043e')) ||
-      normalized.includes(this.normalizeText('\u043d\u0435\u0440\u0435\u0430\u043b\u0438\u0437\u043e\u0432\u0430\u043d\u043e')) ||
-      normalized === 'lost';
-  }
-
-  private dealHasNoLossReason(deal: any) {
-    const reasonName = this.normalizeText(deal?.lossReason?.name ?? '');
-    return !deal?.lossReasonId || reasonName === this.normalizeText('\u0411\u0435\u0437 \u043f\u0440\u0438\u0447\u0438\u043d\u044b');
   }
 
   private async salesPipelineIds() {
