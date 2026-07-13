@@ -321,41 +321,48 @@ export class CrmEventNotificationsService {
     if (!salesPipelineIds.length) return { checked: 0, sent: 0, skipped: 0 };
 
     const now = new Date();
-    const deals = await this.prisma.deal.findMany({
-      where: {
-        deletedAt: null,
-        createdAt: { lte: now },
-        pipelineId: { in: salesPipelineIds },
-        stage: { isWon: false, isLost: false },
-      },
-      select: {
-        id: true,
-        externalId: true,
-        title: true,
-        amount: true,
-        createdAt: true,
-        updatedAt: true,
-        customFields: true,
-        stageId: true,
-        responsibleId: true,
-        responsible: { select: { id: true, name: true, group: { select: { name: true } } } },
-        pipeline: { select: { id: true, name: true } },
-        stage: { select: { id: true, name: true, isWon: true, isLost: true } },
-      },
-      orderBy: { createdAt: 'asc' },
-      take: 1000,
-    });
-
     let checked = 0;
     let sent = 0;
     let skipped = 0;
-    for (const deal of deals) {
-      if (!this.customFieldIsEnabled((deal.customFields as Record<string, unknown>)?.[workFieldExternalId])) continue;
-      if (!this.workSlaIsDue(deal, now)) continue;
-      checked += 1;
-      const delivered = await this.notifyWorkAcceptedDeal(deal, leaders, domain);
-      if (delivered) sent += 1;
-      else skipped += 1;
+    const maxDeals = 1000;
+    const batchSize = 200;
+    for (let skip = 0; skip < maxDeals; skip += batchSize) {
+      const deals = await this.prisma.deal.findMany({
+        where: {
+          deletedAt: null,
+          createdAt: { lte: now },
+          pipelineId: { in: salesPipelineIds },
+          stage: { isWon: false, isLost: false },
+        },
+        select: {
+          id: true,
+          externalId: true,
+          title: true,
+          amount: true,
+          createdAt: true,
+          updatedAt: true,
+          customFields: true,
+          stageId: true,
+          responsibleId: true,
+          responsible: { select: { id: true, name: true, group: { select: { name: true } } } },
+          pipeline: { select: { id: true, name: true } },
+          stage: { select: { id: true, name: true, isWon: true, isLost: true } },
+        },
+        orderBy: { createdAt: 'asc' },
+        skip,
+        take: batchSize,
+      });
+      if (deals.length === 0) break;
+
+      for (const deal of deals) {
+        if (!this.customFieldIsEnabled((deal.customFields as Record<string, unknown>)?.[workFieldExternalId])) continue;
+        if (!this.workSlaIsDue(deal, now)) continue;
+        checked += 1;
+        const delivered = await this.notifyWorkAcceptedDeal(deal, leaders, domain);
+        if (delivered) sent += 1;
+        else skipped += 1;
+      }
+      this.compactHeap();
     }
 
     return { checked, sent, skipped };
@@ -679,61 +686,68 @@ export class CrmEventNotificationsService {
     }
 
     const now = new Date();
-    const deals = await this.prisma.deal.findMany({
-      where: {
-        deletedAt: null,
-        pipelineId: { in: salesPipelineIds },
-        stage: { isWon: false, isLost: false },
-      },
-      select: {
-        id: true,
-        externalId: true,
-        title: true,
-        amount: true,
-        createdAt: true,
-        updatedAt: true,
-        stageId: true,
-        responsibleId: true,
-        responsible: { select: { id: true, name: true, group: { select: { name: true } } } },
-        pipeline: { select: { id: true, name: true } },
-        stage: { select: { id: true, name: true, isWon: true, isLost: true } },
-        tasks: {
-          where: { isCompleted: false },
-          select: { id: true, responsibleId: true, isCompleted: true, createdAt: true, updatedAt: true, completedAt: true },
-          orderBy: { createdAt: 'asc' },
-        },
-        notes: { select: { createdAt: true }, orderBy: { createdAt: 'desc' }, take: 1 },
-        events: { select: { createdAt: true }, orderBy: { createdAt: 'desc' }, take: 1 },
-        stageHistory: { select: { toStageId: true, movedAt: true }, orderBy: { movedAt: 'desc' }, take: 20 },
-      },
-      orderBy: { createdAt: 'asc' },
-      take: 2000,
-    });
-
     const result = { assignedLeadNew: 0, assignedLeadReminder: 0, invoiceNoPayment: 0, proposalStale: 0, highValueIdle: 0, skipped: 0 };
-    for (const deal of deals) {
-      if (this.isAssignedResponsibleStage(deal.stage?.name)) {
-        const delivered = await this.notifyAssignedLeadManagerAlerts(deal, users, domain, now);
-        result.assignedLeadNew += delivered.newLead;
-        result.assignedLeadReminder += delivered.reminder;
-        result.skipped += delivered.skipped;
-      }
+    const maxDeals = 2000;
+    const batchSize = 200;
+    for (let skip = 0; skip < maxDeals; skip += batchSize) {
+      const deals = await this.prisma.deal.findMany({
+        where: {
+          deletedAt: null,
+          pipelineId: { in: salesPipelineIds },
+          stage: { isWon: false, isLost: false },
+        },
+        select: {
+          id: true,
+          externalId: true,
+          title: true,
+          amount: true,
+          createdAt: true,
+          updatedAt: true,
+          stageId: true,
+          responsibleId: true,
+          responsible: { select: { id: true, name: true, group: { select: { name: true } } } },
+          pipeline: { select: { id: true, name: true } },
+          stage: { select: { id: true, name: true, isWon: true, isLost: true } },
+          tasks: {
+            where: { isCompleted: false },
+            select: { id: true, responsibleId: true, isCompleted: true, createdAt: true, updatedAt: true, completedAt: true },
+            orderBy: { createdAt: 'asc' },
+          },
+          notes: { select: { createdAt: true }, orderBy: { createdAt: 'desc' }, take: 1 },
+          events: { select: { createdAt: true }, orderBy: { createdAt: 'desc' }, take: 1 },
+          stageHistory: { select: { toStageId: true, movedAt: true }, orderBy: { movedAt: 'desc' }, take: 20 },
+        },
+        orderBy: { createdAt: 'asc' },
+        skip,
+        take: batchSize,
+      });
+      if (deals.length === 0) break;
 
-      if (this.isInvoiceSentStage(deal.stage?.name)) {
-        const delivered = await this.notifyInvoiceNoPayment(deal, leaders, domain, now);
-        result.invoiceNoPayment += delivered.sent;
-        result.skipped += delivered.skipped;
-      }
+      for (const deal of deals) {
+        if (this.isAssignedResponsibleStage(deal.stage?.name)) {
+          const delivered = await this.notifyAssignedLeadManagerAlerts(deal, users, domain, now);
+          result.assignedLeadNew += delivered.newLead;
+          result.assignedLeadReminder += delivered.reminder;
+          result.skipped += delivered.skipped;
+        }
 
-      if (this.isProposalOrObjectionStage(deal.stage?.name)) {
-        const delivered = await this.notifyProposalStale(deal, leaders, domain, now);
-        result.proposalStale += delivered.sent;
-        result.skipped += delivered.skipped;
-      }
+        if (this.isInvoiceSentStage(deal.stage?.name)) {
+          const delivered = await this.notifyInvoiceNoPayment(deal, leaders, domain, now);
+          result.invoiceNoPayment += delivered.sent;
+          result.skipped += delivered.skipped;
+        }
 
-      const highValueIdle = await this.notifyHighValueIdle(deal, leaders, domain, now);
-      result.highValueIdle += highValueIdle.sent;
-      result.skipped += highValueIdle.skipped;
+        if (this.isProposalOrObjectionStage(deal.stage?.name)) {
+          const delivered = await this.notifyProposalStale(deal, leaders, domain, now);
+          result.proposalStale += delivered.sent;
+          result.skipped += delivered.skipped;
+        }
+
+        const highValueIdle = await this.notifyHighValueIdle(deal, leaders, domain, now);
+        result.highValueIdle += highValueIdle.sent;
+        result.skipped += highValueIdle.skipped;
+      }
+      this.compactHeap();
     }
 
     return result;
@@ -985,6 +999,11 @@ export class CrmEventNotificationsService {
       select: { id: true },
     });
     return Boolean(delivery);
+  }
+
+  private compactHeap() {
+    const gc = (globalThis as typeof globalThis & { gc?: () => void }).gc;
+    if (typeof gc === 'function') gc();
   }
 
   private assignedLeadTriggerAt(deal: any, task: any) {
