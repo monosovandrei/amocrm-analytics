@@ -686,18 +686,32 @@ export class AmoSyncService {
         take: WEBHOOK_EVENT_BATCH_SIZE,
       });
 
-      const client = await this.amo.getClient(job.connection);
-      const maps = this.emptyMaps();
-      await this.hydrateMetadataMaps(maps);
-
       const earliestEventAt = events[0]?.receivedAt ?? startedAt;
       const groups = this.groupWebhookEvents(events);
+      const actionableGroups = groups.filter((group) => group.externalId);
       stats.webhookEvents = events.length;
       stats.webhookGroups = groups.length;
+
+      let client: AmoClient | null = null;
+      const maps = this.emptyMaps();
+      if (actionableGroups.length > 0) {
+        client = await this.amo.getClient(job.connection);
+        await this.hydrateMetadataMaps(maps);
+      }
 
       for (const group of groups) {
         await this.touchJob(jobId, `webhook:${group.entity}:${group.externalId ?? 'no-id'}`);
         try {
+          if (!group.externalId) {
+            stats.webhookSkippedNoId = (stats.webhookSkippedNoId ?? 0) + 1;
+            await this.prisma.webhookEvent.updateMany({
+              where: { id: { in: group.ids } },
+              data: { processedAt: new Date(), status: 'processed', error: null },
+            });
+            continue;
+          }
+
+          if (!client) throw new Error('amoCRM client was not initialized for actionable webhook group');
           await this.processWebhookGroup(client, maps, group, stats);
           await this.prisma.webhookEvent.updateMany({
             where: { id: { in: group.ids } },
@@ -713,11 +727,11 @@ export class AmoSyncService {
         }
       }
 
-      if (groups.length > 0) {
+      if (actionableGroups.length > 0 && client) {
         await this.reconcileLeadSlaDeals(client, maps, stats);
         const eventSyncFrom = Math.floor((earliestEventAt.getTime() - 5 * 60_000) / 1000);
-        await this.syncWebhookRelatedNotes(client, groups, stats, eventSyncFrom);
-        await this.syncWebhookRelatedEvents(client, maps, groups, stats, eventSyncFrom);
+        await this.syncWebhookRelatedNotes(client, actionableGroups, stats, eventSyncFrom);
+        await this.syncWebhookRelatedEvents(client, maps, actionableGroups, stats, eventSyncFrom);
         if ((stats.webhookEmailNotes ?? 0) > 0 || (stats.webhookMailEvents ?? 0) > 0) {
           await this.touchJob(jobId, 'email_thread_state');
           await this.rebuildEmailThreadStates(stats);
@@ -749,6 +763,8 @@ export class AmoSyncService {
         data: { status: 'ERROR', lastError: error.message },
       });
       throw error;
+    } finally {
+      this.compactHeapAfterHeavySync();
     }
   }
 
