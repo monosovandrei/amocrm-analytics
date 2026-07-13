@@ -144,17 +144,27 @@ export class AmoClient {
   }
 
   private async refreshToken() {
-    const res = await fetch(`https://${this.options.domain}/oauth2/access_token`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        client_id: this.options.clientId,
-        client_secret: this.options.clientSecret,
-        grant_type: 'refresh_token',
-        refresh_token: this.options.credentials.refreshToken,
-        redirect_uri: this.options.redirectUri,
-      }),
-    });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30_000);
+    let res: Awaited<ReturnType<typeof fetch>>;
+    try {
+      res = await fetch(`https://${this.options.domain}/oauth2/access_token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          client_id: this.options.clientId,
+          client_secret: this.options.clientSecret,
+          grant_type: 'refresh_token',
+          refresh_token: this.options.credentials.refreshToken,
+          redirect_uri: this.options.redirectUri,
+        }),
+        signal: controller.signal,
+      });
+    } catch (error: any) {
+      throw new Error(`Не удалось обновить amoCRM token: request timed out or failed: ${error.message}`);
+    } finally {
+      clearTimeout(timeout);
+    }
     if (!res.ok) {
       throw new Error(`Не удалось обновить amoCRM token: ${res.status} ${await res.text()}`);
     }
