@@ -327,8 +327,10 @@ export class AmoSyncService {
     const updatedSince = Math.floor((cursor.getTime() - 5 * 60_000) / 1000);
 
     try {
-      await this.syncEmailNotes(client, stats, updatedSince);
-      const state = await this.platform.rebuildEmailThreadStates();
+      const affectedDealIds = await this.syncEmailNotes(client, stats, updatedSince);
+      const state = affectedDealIds.length
+        ? await this.platform.rebuildEmailThreadStatesForDeals(affectedDealIds)
+        : { total: 0, pending: 0 };
       await this.prisma.amoConnection.update({
         where: { id: connection.id },
         data: {
@@ -340,7 +342,15 @@ export class AmoSyncService {
           },
         },
       });
-      return { status: 'ok', stats: { ...stats, emailThreadStates: state.total, pendingEmailThreadStates: state.pending } };
+      return {
+        status: 'ok',
+        stats: {
+          ...stats,
+          ...(affectedDealIds.length
+            ? { emailThreadStates: state.total, pendingEmailThreadStates: state.pending }
+            : { emailThreadStateRebuildSkipped: 1 }),
+        },
+      };
     } catch (error: any) {
       await this.prisma.amoConnection.update({
         where: { id: connection.id },
@@ -2274,13 +2284,14 @@ export class AmoSyncService {
 
     let total = 0;
     let emailTotal = 0;
+    const affectedDealIds = new Set<string>();
     for (const source of ['leads', 'contacts']) {
       try {
         await client.paginateBatch<any>(`/${source}/notes`, 'notes', params, async (notes) => {
           for (const note of notes) {
             total += 1;
             if (note.note_type !== 'amomail_message') continue;
-            await this.upsertNote(source, note);
+            for (const dealId of await this.upsertNote(source, note)) affectedDealIds.add(dealId);
             emailTotal += 1;
           }
         });
@@ -2291,6 +2302,8 @@ export class AmoSyncService {
     }
     stats.emailNotesScanned = total;
     stats.emailNotes = emailTotal;
+    stats.emailNotesAffectedDeals = affectedDealIds.size;
+    return [...affectedDealIds];
   }
 
   private async syncWebhookRelatedNotes(
@@ -2345,23 +2358,38 @@ export class AmoSyncService {
     const deal = source === 'leads' && note.entity_id
       ? await this.prisma.deal.findUnique({ where: { externalId: String(note.entity_id) }, select: { id: true } })
       : null;
+    const noteType = note.note_type ?? 'unknown';
     await this.prisma.note.upsert({
       where: { externalId: String(note.id) },
       create: {
         externalId: String(note.id),
         dealId: deal?.id ?? null,
-        type: note.note_type ?? 'unknown',
+        type: noteType,
         text: note.params?.text ?? null,
         createdAt: toDateFromAmoTimestamp(note.created_at) ?? new Date(),
         raw: note,
       },
       update: {
         dealId: deal?.id ?? null,
-        type: note.note_type ?? 'unknown',
+        type: noteType,
         text: note.params?.text ?? null,
         raw: note,
       },
     });
+
+    if (noteType !== 'amomail_message') return deal?.id ? [deal.id] : [];
+    if (deal?.id) return [deal.id];
+    if (source !== 'contacts' || !note.entity_id) return [];
+
+    const deals = await this.prisma.deal.findMany({
+      where: {
+        deletedAt: null,
+        stage: { isWon: false, isLost: false },
+        contact: { externalId: String(note.entity_id) },
+      },
+      select: { id: true },
+    });
+    return deals.map((item) => item.id);
   }
 
   private async syncEvents(

@@ -519,7 +519,17 @@ export class PlatformService {
   }
 
   async rebuildEmailThreadStates() {
-    const drafts = await this.buildEmailThreadDrafts();
+    return this.rebuildEmailThreadStatesForScope();
+  }
+
+  async rebuildEmailThreadStatesForDeals(dealIds: string[]) {
+    const uniqueDealIds = [...new Set(dealIds.filter(Boolean))];
+    if (!uniqueDealIds.length) return { total: 0, pending: 0 };
+    return this.rebuildEmailThreadStatesForScope(uniqueDealIds);
+  }
+
+  private async rebuildEmailThreadStatesForScope(dealIds?: string[]) {
+    const drafts = await this.buildEmailThreadDrafts(dealIds);
     const rowsByKey = new Map<string, Prisma.EmailThreadStateCreateManyInput>();
     for (const draft of drafts) {
       const row = this.emailThreadStateData(draft);
@@ -528,7 +538,7 @@ export class PlatformService {
     }
     const rows = [...rowsByKey.values()];
 
-    await this.prisma.emailThreadState.deleteMany();
+    await this.prisma.emailThreadState.deleteMany(dealIds ? { where: { dealId: { in: dealIds } } } : undefined);
     for (const chunk of this.chunks(rows, EMAIL_THREAD_CREATE_BATCH_SIZE)) {
       await this.prisma.emailThreadState.createMany({ data: chunk, skipDuplicates: true });
     }
@@ -2034,12 +2044,15 @@ export class PlatformService {
     return next;
   }
 
-  private async buildEmailThreadDrafts() {
+  private async buildEmailThreadDrafts(dealIds?: string[]) {
+    const dealWhere: Prisma.DealWhereInput = {
+      deletedAt: null,
+      stage: { isWon: false, isLost: false },
+    };
+    if (dealIds) dealWhere.id = { in: dealIds };
+
     const openDeals = await this.prisma.deal.findMany({
-      where: {
-        deletedAt: null,
-        stage: { isWon: false, isLost: false },
-      },
+      where: dealWhere,
       select: {
         id: true,
         externalId: true,
@@ -2052,6 +2065,7 @@ export class PlatformService {
         contact: { select: { externalId: true, name: true, email: true } },
       },
     });
+    if (openDeals.length === 0) return [];
 
     const drafts = new Map<string, EmailThreadDraft>();
     const storedNoteIds = new Set<string>();
@@ -2071,9 +2085,10 @@ export class PlatformService {
     }
 
     const noteEntityIds = [...new Set([...leadExternalToDealId.keys(), ...contactExternalToDealIds.keys()])];
+    const openDealIds = openDeals.map((deal) => deal.id);
     const noteEntityWhere = noteEntityIds.length
-      ? Prisma.sql`("dealId" IS NOT NULL OR raw->>'entity_id' IN (${Prisma.join(noteEntityIds)}))`
-      : Prisma.sql`"dealId" IS NOT NULL`;
+      ? Prisma.sql`("dealId" IN (${Prisma.join(openDealIds)}) OR raw->>'entity_id' IN (${Prisma.join(noteEntityIds)}))`
+      : Prisma.sql`"dealId" IN (${Prisma.join(openDealIds)})`;
     const noteRows = await this.prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
       SELECT id
       FROM "Note"
