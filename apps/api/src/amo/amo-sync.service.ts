@@ -740,8 +740,6 @@ export class AmoSyncService {
         if (communicationGroups.length > 0) {
           await this.touchJob(jobId, 'webhook_related_notes');
           await this.syncWebhookRelatedNotes(client, communicationGroups, stats, eventSyncFrom);
-          await this.touchJob(jobId, 'webhook_related_events');
-          await this.syncWebhookRelatedEvents(client, maps, communicationGroups, stats, eventSyncFrom);
         }
         if ((stats.webhookEmailNotes ?? 0) > 0 || (stats.webhookMailEvents ?? 0) > 0) {
           await this.touchJob(jobId, 'email_thread_state');
