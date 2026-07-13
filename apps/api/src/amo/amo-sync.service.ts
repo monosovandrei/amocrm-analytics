@@ -45,7 +45,15 @@ export class AmoSyncService {
     await this.expireStaleJobs(connection.id);
 
     const result = await this.prisma.$transaction(async (tx) => {
-      await tx.$executeRawUnsafe('SELECT pg_advisory_xact_lock(hashtext($1::text))', `amo-pull-sync:${connection.id}`);
+      const locked = await this.tryAdvisoryTransactionLock(tx, `amo-pull-sync:${connection.id}`);
+      if (!locked) {
+        return {
+          job: null,
+          shouldRun: false,
+          response: { status: 'busy', type: syncType, requestedType: type },
+        };
+      }
+
       const runningJob = await tx.syncJob.findFirst({
         where: {
           connectionId: connection.id,
@@ -70,9 +78,9 @@ export class AmoSyncService {
         shouldRun: true,
         response: { jobId: job.id, status: job.status, type: job.type, requestedType: type },
       };
-    });
+    }, { maxWait: 2_000, timeout: 5_000 });
 
-    if (!result.shouldRun) return result.response;
+    if (!result.shouldRun || !result.job) return result.response;
 
     const job = result.job;
     await this.audit.record({
@@ -95,7 +103,14 @@ export class AmoSyncService {
     await this.expireStaleJobs(connection.id);
 
     const result = await this.prisma.$transaction(async (tx) => {
-      await tx.$executeRawUnsafe('SELECT pg_advisory_xact_lock(hashtext($1::text))', `amo-webhook-sync:${connection.id}`);
+      const locked = await this.tryAdvisoryTransactionLock(tx, `amo-webhook-sync:${connection.id}`);
+      if (!locked) {
+        return {
+          job: null,
+          shouldRun: false,
+          response: { status: 'busy', type: SyncJobType.WEBHOOK },
+        };
+      }
 
       const pendingWebhooks = await tx.webhookEvent.count({
         where: {
@@ -162,7 +177,7 @@ export class AmoSyncService {
         shouldRun: true,
         response: { jobId: job.id, status: job.status, type: job.type, pendingWebhooks },
       };
-    });
+    }, { maxWait: 2_000, timeout: 5_000 });
 
     if (!result.shouldRun || !result.job) return result.response;
 
@@ -180,6 +195,14 @@ export class AmoSyncService {
     });
 
     return result.response;
+  }
+
+  private async tryAdvisoryTransactionLock(tx: Prisma.TransactionClient, key: string) {
+    const rows = await tx.$queryRawUnsafe<Array<{ locked: boolean }>>(
+      'SELECT pg_try_advisory_xact_lock(hashtext($1::text)) AS locked',
+      key,
+    );
+    return rows[0]?.locked === true;
   }
 
   async expireStaleJobs(connectionId: string) {

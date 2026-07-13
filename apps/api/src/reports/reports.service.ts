@@ -1,7 +1,6 @@
 import JSZip from 'jszip';
-import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
-import { ForbiddenException, Injectable } from '@nestjs/common';
+import { ForbiddenException, Injectable, Logger } from '@nestjs/common';
 import { Prisma, ReportSourceType, UserRole } from '../generated/prisma';
 import {
   absoluteDurationDays,
@@ -79,6 +78,7 @@ type RevenueForecastBucketKey =
 
 const LOSS_REASON_CUSTOM_FIELD_NAMES = new Set(['причина отказа', 'причины отказа'].map(normalizeCustomFieldName));
 const MISSING_LOSS_REASON_LABEL = 'Не указано';
+const DEFAULT_REPORT_FRESH_COMPUTE_CONCURRENCY = 2;
 
 function normalizeCustomFieldName(value: unknown) {
   return String(value ?? '').trim().toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ');
@@ -96,8 +96,11 @@ function stableStringify(value: unknown): string {
 
 @Injectable()
 export class ReportsService {
-  private readonly transactionStore = new AsyncLocalStorage<Prisma.TransactionClient>();
+  private readonly logger = new Logger(ReportsService.name);
   private readonly refreshingReportKeys = new Set<string>();
+  private readonly freshComputeQueue: Array<() => void> = [];
+  private readonly freshComputeConcurrency = this.resolveFreshComputeConcurrency();
+  private activeFreshComputes = 0;
   private reportCacheReady?: Promise<void>;
 
   constructor(
@@ -111,13 +114,9 @@ export class ReportsService {
     const cached = await this.getCachedReport(cacheKey);
     if (cached) {
       if (this.cacheIsStale(cached.sourceSyncAt, latestSyncAt)) {
-        try {
-          const report = await this.computeFresh(dto, user);
-          await this.saveCachedReport(cacheKey, dto.name, report, latestSyncAt);
-          return report;
-        } catch {
-          return cached.payload;
-        }
+        void this.refreshCachedReport(cacheKey, dto, user, latestSyncAt).catch((error: any) => {
+          this.logger.warn(`Report cache refresh failed for ${dto.name}: ${error.message}`);
+        });
       }
       return cached.payload;
     }
@@ -128,20 +127,12 @@ export class ReportsService {
   }
 
   private async computeFresh(dto: ReportQueryDto, user: { id: string; role: UserRole }) {
-    return this.prisma.$transaction(
-      (tx) =>
-        this.transactionStore.run(tx, async () => {
-          const filters = dto.filters as ReportFilters;
-          const config = dto.config as ReportConfig;
-          const report = await this.computeBase(filters, config, user);
-          return this.attachComparison(report, filters, config, user);
-        }),
-      {
-        isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead,
-        maxWait: 10_000,
-        timeout: 60_000,
-      },
-    );
+    return this.withFreshComputeSlot(async () => {
+      const filters = dto.filters as ReportFilters;
+      const config = dto.config as ReportConfig;
+      const report = await this.computeBase(filters, config, user);
+      return this.attachComparison(report, filters, config, user);
+    });
   }
 
   private async refreshCachedReport(cacheKey: string, dto: ReportQueryDto, user: { id: string; role: UserRole }, latestSyncAt: Date | null) {
@@ -229,7 +220,27 @@ export class ReportsService {
   }
 
   private get db() {
-    return this.transactionStore.getStore() ?? this.prisma;
+    return this.prisma;
+  }
+
+  private resolveFreshComputeConcurrency() {
+    const value = Number(process.env.REPORT_FRESH_COMPUTE_CONCURRENCY);
+    if (!Number.isFinite(value) || value <= 0) return DEFAULT_REPORT_FRESH_COMPUTE_CONCURRENCY;
+    return Math.max(1, Math.floor(value));
+  }
+
+  private async withFreshComputeSlot<T>(callback: () => Promise<T>): Promise<T> {
+    if (this.activeFreshComputes >= this.freshComputeConcurrency) {
+      await new Promise<void>((resolve) => this.freshComputeQueue.push(resolve));
+    }
+
+    this.activeFreshComputes += 1;
+    try {
+      return await callback();
+    } finally {
+      this.activeFreshComputes -= 1;
+      this.freshComputeQueue.shift()?.();
+    }
   }
 
   private async computeBase(filters: ReportFilters, config: ReportConfig, user: { id: string; role: UserRole }) {
