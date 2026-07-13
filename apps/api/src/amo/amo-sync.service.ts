@@ -742,8 +742,7 @@ export class AmoSyncService {
           await this.syncWebhookRelatedNotes(client, communicationGroups, stats, eventSyncFrom);
         }
         if ((stats.webhookEmailNotes ?? 0) > 0 || (stats.webhookMailEvents ?? 0) > 0) {
-          await this.touchJob(jobId, 'email_thread_state');
-          await this.rebuildEmailThreadStates(stats);
+          stats.emailThreadStateDeferred = 1;
         }
         if (leadSideEffectGroups.length > 0) {
           await this.touchJob(jobId, 'crm_notifications');
