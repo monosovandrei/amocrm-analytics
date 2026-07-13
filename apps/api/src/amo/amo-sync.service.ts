@@ -740,24 +740,18 @@ export class AmoSyncService {
       const leadSideEffectGroups = actionableGroups.filter((group) => this.webhookGroupNeedsLeadSideEffects(group));
       const communicationGroups = actionableGroups.filter((group) => this.webhookGroupNeedsCommunicationSync(group));
 
-      if ((leadSideEffectGroups.length > 0 || communicationGroups.length > 0) && client) {
-        if (leadSideEffectGroups.length > 0) {
-          await this.touchJob(jobId, 'lead_sla_reconcile');
-          await this.reconcileLeadSlaDeals(client, maps, stats);
-        }
+      if (communicationGroups.length > 0) {
+        stats.webhookRelatedNotesDeferred = communicationGroups.length;
+        stats.emailThreadStateDeferred = 1;
+      }
+
+      if (leadSideEffectGroups.length > 0 && client) {
+        await this.touchJob(jobId, 'lead_sla_reconcile');
+        await this.reconcileLeadSlaDeals(client, maps, stats);
 
         const eventSyncFrom = Math.floor((earliestEventAt.getTime() - 5 * 60_000) / 1000);
-        if (communicationGroups.length > 0) {
-          await this.touchJob(jobId, 'webhook_related_notes');
-          await this.syncWebhookRelatedNotes(client, communicationGroups, stats, eventSyncFrom);
-        }
-        if ((stats.webhookEmailNotes ?? 0) > 0 || (stats.webhookMailEvents ?? 0) > 0) {
-          stats.emailThreadStateDeferred = 1;
-        }
-        if (leadSideEffectGroups.length > 0) {
-          await this.touchJob(jobId, 'crm_notifications');
-          await this.processCrmNotifications(stats, new Date(eventSyncFrom * 1000), client.domain);
-        }
+        await this.touchJob(jobId, 'crm_notifications');
+        await this.processCrmNotifications(stats, new Date(eventSyncFrom * 1000), client.domain);
       }
 
       const finishedAt = new Date();
@@ -972,8 +966,7 @@ export class AmoSyncService {
   }
 
   private webhookGroupNeedsCommunicationSync(group: WebhookEventGroup) {
-    if (group.entity === 'leads') return true;
-    if (group.entity !== 'contacts') return false;
+    if (group.entity !== 'leads' && group.entity !== 'contacts') return false;
     return group.actions.some((action) => {
       const clean = String(action ?? '').toLowerCase();
       return clean.includes('note') || clean.includes('message') || clean.includes('mail');
