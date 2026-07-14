@@ -963,7 +963,7 @@ export class AmoSyncService {
       return;
     }
     if (group.entity === 'tasks') {
-      await this.syncSingleTask(client, maps, group.externalId, stats);
+      await this.syncSingleTask(client, maps, group.externalId, stats, group.payloads);
       return;
     }
     if (group.entity === 'contacts') {
@@ -1083,6 +1083,7 @@ export class AmoSyncService {
     maps: AmoSyncMaps,
     externalId: string,
     stats: Record<string, number>,
+    webhookPayloads: Prisma.JsonValue[] = [],
   ) {
     let task: any;
     try {
@@ -1095,11 +1096,22 @@ export class AmoSyncService {
       }
       throw error;
     }
+    if (!task?.id) {
+      await this.prisma.task.deleteMany({ where: { externalId } });
+      stats.webhookTasksEmpty = (stats.webhookTasksEmpty ?? 0) + 1;
+      const leadExternalId = this.webhookTaskLeadExternalId(webhookPayloads);
+      if (leadExternalId) {
+        await this.syncSingleLead(client, maps, leadExternalId, stats);
+        stats.webhookTaskLeadFallbacks = (stats.webhookTaskLeadFallbacks ?? 0) + 1;
+      }
+      return;
+    }
     await this.upsertTask(task, maps);
     stats.webhookTasks = (stats.webhookTasks ?? 0) + 1;
 
-    if (task.entity_type === 'leads' && task.entity_id) {
-      await this.syncSingleLead(client, maps, String(task.entity_id), stats);
+    const leadExternalId = this.taskLeadExternalId(task) ?? this.webhookTaskLeadExternalId(webhookPayloads);
+    if (leadExternalId) {
+      await this.syncSingleLead(client, maps, leadExternalId, stats);
     }
   }
 
@@ -2233,10 +2245,13 @@ export class AmoSyncService {
   }
 
   private async upsertTask(task: any, maps: AmoSyncMaps) {
+    if (!task?.id) return null;
+
     let dealId: string | null = null;
-    if (task.entity_type === 'leads' && task.entity_id) {
+    const leadExternalId = this.taskLeadExternalId(task);
+    if (leadExternalId) {
       const deal = await this.prisma.deal.findUnique({
-        where: { externalId: String(task.entity_id) },
+        where: { externalId: leadExternalId },
         select: { id: true },
       });
       dealId = deal?.id ?? null;
@@ -2272,6 +2287,32 @@ export class AmoSyncService {
         raw: task,
       },
     });
+  }
+
+  private taskLeadExternalId(task: any) {
+    if (!task || typeof task !== 'object') return null;
+    const directLeadId = task.lead_id ?? task.leadId;
+    if (directLeadId != null) return String(directLeadId);
+
+    const entityId = task.entity_id ?? task.element_id;
+    if (entityId == null) return null;
+    const entityType = task.entity_type ?? task.element_type ?? task.entity;
+    return this.isLeadEntityType(entityType) ? String(entityId) : null;
+  }
+
+  private webhookTaskLeadExternalId(payloads: Prisma.JsonValue[]) {
+    for (const payload of payloads) {
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) continue;
+      const item = payload as Record<string, any>;
+      const leadExternalId = this.taskLeadExternalId(item);
+      if (leadExternalId) return leadExternalId;
+    }
+    return null;
+  }
+
+  private isLeadEntityType(value: unknown) {
+    const normalized = String(value ?? '').toLowerCase();
+    return normalized === '2' || normalized.includes('lead');
   }
 
   private async syncNotes(client: AmoClient, stats: Record<string, number>, updatedSince?: number) {
