@@ -158,7 +158,7 @@ export interface ReportConfig {
   pinned?: boolean;
   size?: 'sm' | 'md' | 'lg';
   order?: number;
-  dashboardSection?: 'sales' | 'csm' | 'forecast';
+  dashboardSection?: 'sales' | 'csmSales' | 'csm' | 'forecast';
   lockPipelineFilter?: boolean;
   lockTeamFilter?: boolean;
   builtinKey?: string;

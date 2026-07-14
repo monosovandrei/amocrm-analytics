@@ -378,8 +378,10 @@ export class ReportsService {
   }
 
   private async ensureBuiltinReportTemplates() {
+    const salesTemplates = await this.buildSalesReportTemplates();
     const templates = [
-      ...(await this.buildSalesReportTemplates()),
+      ...salesTemplates,
+      ...(await this.buildCsmInSalesReportTemplates(salesTemplates)),
       ...(await this.buildCsmReportTemplates()),
       this.buildRevenueForecastReportTemplate(),
     ];
@@ -673,6 +675,76 @@ export class ReportsService {
         }),
       },
     ];
+  }
+
+  private async buildCsmInSalesReportTemplates(salesTemplates: BuiltinReportTemplate[]): Promise<BuiltinReportTemplate[]> {
+    const [refs, csmGroup] = await Promise.all([
+      this.resolveSalesRefs(),
+      this.findCrmGroupByName('CSM'),
+    ]);
+    if (!refs || !csmGroup || salesTemplates.length === 0) return [];
+
+    const namesBySalesKey = new Map<string, string>([
+      ['sales_funnel_steps', 'CSM в продажах: шаги и конверсии за месяц'],
+      ['sales_weighted_funnel', 'CSM в продажах: взвешенная воронка'],
+      ['sales_assigned_stage_speed', 'CSM в продажах: скорость взятия сделок'],
+      ['sales_stage_age', 'CSM в продажах: текущие сделки по этапам'],
+      ['sales_loss_reasons', 'CSM в продажах: причины отказа'],
+    ]);
+    const descriptionsBySalesKey = new Map<string, Pick<ReportConfig, 'description' | 'conditionLabel'>>([
+      ['sales_funnel_steps', {
+        description: 'Полученные лиды, КП, счета, оплаты и конверсии по менеджерам CSM в воронке Продажи',
+        conditionLabel: 'Воронка Продажи: полученные лиды, КП, счета, оплаты и конверсии по менеджерам CSM',
+      }],
+      ['sales_weighted_funnel', {
+        description: 'Взвешенная сумма по КП, счетам и сборке по менеджерам CSM в воронке Продажи',
+      }],
+      ['sales_assigned_stage_speed', {
+        description: 'Среднее время взятия сделок менеджерами CSM в воронке Продажи',
+        conditionLabel: 'Воронка Продажи: от назначения ответственного и задачи на него до выхода из этапа',
+      }],
+      ['sales_stage_age', {
+        description: 'Сколько текущие открытые сделки находятся в этапах воронки Продажи по менеджерам CSM',
+        conditionLabel: 'Воронка Продажи: открытые сделки сейчас, вход в текущий этап -> текущее время',
+      }],
+      ['sales_loss_reasons', {
+        description: 'Сделки CSM, отправленные в отказ в воронке Продажи за выбранный период, по причинам отказа',
+        conditionLabel: 'Воронка Продажи: вход в отказ за выбранный период, по менеджерам CSM',
+      }],
+    ]);
+
+    return salesTemplates
+      .filter((template) => namesBySalesKey.has(template.config.builtinKey ?? ''))
+      .map((template, index) => {
+        const salesKey = template.config.builtinKey ?? '';
+        const csmSalesKey = salesKey.replace(/^sales_/, 'csm_sales_');
+        const config: ReportConfig = {
+          ...this.cloneReportConfig(template.config),
+          ...(descriptionsBySalesKey.get(salesKey) ?? {}),
+          builtinKey: csmSalesKey,
+          dashboardSection: 'csmSales',
+          pinned: true,
+          order: index,
+          lockPipelineFilter: true,
+          lockTeamFilter: true,
+          filters: {
+            ...(template.config.filters ?? {}),
+            pipelineIds: [refs.salesPipeline.id],
+            groupIds: [csmGroup.id],
+          },
+        };
+
+        return {
+          name: namesBySalesKey.get(salesKey)!,
+          position: 10 + index,
+          sourceType: template.sourceType,
+          config,
+        };
+      });
+  }
+
+  private cloneReportConfig(config: ReportConfig): ReportConfig {
+    return JSON.parse(JSON.stringify(config)) as ReportConfig;
   }
 
   private buildRevenueForecastReportTemplate(): BuiltinReportTemplate {
@@ -973,6 +1045,7 @@ export class ReportsService {
 
     await this.ensureSalesLossReasonsReportTemplate(salesGroup?.id, salesPipeline?.id);
     await this.applyTeamScopeToTemplates('Sales:', salesGroup?.id, salesPipeline ? [salesPipeline.id] : undefined, true);
+    await this.applyTeamScopeToTemplates('CSM в продажах:', csmGroup?.id, salesPipeline ? [salesPipeline.id] : undefined, true);
     await this.applyTeamScopeToTemplates('CSM:', csmGroup?.id, undefined, true);
     await this.applySalesAssignedStageSpeedMode();
     await this.applySalesLeadsReceivedMetric();

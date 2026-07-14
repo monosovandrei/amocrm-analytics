@@ -1042,12 +1042,14 @@ function WorkspaceTab({
   refreshStamp: number;
   onSetFilters: (filters: ReportFilters) => void;
 }) {
-  const [sectionOpen, setSectionOpen] = useState<Record<'sales' | 'csm' | 'forecast', boolean>>({
+  const [sectionOpen, setSectionOpen] = useState<Record<'sales' | 'csmSales' | 'csm' | 'forecast', boolean>>({
     sales: true,
+    csmSales: true,
     csm: true,
     forecast: true,
   });
   const salesTemplates = reportTemplates.filter((template) => dashboardSectionKey(template) === 'sales');
+  const csmSalesTemplates = reportTemplates.filter((template) => dashboardSectionKey(template) === 'csmSales');
   const csmTemplates = reportTemplates.filter((template) => dashboardSectionKey(template) === 'csm');
   const forecastTemplates = reportTemplates.filter((template) => dashboardSectionKey(template) === 'forecast');
 
@@ -1067,7 +1069,7 @@ function WorkspaceTab({
         <div>
           <h1 className="page-title">Отчёты</h1>
           <p className="page-description">
-            Продажи, CSM и прогноз по актуальным данным amoCRM.
+            Продажи, CSM в продажах, CSM и прогноз по актуальным данным amoCRM.
           </p>
         </div>
       </div>
@@ -1096,6 +1098,16 @@ function WorkspaceTab({
               onToggle={() => setSectionOpen((current) => ({ ...current, sales: !current.sales }))}
             >
               {salesTemplates.map(renderWidget)}
+            </DashboardSection>
+          )}
+          {csmSalesTemplates.length > 0 && (
+            <DashboardSection
+              count={csmSalesTemplates.length}
+              isOpen={sectionOpen.csmSales}
+              title="CSM в продажах"
+              onToggle={() => setSectionOpen((current) => ({ ...current, csmSales: !current.csmSales }))}
+            >
+              {csmSalesTemplates.map(renderWidget)}
             </DashboardSection>
           )}
           {csmTemplates.length > 0 && (
@@ -6260,6 +6272,10 @@ function orderTemplates(items: ReportTemplate[]) {
 
 function dashboardSectionKey(template: ReportTemplate) {
   if (template.config.metric === 'revenue_profit_forecast') return 'forecast';
+  if (
+    template.config.dashboardSection === 'csmSales' ||
+    template.name.trim().toLowerCase().startsWith('csm в продажах:')
+  ) return 'csmSales';
   if (template.config.dashboardSection === 'csm' || template.name.trim().toLowerCase().startsWith('csm:')) return 'csm';
   return 'sales';
 }

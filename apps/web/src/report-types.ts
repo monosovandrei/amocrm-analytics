@@ -334,7 +334,7 @@ export interface ReportConfig {
   pinned?: boolean;
   size?: WidgetSize;
   order?: number;
-  dashboardSection?: 'sales' | 'csm' | 'forecast';
+  dashboardSection?: 'sales' | 'csmSales' | 'csm' | 'forecast';
   lockPipelineFilter?: boolean;
   lockTeamFilter?: boolean;
   builtinKey?: string;
