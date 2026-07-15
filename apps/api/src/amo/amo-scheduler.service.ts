@@ -203,10 +203,10 @@ export class AmoSchedulerService {
 
   private getEmailNotesSyncIntervalSeconds() {
     const rawInterval = this.config.get<string>('AMOCRM_EMAIL_NOTES_SYNC_INTERVAL_SECONDS');
-    if (!rawInterval) return 60;
+    if (!rawInterval) return 0;
 
     const parsed = Number(rawInterval);
-    return Number.isFinite(parsed) ? Math.max(0, parsed) : 60;
+    return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
   }
 
   private getRecentReconcileIntervalSeconds() {
