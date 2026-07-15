@@ -67,6 +67,10 @@ type StageSuccessProbability = {
 type StageSuccessProbabilityModel = {
   probability: (stageId: string, managerId?: string | null) => StageSuccessProbability;
 };
+type ReportCacheConfig = {
+  dto?: ReportQueryDto;
+  user?: { id: string; role: UserRole };
+};
 type RevenueForecastBucketKey =
   | 'salesShippedThisMonth'
   | 'salesShippingThisMonth'
@@ -101,7 +105,6 @@ function stableStringify(value: unknown): string {
 @Injectable()
 export class ReportsService {
   private readonly logger = new Logger(ReportsService.name);
-  private readonly refreshingReportKeys = new Set<string>();
   private readonly freshComputeQueue: Array<() => void> = [];
   private readonly freshComputeConcurrency = this.resolveFreshComputeConcurrency();
   private activeFreshComputes = 0;
@@ -118,15 +121,13 @@ export class ReportsService {
     const cached = await this.getCachedReport(cacheKey);
     if (cached) {
       if (this.cacheIsStale(cached.sourceSyncAt, latestSyncAt)) {
-        void this.refreshCachedReport(cacheKey, dto, user, latestSyncAt).catch((error: any) => {
-          this.logger.warn(`Report cache refresh failed for ${dto.name}: ${error.message}`);
-        });
+        await this.enqueueReportCacheRefresh(cacheKey, dto, user);
       }
       return cached.payload;
     }
 
     const report = await this.computeFresh(dto, user);
-    await this.saveCachedReport(cacheKey, dto.name, report, latestSyncAt);
+    await this.saveCachedReport(cacheKey, dto.name, report, latestSyncAt, dto, user);
     return report;
   }
 
@@ -137,17 +138,6 @@ export class ReportsService {
       const report = await this.computeBase(filters, config, user);
       return this.attachComparison(report, filters, config, user);
     });
-  }
-
-  private async refreshCachedReport(cacheKey: string, dto: ReportQueryDto, user: { id: string; role: UserRole }, latestSyncAt: Date | null) {
-    if (this.refreshingReportKeys.has(cacheKey)) return;
-    this.refreshingReportKeys.add(cacheKey);
-    try {
-      const report = await this.computeFresh(dto, user);
-      await this.saveCachedReport(cacheKey, dto.name, report, latestSyncAt);
-    } finally {
-      this.refreshingReportKeys.delete(cacheKey);
-    }
   }
 
   private reportCacheKey(dto: ReportQueryDto, user: { id: string; role: UserRole }) {
@@ -163,17 +153,35 @@ export class ReportsService {
   }
 
   private async ensureReportCacheTable() {
-    this.reportCacheReady ??= this.prisma.$executeRawUnsafe(`
+    this.reportCacheReady ??= this.ensureReportCacheSchema();
+    return this.reportCacheReady;
+  }
+
+  private async ensureReportCacheSchema() {
+    await this.prisma.$executeRawUnsafe(`
       CREATE TABLE IF NOT EXISTS report_result_cache (
         cache_key TEXT PRIMARY KEY,
         name TEXT,
         payload JSONB NOT NULL,
+        report_config JSONB,
         source_sync_at TIMESTAMPTZ,
+        refresh_status TEXT NOT NULL DEFAULT 'IDLE',
+        refresh_requested_at TIMESTAMPTZ,
+        refreshing_at TIMESTAMPTZ,
+        refresh_error TEXT,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
-    `).then(() => undefined);
-    return this.reportCacheReady;
+    `);
+    await this.prisma.$executeRawUnsafe(`ALTER TABLE report_result_cache ADD COLUMN IF NOT EXISTS report_config JSONB`);
+    await this.prisma.$executeRawUnsafe(`ALTER TABLE report_result_cache ADD COLUMN IF NOT EXISTS refresh_status TEXT NOT NULL DEFAULT 'IDLE'`);
+    await this.prisma.$executeRawUnsafe(`ALTER TABLE report_result_cache ADD COLUMN IF NOT EXISTS refresh_requested_at TIMESTAMPTZ`);
+    await this.prisma.$executeRawUnsafe(`ALTER TABLE report_result_cache ADD COLUMN IF NOT EXISTS refreshing_at TIMESTAMPTZ`);
+    await this.prisma.$executeRawUnsafe(`ALTER TABLE report_result_cache ADD COLUMN IF NOT EXISTS refresh_error TEXT`);
+    await this.prisma.$executeRawUnsafe(`
+      CREATE INDEX IF NOT EXISTS report_result_cache_refresh_idx
+      ON report_result_cache (refresh_status, refresh_requested_at)
+    `);
   }
 
   private async getCachedReport(cacheKey: string) {
@@ -189,24 +197,126 @@ export class ReportsService {
     return { payload: row.payload as Record<string, any>, sourceSyncAt: row.source_sync_at };
   }
 
-  private async saveCachedReport(cacheKey: string, name: string, report: unknown, sourceSyncAt: Date | null) {
+  private async saveCachedReport(
+    cacheKey: string,
+    name: string,
+    report: unknown,
+    sourceSyncAt: Date | null,
+    dto?: ReportQueryDto,
+    user?: { id: string; role: UserRole },
+  ) {
     await this.ensureReportCacheTable();
+    const reportConfig = dto && user ? JSON.stringify({ dto, user: { id: user.id, role: user.role } }) : null;
     await this.prisma.$executeRawUnsafe(
       `
-        INSERT INTO report_result_cache (cache_key, name, payload, source_sync_at, updated_at)
-        VALUES ($1, $2, $3::jsonb, $4, NOW())
+        INSERT INTO report_result_cache (
+          cache_key,
+          name,
+          payload,
+          report_config,
+          source_sync_at,
+          refresh_status,
+          refresh_requested_at,
+          refreshing_at,
+          refresh_error,
+          updated_at
+        )
+        VALUES ($1, $2, $3::jsonb, $4::jsonb, $5, 'IDLE', NULL, NULL, NULL, NOW())
         ON CONFLICT (cache_key)
         DO UPDATE SET
           name = EXCLUDED.name,
           payload = EXCLUDED.payload,
+          report_config = COALESCE(EXCLUDED.report_config, report_result_cache.report_config),
           source_sync_at = EXCLUDED.source_sync_at,
+          refresh_status = 'IDLE',
+          refresh_requested_at = NULL,
+          refreshing_at = NULL,
+          refresh_error = NULL,
           updated_at = NOW()
       `,
       cacheKey,
       name,
       JSON.stringify(report),
+      reportConfig,
       sourceSyncAt,
     );
+  }
+
+  private async enqueueReportCacheRefresh(cacheKey: string, dto: ReportQueryDto, user: { id: string; role: UserRole }) {
+    await this.ensureReportCacheTable();
+    await this.prisma.$executeRawUnsafe(
+      `
+        UPDATE report_result_cache
+        SET
+          name = $2,
+          report_config = $3::jsonb,
+          refresh_status = CASE WHEN refresh_status = 'RUNNING' THEN refresh_status ELSE 'QUEUED' END,
+          refresh_requested_at = CASE WHEN refresh_status = 'RUNNING' THEN refresh_requested_at ELSE NOW() END,
+          refresh_error = NULL,
+          updated_at = NOW()
+        WHERE cache_key = $1
+      `,
+      cacheKey,
+      dto.name,
+      JSON.stringify({ dto, user: { id: user.id, role: user.role } }),
+    );
+  }
+
+  async processReportCacheRefreshJobs(limit = 1) {
+    await this.ensureReportCacheTable();
+    await this.requeueStaleReportCacheLocks();
+    const jobs = await this.prisma.$queryRaw<Array<{ cache_key: string; report_config: ReportCacheConfig | null }>>`
+      SELECT cache_key, report_config
+      FROM report_result_cache
+      WHERE refresh_status = 'QUEUED' AND report_config IS NOT NULL
+      ORDER BY refresh_requested_at ASC NULLS FIRST, updated_at ASC
+      LIMIT ${limit}
+    `;
+
+    for (const job of jobs) {
+      const locked = await this.prisma.$executeRawUnsafe(
+        `
+          UPDATE report_result_cache
+          SET refresh_status = 'RUNNING', refreshing_at = NOW(), refresh_error = NULL, updated_at = NOW()
+          WHERE cache_key = $1 AND refresh_status = 'QUEUED'
+        `,
+        job.cache_key,
+      );
+      if (!locked) continue;
+
+      try {
+        const dto = job.report_config?.dto;
+        const user = job.report_config?.user;
+        if (!dto || !user?.id || !user?.role) throw new Error('Invalid report cache refresh payload');
+
+        const latestSyncAt = await this.latestReportSourceSyncAt();
+        const report = await this.computeFresh(dto, user);
+        await this.saveCachedReport(job.cache_key, dto.name, report, latestSyncAt, dto, user);
+      } catch (error: any) {
+        await this.prisma.$executeRawUnsafe(
+          `
+            UPDATE report_result_cache
+            SET refresh_status = 'ERROR', refreshing_at = NULL, refresh_error = $2, updated_at = NOW()
+            WHERE cache_key = $1
+          `,
+          job.cache_key,
+          String(error?.message ?? error),
+        );
+        this.logger.warn(`Report cache refresh ${job.cache_key} failed: ${error.message}`);
+      } finally {
+        this.compactHeap();
+      }
+    }
+
+    return { processed: jobs.length };
+  }
+
+  private async requeueStaleReportCacheLocks() {
+    await this.prisma.$executeRawUnsafe(`
+      UPDATE report_result_cache
+      SET refresh_status = 'QUEUED', refreshing_at = NULL, updated_at = NOW()
+      WHERE refresh_status = 'RUNNING' AND refreshing_at < NOW() - INTERVAL '10 minutes'
+    `);
   }
 
   private async latestReportSourceSyncAt() {
@@ -1263,7 +1373,10 @@ export class ReportsService {
   }
 
   async exportExcel(dto: ReportQueryDto, user: { id: string; role: UserRole }) {
-    const report = await this.compute(dto, user);
+    const latestSyncAt = await this.latestReportSourceSyncAt();
+    const cacheKey = this.reportCacheKey(dto, user);
+    const report = await this.computeFresh(dto, user);
+    await this.saveCachedReport(cacheKey, dto.name, report, latestSyncAt, dto, user);
     const sheets: XlsxSheet[] = [
       {
         name: 'Параметры',

@@ -6,6 +6,7 @@ const MB = 1024 * 1024;
 @Injectable()
 export class ApiMemoryInterceptor implements NestInterceptor {
   private readonly logger = new Logger(ApiMemoryInterceptor.name);
+  private lastHighRssLogAt = 0;
 
   intercept(context: ExecutionContext, next: CallHandler): any {
     const request = context.switchToHttp().getRequest<{ method?: string; url?: string; raw?: { url?: string } }>();
@@ -21,11 +22,16 @@ export class ApiMemoryInterceptor implements NestInterceptor {
         const rssDeltaMb = Math.round((after.rss - before.rss) / MB);
         const rssMb = Math.round(after.rss / MB);
         const heapMb = Math.round(after.heapUsed / MB);
-        const shouldLog = durationMs >= 1000 || Math.abs(rssDeltaMb) >= 64 || rssMb >= 900;
+        const externalMb = Math.round(after.external / MB);
+        const shouldLog =
+          durationMs >= 1000 ||
+          Math.abs(rssDeltaMb) >= 16 ||
+          this.isTrackedRoute(url) ||
+          this.shouldSampleHighRss(rssMb);
 
         if (shouldLog) {
           this.logger.warn(
-            `${method} ${url} ${durationMs}ms rss=${rssMb}MB heap=${heapMb}MB rssDelta=${rssDeltaMb}MB`,
+            `${method} ${url} ${durationMs}ms rss=${rssMb}MB heap=${heapMb}MB external=${externalMb}MB rssDelta=${rssDeltaMb}MB`,
           );
         }
 
@@ -42,14 +48,26 @@ export class ApiMemoryInterceptor implements NestInterceptor {
   private shouldCompact(url: string, durationMs: number, rssMb: number, rssDeltaMb: number) {
     if (process.env.API_FORCE_GC_AFTER_HEAVY_REQUESTS === '0') return false;
     return (
-      rssMb >= 900 ||
       rssDeltaMb >= 128 ||
-      (durationMs >= 1000 && (
-        url.includes('/reports/') ||
-        url.includes('/settings/options') ||
-        url.includes('/platform/email-threads') ||
-        url.includes('/platform/lead-sla')
-      ))
+      (durationMs >= 1000 && this.isTrackedRoute(url)) ||
+      (rssMb >= 1200 && this.isTrackedRoute(url))
     );
+  }
+
+  private isTrackedRoute(url: string) {
+    return (
+      url.includes('/reports/') ||
+      url.includes('/settings/options') ||
+      url.includes('/platform/email-threads') ||
+      url.includes('/platform/lead-sla')
+    );
+  }
+
+  private shouldSampleHighRss(rssMb: number) {
+    if (rssMb < 900) return false;
+    const now = Date.now();
+    if (now - this.lastHighRssLogAt < 60_000) return false;
+    this.lastHighRssLogAt = now;
+    return true;
   }
 }

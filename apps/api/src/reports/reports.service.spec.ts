@@ -257,6 +257,37 @@ describe('ReportsService data contract', () => {
     service = new ReportsService(createPrismaMock() as any, audit as any);
   });
 
+  it('queues stale cached report refresh instead of recomputing inside API', async () => {
+    const cachedPayload = { rows: [{ id: 'cached-row' }] };
+    const db = {
+      $executeRawUnsafe: jest.fn(() => Promise.resolve(1)),
+      $queryRaw: jest.fn(() => Promise.resolve([{ payload: cachedPayload, source_sync_at: new Date('2026-01-01T00:00:00.000Z') }])),
+      amoConnection: {
+        findFirst: jest.fn(() =>
+          Promise.resolve({ lastIncrementalSyncAt: new Date('2026-01-02T00:00:00.000Z'), lastFullSyncAt: null }),
+        ),
+      },
+    };
+    const localService = new ReportsService(db as any, audit as any);
+
+    const result = await localService.compute(
+      {
+        name: 'Cached report',
+        sourceType: 'CURRENT' as any,
+        filters: {},
+        config: { metric: 'contract', contract: { groupBy: 'none', metrics: [] } },
+      } as any,
+      { id: 'user-1', role: 'ADMIN' as any },
+    );
+
+    expect(result).toBe(cachedPayload);
+    expect(
+      db.$executeRawUnsafe.mock.calls.some(
+        (call: any[]) => String(call[0]).includes('WHERE cache_key = $1') && String(call[0]).includes("ELSE 'QUEUED'"),
+      ),
+    ).toBe(true);
+  });
+
   it('computes count, stage transitions, field conditions, sums, conversion and durations in one contract', async () => {
     const result = await service.compute(
       {
