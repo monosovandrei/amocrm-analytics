@@ -307,7 +307,7 @@ export class ReportsService {
         this.logger.warn(`Report cache refresh ${job.cache_key} failed: ${error.message}`);
       } finally {
         this.compactHeap();
-        this.recycleWorkerIfNeeded('report cache refresh');
+        await this.recycleWorkerIfNeeded('report cache refresh');
       }
     }
 
@@ -1470,7 +1470,7 @@ export class ReportsService {
         this.logger.warn(`Export job ${job.id} failed: ${error.message}`);
       } finally {
         this.compactHeap();
-        this.recycleWorkerIfNeeded('report export');
+        await this.recycleWorkerIfNeeded('report export');
       }
     }
 
@@ -1515,13 +1515,19 @@ export class ReportsService {
     if (typeof gc === 'function') gc();
   }
 
-  private recycleWorkerIfNeeded(reason: string) {
+  private async recycleWorkerIfNeeded(reason: string) {
     if (!process.argv.some((arg) => arg.endsWith('worker.js'))) return;
     const limit = this.resolveWorkerRecycleRssMb();
     if (limit <= 0) return;
 
     const rssMb = Math.round(process.memoryUsage().rss / MB);
     if (rssMb < limit) return;
+
+    const runningSyncJobs = await this.prisma.syncJob.count({ where: { status: 'RUNNING' } });
+    if (runningSyncJobs > 0) {
+      this.logger.warn(`Worker RSS ${rssMb}MB exceeded ${limit}MB after ${reason}; restart delayed, sync jobs are running`);
+      return;
+    }
 
     this.logger.warn(`Worker RSS ${rssMb}MB exceeded ${limit}MB after ${reason}; restarting worker process`);
     setTimeout(() => process.exit(0), 100);
