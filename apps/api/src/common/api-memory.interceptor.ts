@@ -23,10 +23,11 @@ export class ApiMemoryInterceptor implements NestInterceptor {
         const rssMb = Math.round(after.rss / MB);
         const heapMb = Math.round(after.heapUsed / MB);
         const externalMb = Math.round(after.external / MB);
+        const trackedRoute = this.isTrackedRoute(url);
         const shouldLog =
           durationMs >= 1000 ||
           Math.abs(rssDeltaMb) >= 16 ||
-          this.isTrackedRoute(url) ||
+          (trackedRoute && (durationMs >= 100 || Math.abs(rssDeltaMb) >= 4)) ||
           this.shouldSampleHighRss(rssMb);
 
         if (shouldLog) {
