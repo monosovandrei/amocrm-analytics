@@ -366,6 +366,62 @@ export class AmoSyncService {
     }
   }
 
+  async reconcileRecentChanges() {
+    const connection = await this.amo.getActiveConnectionOrFail();
+    if (!connection.lastFullSyncAt) return { status: 'waiting_initial_snapshot' };
+
+    const startedAt = new Date();
+    const connectionConfig = this.connectionConfig(connection);
+    const previousCursor = this.parseConfigDate(connectionConfig.recentReconcileAt);
+    const lookbackMs = this.getRecentReconcileLookbackMinutes() * 60_000;
+    const overlapMs = this.getRecentReconcileOverlapMinutes() * 60_000;
+    const earliestAllowed = startedAt.getTime() - lookbackMs;
+    const cursorFrom = previousCursor ? previousCursor.getTime() - overlapMs : earliestAllowed;
+    const syncFrom = new Date(Math.max(earliestAllowed, cursorFrom));
+    const updatedSince = Math.floor(syncFrom.getTime() / 1000);
+    const stats: Record<string, number> = {};
+
+    try {
+      const client = await this.amo.getClient(connection);
+      const maps = this.emptyMaps();
+      await this.hydrateMetadataMaps(maps);
+      await this.syncDeals(client, maps, stats, updatedSince);
+      await this.syncOptional('events', stats, () => this.syncEvents(client, maps, stats, updatedSince));
+
+      await this.prisma.amoConnection.update({
+        where: { id: connection.id },
+        data: {
+          status: 'ACTIVE',
+          lastError: null,
+          config: {
+            ...connectionConfig,
+            recentReconcileAt: startedAt.toISOString(),
+            recentReconcileFrom: syncFrom.toISOString(),
+            recentReconcileStats: stats,
+            recentReconcileError: null,
+            recentReconcileErrorAt: null,
+          },
+        },
+      });
+
+      return { status: 'ok', from: syncFrom, stats };
+    } catch (error: any) {
+      await this.prisma.amoConnection.update({
+        where: { id: connection.id },
+        data: {
+          config: {
+            ...connectionConfig,
+            recentReconcileError: String(error?.message ?? error),
+            recentReconcileErrorAt: new Date().toISOString(),
+          },
+        },
+      });
+      throw error;
+    } finally {
+      this.compactHeapAfterHeavySync();
+    }
+  }
+
   async processCrmStateNotifications() {
     const connection = await this.amo.getActiveConnectionOrFail();
     if (!connection.lastFullSyncAt) return { status: 'waiting_initial_snapshot' };
@@ -472,11 +528,15 @@ export class AmoSyncService {
       }),
     ]);
 
+    const connectionConfig = this.connectionConfig(connection);
     const syncMode = this.getConfiguredSyncIntervalMinutes() > 0 ? 'POLLING' : 'WEBHOOK';
     const hasReceivedWebhooks = Boolean(lastWebhook);
     const lastSuccessfulSyncAt = lastSuccessJob?.finishedAt ?? connection.lastIncrementalSyncAt ?? connection.lastFullSyncAt;
-    const lastDataUpdateAt = lastProcessedWebhook?.processedAt ?? lastSuccessfulSyncAt;
-    const connectionConfig = this.connectionConfig(connection);
+    const recentReconcileAt = this.parseConfigDate(connectionConfig.recentReconcileAt);
+    const recentReconcileErrorAt = this.parseConfigDate(connectionConfig.recentReconcileErrorAt);
+    const recentReconcileError =
+      typeof connectionConfig.recentReconcileError === 'string' ? connectionConfig.recentReconcileError : null;
+    const lastDataUpdateAt = this.latestDate(lastProcessedWebhook?.processedAt, recentReconcileAt, lastSuccessfulSyncAt);
     const webhookSubscriptionEnsuredAt = this.parseConfigDate(connectionConfig.webhookEnsuredAt);
     const webhookSubscriptionErrorAt = this.parseConfigDate(connectionConfig.webhookEnsureErrorAt);
     const webhookSubscriptionError =
@@ -531,6 +591,9 @@ export class AmoSyncService {
       lastSuccessfulSyncAt,
       lastDataUpdateAt,
       lastSnapshotAt: connection.lastFullSyncAt,
+      recentReconcileAt,
+      recentReconcileError,
+      recentReconcileErrorAt,
       lastWebhookAt: lastWebhook?.receivedAt ?? null,
       lastProcessedWebhookAt: lastProcessedWebhook?.processedAt ?? null,
       webhookLagSeconds,
@@ -560,6 +623,20 @@ export class AmoSyncService {
     return Number.isFinite(parsed) && parsed > 0 ? parsed : 7;
   }
 
+  private getRecentReconcileLookbackMinutes() {
+    const rawMinutes = this.config.get<string>('AMOCRM_RECENT_RECONCILE_LOOKBACK_MINUTES');
+    if (!rawMinutes) return 30;
+    const parsed = Number(rawMinutes);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 30;
+  }
+
+  private getRecentReconcileOverlapMinutes() {
+    const rawMinutes = this.config.get<string>('AMOCRM_RECENT_RECONCILE_OVERLAP_MINUTES');
+    if (!rawMinutes) return 10;
+    const parsed = Number(rawMinutes);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 10;
+  }
+
   private connectionConfig(connection: AmoConnection) {
     const config = connection.config;
     return config && typeof config === 'object' && !Array.isArray(config) ? (config as Record<string, unknown>) : {};
@@ -569,6 +646,14 @@ export class AmoSyncService {
     if (typeof raw !== 'string') return null;
     const date = new Date(raw);
     return Number.isNaN(date.getTime()) ? null : date;
+  }
+
+  private latestDate(...dates: Array<Date | null | undefined>) {
+    const timestamps = dates
+      .filter((date): date is Date => date instanceof Date && !Number.isNaN(date.getTime()))
+      .map((date) => date.getTime());
+    if (timestamps.length === 0) return null;
+    return new Date(Math.max(...timestamps));
   }
 
   async run(jobId: string) {

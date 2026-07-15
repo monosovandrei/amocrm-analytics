@@ -11,6 +11,7 @@ export class AmoSchedulerService {
   private webhookBusy = false;
   private webhookSubscriptionBusy = false;
   private emailNotesBusy = false;
+  private recentReconcileBusy = false;
   private crmStateNotificationsBusy = false;
   private lastCrmStateNotificationsAt = Date.now();
 
@@ -103,6 +104,38 @@ export class AmoSchedulerService {
   }
 
   @Interval(60_000)
+  async reconcileRecentAmoChanges() {
+    if (this.recentReconcileBusy) return;
+    const intervalSeconds = this.getRecentReconcileIntervalSeconds();
+    if (intervalSeconds <= 0) return;
+
+    const connection = await this.prisma.amoConnection.findFirst({
+      where: { status: { in: ['ACTIVE', 'ERROR', 'SYNCING'] } },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (!connection?.lastFullSyncAt) return;
+
+    const lastReconciledAt = this.getConfigDate(connection.config, 'recentReconcileAt');
+    const due = !lastReconciledAt || Date.now() - lastReconciledAt.getTime() >= intervalSeconds * 1000;
+    if (!due) return;
+
+    await this.sync.expireStaleJobs(connection.id);
+    const running = await this.prisma.syncJob.count({
+      where: { connectionId: connection.id, status: { in: ['QUEUED', 'RUNNING'] } },
+    });
+    if (running > 0) return;
+
+    this.recentReconcileBusy = true;
+    try {
+      await this.sync.reconcileRecentChanges();
+    } catch (error: any) {
+      this.logger.warn(`Recent amoCRM reconcile failed: ${error.message}`);
+    } finally {
+      this.recentReconcileBusy = false;
+    }
+  }
+
+  @Interval(60_000)
   async ensureWebhookSubscription() {
     if (this.webhookSubscriptionBusy) return;
     const checkIntervalMinutes = this.getWebhookSubscriptionCheckMinutes();
@@ -174,6 +207,14 @@ export class AmoSchedulerService {
 
     const parsed = Number(rawInterval);
     return Number.isFinite(parsed) ? Math.max(0, parsed) : 60;
+  }
+
+  private getRecentReconcileIntervalSeconds() {
+    const rawInterval = this.config.get<string>('AMOCRM_RECENT_RECONCILE_INTERVAL_SECONDS');
+    if (!rawInterval) return 120;
+
+    const parsed = Number(rawInterval);
+    return Number.isFinite(parsed) ? Math.max(0, parsed) : 120;
   }
 
   private getCrmStateNotificationsIntervalSeconds() {
