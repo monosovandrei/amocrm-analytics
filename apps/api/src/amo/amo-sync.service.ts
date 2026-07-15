@@ -385,8 +385,8 @@ export class AmoSyncService {
       const client = await this.amo.getClient(connection);
       const maps = this.emptyMaps();
       await this.hydrateMetadataMaps(maps);
-      await this.syncDeals(client, maps, stats, updatedSince);
-      await this.syncOptional('events', stats, () => this.syncEvents(client, maps, stats, updatedSince));
+      await this.syncRecentDeals(client, maps, stats, updatedSince);
+      await this.syncRecentStageEvents(client, maps, stats, updatedSince);
 
       await this.prisma.amoConnection.update({
         where: { id: connection.id },
@@ -635,6 +635,20 @@ export class AmoSyncService {
     if (!rawMinutes) return 10;
     const parsed = Number(rawMinutes);
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : 10;
+  }
+
+  private getRecentReconcileMaxDeals() {
+    const rawLimit = this.config.get<string>('AMOCRM_RECENT_RECONCILE_MAX_DEALS');
+    if (!rawLimit) return 500;
+    const parsed = Number(rawLimit);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 500;
+  }
+
+  private getRecentReconcileMaxEvents() {
+    const rawLimit = this.config.get<string>('AMOCRM_RECENT_RECONCILE_MAX_EVENTS');
+    if (!rawLimit) return 1000;
+    const parsed = Number(rawLimit);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 1000;
   }
 
   private connectionConfig(connection: AmoConnection) {
@@ -1915,6 +1929,84 @@ export class AmoSyncService {
       }
     });
     stats.deals = totalDeals;
+  }
+
+  private async syncRecentDeals(
+    client: AmoClient,
+    maps: AmoSyncMaps,
+    stats: Record<string, number>,
+    updatedSince: number,
+  ) {
+    const maxDeals = this.getRecentReconcileMaxDeals();
+    const pageLimit = Math.min(250, maxDeals);
+    const params: Record<string, string | number> = {
+      with: 'contacts,catalog_elements,loss_reason',
+      'filter[updated_at][from]': updatedSince,
+    };
+    let page = 1;
+    let totalDeals = 0;
+    let hasNextPage = false;
+
+    while (totalDeals < maxDeals) {
+      const limit = Math.min(pageLimit, maxDeals - totalDeals);
+      const data = await client.get<any>('/leads', { ...params, page, limit });
+      const leads = data?._embedded?.leads ?? [];
+      if (!Array.isArray(leads) || leads.length === 0) break;
+
+      for (const lead of leads) {
+        await this.upsertDeal(lead, maps);
+      }
+
+      totalDeals += leads.length;
+      hasNextPage = Boolean(data?._links?.next?.href);
+      if (!hasNextPage) break;
+      page += 1;
+    }
+
+    stats.deals = totalDeals;
+    stats.dealPages = page;
+    if (hasNextPage && totalDeals >= maxDeals) stats.dealsTruncated = 1;
+  }
+
+  private async syncRecentStageEvents(
+    client: AmoClient,
+    maps: AmoSyncMaps,
+    stats: Record<string, number>,
+    updatedSince: number,
+  ) {
+    const maxEvents = this.getRecentReconcileMaxEvents();
+    const pageLimit = Math.min(250, maxEvents);
+    const params: Record<string, string | number> = {
+      'filter[created_at][from]': updatedSince,
+      'filter[type]': 'lead_status_changed',
+    };
+    const eventsById = new Map<string, any>();
+    let page = 1;
+    let hasNextPage = false;
+
+    while (eventsById.size < maxEvents) {
+      const limit = Math.min(pageLimit, maxEvents - eventsById.size);
+      const data = await client.get<any>('/events', { ...params, page, limit });
+      const events = data?._embedded?.events ?? [];
+      if (!Array.isArray(events) || events.length === 0) break;
+
+      for (const event of events) {
+        eventsById.set(String(event.id), event);
+      }
+
+      hasNextPage = Boolean(data?._links?.next?.href);
+      if (!hasNextPage) break;
+      page += 1;
+    }
+
+    for (const event of eventsById.values()) {
+      await this.upsertCrmEvent(event, maps);
+    }
+
+    stats.events = eventsById.size;
+    stats.eventPages = page;
+    if (hasNextPage && eventsById.size >= maxEvents) stats.eventsTruncated = 1;
+    await this.backfillStageHistoryFromStoredEvents(maps, stats, updatedSince);
   }
 
   private async reconcileLeadSlaDeals(client: AmoClient, maps: AmoSyncMaps, stats: Record<string, number>) {
