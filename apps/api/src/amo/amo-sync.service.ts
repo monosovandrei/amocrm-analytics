@@ -847,9 +847,6 @@ export class AmoSyncService {
       }
 
       if (leadSideEffectGroups.length > 0 && client) {
-        await this.touchJob(jobId, 'lead_sla_reconcile');
-        await this.reconcileLeadSlaDeals(client, maps, stats);
-
         const eventSyncFrom = Math.floor((earliestEventAt.getTime() - 5 * 60_000) / 1000);
         await this.touchJob(jobId, 'crm_notifications');
         await this.processCrmNotifications(
