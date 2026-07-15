@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Header, Param, Post, Request, StreamableFile, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Post, Request, StreamableFile, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { ReportsService } from './reports.service';
 import { ReportQueryDto, SaveReportTemplateDto } from './dto/report-query.dto';
@@ -29,12 +29,21 @@ export class ReportsController {
   }
 
   @Post('export.xlsx')
-  @Header('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
   async exportExcel(@Body() dto: ReportQueryDto, @Request() req: any) {
-    const buffer = await this.reports.exportExcel(dto, req.user);
-    return new StreamableFile(buffer, {
+    return this.reports.enqueueExport(dto, req.user);
+  }
+
+  @Get('export-jobs/:id')
+  exportJob(@Param('id') id: string, @Request() req: any) {
+    return this.reports.getExportJob(id, req.user);
+  }
+
+  @Get('export-jobs/:id/download')
+  async downloadExport(@Param('id') id: string, @Request() req: any) {
+    const file = await this.reports.getExportFile(id, req.user);
+    return new StreamableFile(file.stream, {
       type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-      disposition: `attachment; filename="${encodeURIComponent(dto.name)}.xlsx"`,
+      disposition: `attachment; filename="${encodeURIComponent(file.fileName)}"`,
     });
   }
 }

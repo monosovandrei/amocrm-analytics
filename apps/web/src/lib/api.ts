@@ -41,6 +41,14 @@ export async function downloadExcel(path: string, body: unknown) {
     body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error(await res.text());
+  const contentType = res.headers.get('content-type') || '';
+  if (contentType.includes('application/json')) {
+    const job = await res.json();
+    if (!job?.jobId) throw new Error('Export job was not created');
+    await waitForExportJob(job.jobId);
+    await downloadFile(`/reports/export-jobs/${job.jobId}/download`, 'report.xlsx');
+    return;
+  }
   const blob = await res.blob();
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -48,6 +56,17 @@ export async function downloadExcel(path: string, body: unknown) {
   a.download = 'report.xlsx';
   a.click();
   URL.revokeObjectURL(url);
+}
+
+async function waitForExportJob(jobId: string) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < 120_000) {
+    const job = await api<{ status: string; error?: string | null }>(`/reports/export-jobs/${jobId}`);
+    if (job.status === 'SUCCESS') return;
+    if (job.status === 'ERROR') throw new Error(job.error || 'Export failed');
+    await new Promise((resolve) => window.setTimeout(resolve, 1500));
+  }
+  throw new Error('Export is still running');
 }
 
 export async function downloadFile(path: string, fileName: string) {

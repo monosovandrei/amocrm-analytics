@@ -1,7 +1,10 @@
 import JSZip from 'jszip';
 import { createHash } from 'node:crypto';
-import { ForbiddenException, Injectable, Logger } from '@nestjs/common';
-import { Prisma, ReportSourceType, UserRole } from '../generated/prisma';
+import { createReadStream } from 'node:fs';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { ForbiddenException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { ExportJobStatus, Prisma, ReportSourceType, UserRole } from '../generated/prisma';
 import {
   absoluteDurationDays,
   endOfMonth,
@@ -79,6 +82,7 @@ type RevenueForecastBucketKey =
 const LOSS_REASON_CUSTOM_FIELD_NAMES = new Set(['причина отказа', 'причины отказа'].map(normalizeCustomFieldName));
 const MISSING_LOSS_REASON_LABEL = 'Не указано';
 const DEFAULT_REPORT_FRESH_COMPUTE_CONCURRENCY = 2;
+const EXPORTS_DIR = process.env.REPORT_EXPORT_DIR || '/tmp/amocrm-analytics-exports';
 
 function normalizeCustomFieldName(value: unknown) {
   return String(value ?? '').trim().toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ');
@@ -1298,6 +1302,100 @@ export class ReportsService {
     }
 
     return this.buildXlsx(sheets);
+  }
+
+  async enqueueExport(dto: ReportQueryDto, user: { id: string; role: UserRole }) {
+    const job = await this.prisma.exportJob.create({
+      data: {
+        status: ExportJobStatus.QUEUED,
+        reportConfig: {
+          dto,
+          user: { id: user.id, role: user.role },
+          fileName: `${dto.name || 'report'}.xlsx`,
+        } as any,
+      },
+    });
+    return { jobId: job.id, status: job.status };
+  }
+
+  async processExportJobs(limit = 1) {
+    const jobs = await this.prisma.exportJob.findMany({
+      where: { status: ExportJobStatus.QUEUED },
+      orderBy: { createdAt: 'asc' },
+      take: limit,
+    });
+
+    for (const job of jobs) {
+      const locked = await this.prisma.exportJob.updateMany({
+        where: { id: job.id, status: ExportJobStatus.QUEUED },
+        data: { status: ExportJobStatus.RUNNING, error: null },
+      });
+      if (locked.count === 0) continue;
+
+      try {
+        const config = job.reportConfig as any;
+        const dto = config?.dto as ReportQueryDto;
+        const user = config?.user as { id: string; role: UserRole };
+        if (!dto || !user?.id || !user?.role) throw new Error('Invalid export job payload');
+
+        const buffer = await this.exportExcel(dto, user);
+        await mkdir(EXPORTS_DIR, { recursive: true });
+        const filePath = join(EXPORTS_DIR, `${job.id}.xlsx`);
+        await writeFile(filePath, buffer);
+        await this.prisma.exportJob.update({
+          where: { id: job.id },
+          data: { status: ExportJobStatus.SUCCESS, filePath, finishedAt: new Date(), error: null },
+        });
+      } catch (error: any) {
+        await this.prisma.exportJob.update({
+          where: { id: job.id },
+          data: { status: ExportJobStatus.ERROR, error: String(error?.message ?? error), finishedAt: new Date() },
+        });
+        this.logger.warn(`Export job ${job.id} failed: ${error.message}`);
+      } finally {
+        this.compactHeap();
+      }
+    }
+
+    return { processed: jobs.length };
+  }
+
+  async getExportJob(id: string, user: { id: string; role: UserRole }) {
+    const job = await this.prisma.exportJob.findUnique({ where: { id } });
+    if (!job) throw new NotFoundException('Export job not found');
+    this.ensureExportJobOwner(job.reportConfig, user);
+    return {
+      id: job.id,
+      status: job.status,
+      error: job.error,
+      createdAt: job.createdAt,
+      finishedAt: job.finishedAt,
+    };
+  }
+
+  async getExportFile(id: string, user: { id: string; role: UserRole }) {
+    const job = await this.prisma.exportJob.findUnique({ where: { id } });
+    if (!job) throw new NotFoundException('Export job not found');
+    this.ensureExportJobOwner(job.reportConfig, user);
+    if (job.status !== ExportJobStatus.SUCCESS || !job.filePath) {
+      throw new NotFoundException('Export file is not ready');
+    }
+    const config = job.reportConfig as any;
+    return {
+      stream: createReadStream(job.filePath),
+      fileName: String(config?.fileName || 'report.xlsx'),
+    };
+  }
+
+  private ensureExportJobOwner(reportConfig: Prisma.JsonValue, user: { id: string; role: UserRole }) {
+    if (user.role === UserRole.ADMIN) return;
+    const ownerId = (reportConfig as any)?.user?.id;
+    if (ownerId !== user.id) throw new ForbiddenException('Export job is not available');
+  }
+
+  private compactHeap() {
+    const gc = (globalThis as typeof globalThis & { gc?: () => void }).gc;
+    if (typeof gc === 'function') gc();
   }
 
   private jsonSheet(name: string, rows: Array<Record<string, any>>): XlsxSheet {
