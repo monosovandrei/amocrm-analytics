@@ -28,7 +28,9 @@ export class AmoWebhookController {
     const events = this.amo.flattenWebhook(body);
     await this.amo.recordWebhook(connection.id, events);
     if (events.length > 0) {
-      await this.sync.triggerWebhookQueue();
+      this.sync.triggerWebhookQueue().catch((error) => {
+        this.logger.warn(`amoCRM webhook queue trigger deferred: ${error.message}`);
+      });
     }
     return { status: 'ok', events: events.length };
   }
