@@ -27,7 +27,7 @@ export class ApiMemoryInterceptor implements NestInterceptor {
         const shouldLog =
           durationMs >= 1000 ||
           Math.abs(rssDeltaMb) >= 16 ||
-          (trackedRoute && (durationMs >= 100 || Math.abs(rssDeltaMb) >= 4)) ||
+          (trackedRoute && (durationMs >= 250 || Math.abs(rssDeltaMb) >= 12)) ||
           this.shouldSampleHighRss(rssMb);
 
         if (shouldLog) {

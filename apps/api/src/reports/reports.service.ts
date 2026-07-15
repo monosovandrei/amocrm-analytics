@@ -86,7 +86,9 @@ type RevenueForecastBucketKey =
 const LOSS_REASON_CUSTOM_FIELD_NAMES = new Set(['причина отказа', 'причины отказа'].map(normalizeCustomFieldName));
 const MISSING_LOSS_REASON_LABEL = 'Не указано';
 const DEFAULT_REPORT_FRESH_COMPUTE_CONCURRENCY = 2;
+const DEFAULT_WORKER_RECYCLE_RSS_MB = 850;
 const EXPORTS_DIR = process.env.REPORT_EXPORT_DIR || '/tmp/amocrm-analytics-exports';
+const MB = 1024 * 1024;
 
 function normalizeCustomFieldName(value: unknown) {
   return String(value ?? '').trim().toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ');
@@ -305,6 +307,7 @@ export class ReportsService {
         this.logger.warn(`Report cache refresh ${job.cache_key} failed: ${error.message}`);
       } finally {
         this.compactHeap();
+        this.recycleWorkerIfNeeded('report cache refresh');
       }
     }
 
@@ -1467,6 +1470,7 @@ export class ReportsService {
         this.logger.warn(`Export job ${job.id} failed: ${error.message}`);
       } finally {
         this.compactHeap();
+        this.recycleWorkerIfNeeded('report export');
       }
     }
 
@@ -1509,6 +1513,24 @@ export class ReportsService {
   private compactHeap() {
     const gc = (globalThis as typeof globalThis & { gc?: () => void }).gc;
     if (typeof gc === 'function') gc();
+  }
+
+  private recycleWorkerIfNeeded(reason: string) {
+    if (!process.argv.some((arg) => arg.endsWith('worker.js'))) return;
+    const limit = this.resolveWorkerRecycleRssMb();
+    if (limit <= 0) return;
+
+    const rssMb = Math.round(process.memoryUsage().rss / MB);
+    if (rssMb < limit) return;
+
+    this.logger.warn(`Worker RSS ${rssMb}MB exceeded ${limit}MB after ${reason}; restarting worker process`);
+    setTimeout(() => process.exit(0), 100);
+  }
+
+  private resolveWorkerRecycleRssMb() {
+    const value = Number(process.env.WORKER_RECYCLE_RSS_MB);
+    if (!Number.isFinite(value)) return DEFAULT_WORKER_RECYCLE_RSS_MB;
+    return Math.floor(value);
   }
 
   private jsonSheet(name: string, rows: Array<Record<string, any>>): XlsxSheet {
