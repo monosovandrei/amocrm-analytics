@@ -6,6 +6,7 @@
     "dev": "ts-node --transpile-only -r tsconfig-paths/register src/main.ts",
     "build": "nest build",
     "start": "node dist/main.js",
+    "start:worker": "node dist/worker.js",
     "typecheck": "tsc --noEmit",
     "test": "jest"
   },

@@ -1,15 +1,11 @@
 import { Body, Controller, HttpCode, HttpStatus, Logger, Param, Post } from '@nestjs/common';
 import { AmoService } from './amo.service';
-import { AmoSyncService } from './amo-sync.service';
 
 @Controller('webhooks/amocrm')
 export class AmoWebhookController {
   private readonly logger = new Logger(AmoWebhookController.name);
 
-  constructor(
-    private readonly amo: AmoService,
-    private readonly sync: AmoSyncService,
-  ) {}
+  constructor(private readonly amo: AmoService) {}
 
   @Post(':secret')
   @HttpCode(HttpStatus.OK)
@@ -27,11 +23,6 @@ export class AmoWebhookController {
 
     const events = this.amo.flattenWebhook(body);
     await this.amo.recordWebhook(connection.id, events);
-    if (events.length > 0) {
-      this.sync.triggerWebhookQueue().catch((error) => {
-        this.logger.warn(`amoCRM webhook queue trigger deferred: ${error.message}`);
-      });
-    }
     return { status: 'ok', events: events.length };
   }
 }

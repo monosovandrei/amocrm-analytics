@@ -8,6 +8,7 @@ import { AmoSyncService } from './amo-sync.service';
 @Injectable()
 export class AmoSchedulerService {
   private readonly logger = new Logger(AmoSchedulerService.name);
+  private pullSyncBusy = false;
   private webhookBusy = false;
   private webhookSubscriptionBusy = false;
   private emailNotesBusy = false;
@@ -23,14 +24,37 @@ export class AmoSchedulerService {
 
   @Interval(60_000)
   async tick() {
+    if (this.pullSyncBusy) return;
     const connection = await this.prisma.amoConnection.findFirst({
       where: { status: { in: ['ACTIVE', 'ERROR', 'SYNCING'] } },
       orderBy: { createdAt: 'desc' },
     });
     if (!connection) return;
+    await this.sync.expireStaleJobs(connection.id);
+
+    const queuedPullJob = await this.prisma.syncJob.findFirst({
+      where: {
+        connectionId: connection.id,
+        type: { not: SyncJobType.WEBHOOK },
+        status: 'QUEUED',
+      },
+      orderBy: { createdAt: 'asc' },
+      select: { id: true, type: true },
+    });
+    if (queuedPullJob) {
+      this.pullSyncBusy = true;
+      try {
+        await this.sync.run(queuedPullJob.id);
+      } catch (error: any) {
+        this.logger.warn(`Queued amoCRM ${queuedPullJob.type} sync failed: ${error.message}`);
+      } finally {
+        this.pullSyncBusy = false;
+      }
+      return;
+    }
+
     const syncIntervalMinutes = this.getSyncIntervalMinutes();
     if (syncIntervalMinutes <= 0) return;
-    await this.sync.expireStaleJobs(connection.id);
 
     const lastSync = connection.lastIncrementalSyncAt ?? connection.lastFullSyncAt;
     const syncType = lastSync ? SyncJobType.INCREMENTAL : SyncJobType.FULL;

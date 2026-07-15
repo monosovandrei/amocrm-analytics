@@ -98,6 +98,64 @@ export class AmoSyncService {
     return result.response;
   }
 
+  async enqueuePullSync(type: SyncJobType, actorUserId?: string) {
+    if (type === SyncJobType.WEBHOOK) {
+      return { status: 'ignored', type: SyncJobType.WEBHOOK };
+    }
+
+    const connection = await this.amo.getActiveConnectionOrFail();
+    const syncType = this.resolveRequestedSyncType(type, connection);
+    await this.expireStaleJobs(connection.id);
+
+    const result = await this.prisma.$transaction(async (tx) => {
+      const locked = await this.tryAdvisoryTransactionLock(tx, `amo-pull-sync:${connection.id}`);
+      if (!locked) {
+        return {
+          job: null,
+          shouldEnqueue: false,
+          response: { status: 'busy', type: syncType, requestedType: type },
+        };
+      }
+
+      const existingJob = await tx.syncJob.findFirst({
+        where: {
+          connectionId: connection.id,
+          type: { not: SyncJobType.WEBHOOK },
+          status: { in: ['QUEUED', 'RUNNING'] },
+        },
+        orderBy: { createdAt: 'desc' },
+      });
+      if (existingJob) {
+        return {
+          job: existingJob,
+          shouldEnqueue: false,
+          response: { jobId: existingJob.id, status: existingJob.status, type: existingJob.type },
+        };
+      }
+
+      const job = await tx.syncJob.create({
+        data: { connectionId: connection.id, type: syncType, status: 'QUEUED', heartbeatAt: new Date() },
+      });
+      return {
+        job,
+        shouldEnqueue: true,
+        response: { jobId: job.id, status: job.status, type: job.type, requestedType: type },
+      };
+    }, { maxWait: 2_000, timeout: 5_000 });
+
+    if (result.job && result.shouldEnqueue) {
+      await this.audit.record({
+        userId: actorUserId,
+        action: 'amo.sync.enqueue',
+        entity: 'SyncJob',
+        entityId: result.job.id,
+        metadata: { type: syncType, requestedType: type, connectionId: connection.id },
+      });
+    }
+
+    return result.response;
+  }
+
   async triggerWebhookQueue(actorUserId?: string) {
     const connection = await this.amo.getActiveConnectionOrFail();
     await this.expireStaleJobs(connection.id);

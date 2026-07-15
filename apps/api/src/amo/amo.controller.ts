@@ -40,14 +40,14 @@ export class AmoController {
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN)
   triggerSync(@Request() req: any, @Body() dto: TriggerSyncDto) {
-    return this.sync.trigger(dto.type ?? SyncJobType.INCREMENTAL, req.user.id);
+    return this.sync.enqueuePullSync(dto.type ?? SyncJobType.INCREMENTAL, req.user.id);
   }
 
   @Post('sync/full')
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN)
   triggerFullSync(@Request() req: any) {
-    return this.sync.trigger(SyncJobType.FULL, req.user.id);
+    return this.sync.enqueuePullSync(SyncJobType.FULL, req.user.id);
   }
 
   @Post('webhook/register')
