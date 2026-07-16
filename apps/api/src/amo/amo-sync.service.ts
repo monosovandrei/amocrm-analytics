@@ -389,16 +389,10 @@ export class AmoSyncService {
       const state = affectedDealIds.length
         ? await this.platform.rebuildEmailThreadStatesForDeals(affectedDealIds)
         : { total: 0, pending: 0 };
-      await this.prisma.amoConnection.update({
-        where: { id: connection.id },
-        data: {
-          config: {
-            ...connectionConfig,
-            emailNotesSyncedAt: startedAt.toISOString(),
-            emailNotesSyncError: null,
-            emailNotesSyncErrorAt: null,
-          },
-        },
+      await this.updateConnectionConfig(connection.id, {
+        emailNotesSyncedAt: startedAt.toISOString(),
+        emailNotesSyncError: null,
+        emailNotesSyncErrorAt: null,
       });
       return {
         status: 'ok',
@@ -410,15 +404,9 @@ export class AmoSyncService {
         },
       };
     } catch (error: any) {
-      await this.prisma.amoConnection.update({
-        where: { id: connection.id },
-        data: {
-          config: {
-            ...connectionConfig,
-            emailNotesSyncError: String(error?.message ?? error),
-            emailNotesSyncErrorAt: new Date().toISOString(),
-          },
-        },
+      await this.updateConnectionConfig(connection.id, {
+        emailNotesSyncError: String(error?.message ?? error),
+        emailNotesSyncErrorAt: new Date().toISOString(),
       });
       throw error;
     }
@@ -446,33 +434,22 @@ export class AmoSyncService {
       await this.syncRecentDeals(client, maps, stats, updatedSince);
       await this.syncRecentStageEvents(client, maps, stats, updatedSince);
 
-      await this.prisma.amoConnection.update({
-        where: { id: connection.id },
-        data: {
-          status: 'ACTIVE',
-          lastError: null,
-          config: {
-            ...connectionConfig,
-            recentReconcileAt: startedAt.toISOString(),
-            recentReconcileFrom: syncFrom.toISOString(),
-            recentReconcileStats: stats,
-            recentReconcileError: null,
-            recentReconcileErrorAt: null,
-          },
-        },
+      await this.updateConnectionConfig(connection.id, {
+        recentReconcileAt: startedAt.toISOString(),
+        recentReconcileFrom: syncFrom.toISOString(),
+        recentReconcileStats: stats,
+        recentReconcileError: null,
+        recentReconcileErrorAt: null,
+      }, {
+        status: 'ACTIVE',
+        lastError: null,
       });
 
       return { status: 'ok', from: syncFrom, stats };
     } catch (error: any) {
-      await this.prisma.amoConnection.update({
-        where: { id: connection.id },
-        data: {
-          config: {
-            ...connectionConfig,
-            recentReconcileError: String(error?.message ?? error),
-            recentReconcileErrorAt: new Date().toISOString(),
-          },
-        },
+      await this.updateConnectionConfig(connection.id, {
+        recentReconcileError: String(error?.message ?? error),
+        recentReconcileErrorAt: new Date().toISOString(),
       });
       throw error;
     } finally {
@@ -494,32 +471,21 @@ export class AmoSyncService {
       await this.hydrateMetadataMaps(maps);
       await this.reconcileLeadSlaDeals(client, maps, stats);
 
-      await this.prisma.amoConnection.update({
-        where: { id: connection.id },
-        data: {
-          status: 'ACTIVE',
-          lastError: null,
-          config: {
-            ...connectionConfig,
-            leadSlaReconcileAt: startedAt.toISOString(),
-            leadSlaReconcileStats: stats,
-            leadSlaReconcileError: null,
-            leadSlaReconcileErrorAt: null,
-          },
-        },
+      await this.updateConnectionConfig(connection.id, {
+        leadSlaReconcileAt: startedAt.toISOString(),
+        leadSlaReconcileStats: stats,
+        leadSlaReconcileError: null,
+        leadSlaReconcileErrorAt: null,
+      }, {
+        status: 'ACTIVE',
+        lastError: null,
       });
 
       return { status: 'ok', stats };
     } catch (error: any) {
-      await this.prisma.amoConnection.update({
-        where: { id: connection.id },
-        data: {
-          config: {
-            ...connectionConfig,
-            leadSlaReconcileError: String(error?.message ?? error),
-            leadSlaReconcileErrorAt: new Date().toISOString(),
-          },
-        },
+      await this.updateConnectionConfig(connection.id, {
+        leadSlaReconcileError: String(error?.message ?? error),
+        leadSlaReconcileErrorAt: new Date().toISOString(),
       });
       throw error;
     } finally {
@@ -757,8 +723,32 @@ export class AmoSyncService {
   }
 
   private connectionConfig(connection: AmoConnection) {
-    const config = connection.config;
+    return this.configObject(connection.config);
+  }
+
+  private configObject(config: unknown) {
     return config && typeof config === 'object' && !Array.isArray(config) ? (config as Record<string, unknown>) : {};
+  }
+
+  private async updateConnectionConfig(
+    connectionId: string,
+    patch: Record<string, unknown>,
+    data: Record<string, unknown> = {},
+  ) {
+    const connection = await this.prisma.amoConnection.findUnique({
+      where: { id: connectionId },
+      select: { config: true },
+    });
+    await this.prisma.amoConnection.update({
+      where: { id: connectionId },
+      data: {
+        ...data,
+        config: {
+          ...this.configObject(connection?.config),
+          ...patch,
+        },
+      } as any,
+    });
   }
 
   private parseConfigDate(raw: unknown) {
@@ -1408,15 +1398,9 @@ export class AmoSyncService {
   }
 
   private async recordWebhookSubscriptionError(connection: AmoConnection, error: any) {
-    await this.prisma.amoConnection.update({
-      where: { id: connection.id },
-      data: {
-        config: {
-          ...this.connectionConfig(connection),
-          webhookEnsureError: String(error?.message ?? error),
-          webhookEnsureErrorAt: new Date().toISOString(),
-        },
-      },
+    await this.updateConnectionConfig(connection.id, {
+      webhookEnsureError: String(error?.message ?? error),
+      webhookEnsureErrorAt: new Date().toISOString(),
     });
   }
 
@@ -1434,18 +1418,12 @@ export class AmoSyncService {
       sort: 10,
     });
 
-    await this.prisma.amoConnection.update({
-      where: { id: connection.id },
-      data: {
-        config: {
-          ...this.connectionConfig(connection),
-          webhookUrl: destination,
-          webhookSettings: settings,
-          webhookEnsuredAt: new Date().toISOString(),
-          webhookEnsureError: null,
-          webhookEnsureErrorAt: null,
-        },
-      },
+    await this.updateConnectionConfig(connection.id, {
+      webhookUrl: destination,
+      webhookSettings: settings,
+      webhookEnsuredAt: new Date().toISOString(),
+      webhookEnsureError: null,
+      webhookEnsureErrorAt: null,
     });
     stats.webhookSubscription = 1;
   }
