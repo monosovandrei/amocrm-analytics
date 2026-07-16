@@ -2698,15 +2698,28 @@ export class AmoSyncService {
     if (deal?.id) return [deal.id];
     if (source !== 'contacts' || !note.entity_id) return [];
 
-    const deals = await this.prisma.deal.findMany({
-      where: {
-        deletedAt: null,
-        stage: { isWon: false, isLost: false },
-        contact: { externalId: String(note.entity_id) },
-      },
-      select: { id: true },
-    });
+    const deals = await this.openDealIdsByContactExternalId(String(note.entity_id));
     return deals.map((item) => item.id);
+  }
+
+  private async openDealIdsByContactExternalId(contactExternalId: string) {
+    return this.prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+      SELECT d.id
+      FROM "Deal" d
+      JOIN "PipelineStage" ps ON ps.id = d."stageId"
+      LEFT JOIN "Contact" c ON c.id = d."contactId"
+      WHERE d."deletedAt" IS NULL
+        AND ps."isWon" = false
+        AND ps."isLost" = false
+        AND (
+          c."externalId" = ${contactExternalId}
+          OR EXISTS (
+            SELECT 1
+            FROM jsonb_array_elements(COALESCE(d.raw->'_embedded'->'contacts', '[]'::jsonb)) AS contact_ref(value)
+            WHERE contact_ref.value->>'id' = ${contactExternalId}
+          )
+        )
+    `);
   }
 
   private async syncEvents(

@@ -2063,6 +2063,7 @@ export class PlatformService {
         stage: { select: { name: true } },
         responsible: { select: { name: true, externalId: true, group: { select: { name: true } } } },
         contact: { select: { externalId: true, name: true, email: true } },
+        raw: true,
       },
     });
     if (openDeals.length === 0) return [];
@@ -2077,11 +2078,12 @@ export class PlatformService {
 
     for (const deal of openDeals) {
       leadExternalToDealId.set(deal.externalId, deal.id);
-      if (!deal.contact?.externalId) continue;
-      if (!contactExternalToDealIds.has(deal.contact.externalId)) {
-        contactExternalToDealIds.set(deal.contact.externalId, new Set());
+      for (const contactExternalId of this.dealContactExternalIds(deal)) {
+        if (!contactExternalToDealIds.has(contactExternalId)) {
+          contactExternalToDealIds.set(contactExternalId, new Set());
+        }
+        contactExternalToDealIds.get(contactExternalId)?.add(deal.id);
       }
-      contactExternalToDealIds.get(deal.contact.externalId)?.add(deal.id);
     }
 
     const noteEntityIds = [...new Set([...leadExternalToDealId.keys(), ...contactExternalToDealIds.keys()])];
@@ -2540,6 +2542,20 @@ export class PlatformService {
     const payload = raw as Record<string, any> | null;
     const id = payload?.entity_id ?? payload?._embedded?.entity?.id;
     return id == null ? null : String(id);
+  }
+
+  private dealContactExternalIds(deal: { contact?: { externalId: string | null } | null; raw?: unknown }) {
+    const ids = new Set<string>();
+    if (deal.contact?.externalId) ids.add(deal.contact.externalId);
+
+    const contacts = (deal.raw as { _embedded?: { contacts?: Array<{ id?: unknown }> } } | null)?._embedded?.contacts;
+    if (Array.isArray(contacts)) {
+      for (const contact of contacts) {
+        if (contact?.id != null) ids.add(String(contact.id));
+      }
+    }
+
+    return [...ids];
   }
 
   private async emailInternalDomains() {
