@@ -13,6 +13,7 @@ export class AmoSchedulerService {
   private webhookSubscriptionBusy = false;
   private emailNotesBusy = false;
   private recentReconcileBusy = false;
+  private leadSlaReconcileBusy = false;
   private crmStateNotificationsBusy = false;
   private lastCrmStateNotificationsAt = Date.now();
 
@@ -160,6 +161,37 @@ export class AmoSchedulerService {
   }
 
   @Interval(60_000)
+  async reconcileLeadSlaCandidates() {
+    if (this.leadSlaReconcileBusy) return;
+    const intervalSeconds = this.getLeadSlaReconcileIntervalSeconds();
+    if (intervalSeconds <= 0) return;
+
+    const connection = await this.prisma.amoConnection.findFirst({
+      where: { status: { in: ['ACTIVE', 'ERROR', 'SYNCING'] } },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (!connection?.lastFullSyncAt) return;
+
+    const lastReconciledAt = this.getConfigDate(connection.config, 'leadSlaReconcileAt');
+    const due = !lastReconciledAt || Date.now() - lastReconciledAt.getTime() >= intervalSeconds * 1000;
+    if (!due) return;
+
+    const running = await this.prisma.syncJob.count({
+      where: { connectionId: connection.id, status: 'RUNNING' },
+    });
+    if (running > 0) return;
+
+    this.leadSlaReconcileBusy = true;
+    try {
+      await this.sync.reconcileLeadSlaCandidates();
+    } catch (error: any) {
+      this.logger.warn(`Lead SLA amoCRM reconcile failed: ${error.message}`);
+    } finally {
+      this.leadSlaReconcileBusy = false;
+    }
+  }
+
+  @Interval(60_000)
   async ensureWebhookSubscription() {
     if (this.webhookSubscriptionBusy) return;
     const checkIntervalMinutes = this.getWebhookSubscriptionCheckMinutes();
@@ -239,6 +271,14 @@ export class AmoSchedulerService {
 
     const parsed = Number(rawInterval);
     return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
+  }
+
+  private getLeadSlaReconcileIntervalSeconds() {
+    const rawInterval = this.config.get<string>('AMOCRM_LEAD_SLA_RECONCILE_INTERVAL_SECONDS');
+    if (!rawInterval) return 60;
+
+    const parsed = Number(rawInterval);
+    return Number.isFinite(parsed) ? Math.max(0, parsed) : 60;
   }
 
   private getCrmStateNotificationsIntervalSeconds() {

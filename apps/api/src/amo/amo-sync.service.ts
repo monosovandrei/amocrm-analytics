@@ -480,6 +480,53 @@ export class AmoSyncService {
     }
   }
 
+  async reconcileLeadSlaCandidates() {
+    const connection = await this.amo.getActiveConnectionOrFail();
+    if (!connection.lastFullSyncAt) return { status: 'waiting_initial_snapshot' };
+
+    const startedAt = new Date();
+    const connectionConfig = this.connectionConfig(connection);
+    const stats: Record<string, number> = {};
+
+    try {
+      const client = await this.amo.getClient(connection);
+      const maps = this.emptyMaps();
+      await this.hydrateMetadataMaps(maps);
+      await this.reconcileLeadSlaDeals(client, maps, stats);
+
+      await this.prisma.amoConnection.update({
+        where: { id: connection.id },
+        data: {
+          status: 'ACTIVE',
+          lastError: null,
+          config: {
+            ...connectionConfig,
+            leadSlaReconcileAt: startedAt.toISOString(),
+            leadSlaReconcileStats: stats,
+            leadSlaReconcileError: null,
+            leadSlaReconcileErrorAt: null,
+          },
+        },
+      });
+
+      return { status: 'ok', stats };
+    } catch (error: any) {
+      await this.prisma.amoConnection.update({
+        where: { id: connection.id },
+        data: {
+          config: {
+            ...connectionConfig,
+            leadSlaReconcileError: String(error?.message ?? error),
+            leadSlaReconcileErrorAt: new Date().toISOString(),
+          },
+        },
+      });
+      throw error;
+    } finally {
+      this.compactHeapAfterHeavySync();
+    }
+  }
+
   async processCrmStateNotifications() {
     const connection = await this.amo.getActiveConnectionOrFail();
     if (!connection.lastFullSyncAt) return { status: 'waiting_initial_snapshot' };
