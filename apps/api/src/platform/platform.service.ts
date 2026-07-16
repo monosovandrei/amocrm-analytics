@@ -119,6 +119,13 @@ const EMAIL_PIPELINE_GROUPS: Array<{ key: EmailPipelineKey; label: string }> = [
   { key: 'base', label: 'База' },
   { key: 'assignedCompanies', label: 'Закреплённые компании' },
 ];
+const BASE_EMAIL_STAGE_NAMES = new Set([
+  'взят в работу',
+  'квалифицирован',
+  'цена запрошена',
+  'сделано предложение',
+  'счет отправлен',
+]);
 
 const PLAN_FACT_METRICS: PlanFactMetric[] = [
   { key: 'sales_qualified_leads', label: 'Квал лиды', unit: 'number', team: 'sales', kind: 'additive' },
@@ -2377,6 +2384,7 @@ export class PlatformService {
 
     const pipelineKey = this.emailPipelineKey(state.deal.pipeline?.name);
     if (!pipelineKey) return null;
+    if (!this.isEmailThreadStageAllowed(pipelineKey, state.deal.stage?.name)) return null;
 
     const waitingSeconds = Math.max(0, Math.floor((now.getTime() - state.lastIncomingAt.getTime()) / 1000));
     return {
@@ -2443,6 +2451,7 @@ export class PlatformService {
 
     const pipelineKey = this.emailPipelineKey(draft.deal.pipeline?.name);
     if (!pipelineKey) return null;
+    if (!this.isEmailThreadStageAllowed(pipelineKey, draft.deal.stage?.name)) return null;
 
     const waitingSeconds = Math.max(0, Math.floor((now.getTime() - lastIncoming.createdAt.getTime()) / 1000));
     return {
@@ -2633,6 +2642,11 @@ export class PlatformService {
     if (normalized.includes('база')) return 'base';
     if (normalized.includes('закреплен') && normalized.includes('компан')) return 'assignedCompanies';
     return null;
+  }
+
+  private isEmailThreadStageAllowed(pipelineKey: EmailPipelineKey, stageName?: string | null) {
+    if (pipelineKey !== 'base') return true;
+    return BASE_EMAIL_STAGE_NAMES.has(this.normalizeEmailPipelineName(stageName));
   }
 
   private normalizeEmailPipelineName(name?: string | null) {
