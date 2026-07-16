@@ -1105,7 +1105,6 @@ export class PlatformService {
         group: salesGroup,
         pipelineIds: [salesPipeline.id],
         stages: {
-          qualification: this.findStage(salesPipeline.stages, [['квалификац']]),
           kp: this.findStage(salesPipeline.stages, [['кп', 'презент'], ['кп', 'отправ'], ['предлож']]),
           invoice: this.findStage(salesPipeline.stages, [['счет', 'отправ'], ['счёт', 'отправ']]),
           paid: this.findPaidStage(salesPipeline.stages),
@@ -1141,7 +1140,7 @@ export class PlatformService {
     if (!basePipeline) warnings.push('Не найдена воронка База.');
     if (!assignedPipeline) warnings.push('Не найдена воронка Закрепленные компании.');
     if (!assemblyPipeline) warnings.push('Не найдена воронка Сборка.');
-    if (sales && (!sales.stages.qualification || !sales.stages.kp || !sales.stages.invoice || !sales.stages.paid)) warnings.push('Не найдены все этапы Sales для план-факта.');
+    if (sales && (!sales.stages.kp || !sales.stages.invoice || !sales.stages.paid)) warnings.push('Не найдены все этапы Sales для план-факта.');
     if (csm && (!csm.stages.base || !csm.stages.assigned)) warnings.push('Не найдены все этапы CSM для план-факта.');
     if (!shipping?.shippedStage) warnings.push('Не найден этап отгружено.');
 
@@ -1360,7 +1359,17 @@ export class PlatformService {
 
     if (team === 'sales') {
       return [
-        metric('sales_qualified_leads', 'Квал лиды', refs.stages.qualification ? [refs.stages.qualification.id] : []),
+        {
+          id: 'sales_qualified_leads',
+          label: 'Квал лиды',
+          type: 'created_deals',
+          measure: 'deal_count',
+          display: 'number',
+          pipelineId: refs.pipelineIds[0],
+          extraFilters: refs.marketingFieldId
+            ? [{ id: 'marketing_accepted', subject: 'deal_field', fieldId: refs.marketingFieldId, operator: 'equals', value: 'Принято' }]
+            : [],
+        },
         conversion('sales_conv_lead_to_kp', 'Конверсия лиды -> КП', 'sales_qualified_leads', 'sales_kp_count'),
         metric('sales_kp_count', 'КП', refs.stages.kp ? [refs.stages.kp.id] : []),
         conversion('sales_conv_kp_to_invoice', 'Конверсия КП -> счёт', 'sales_kp_count', 'sales_invoice_count'),
