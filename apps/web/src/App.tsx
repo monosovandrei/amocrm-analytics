@@ -5937,9 +5937,55 @@ type RevenueForecastRow = {
   deals: RevenueForecastDeal[];
 };
 
+const revenueForecastTotalGroups = [
+  {
+    id: 'totalShippedThisMonth',
+    label: 'Уже отгружено',
+    rowIds: ['salesShippedThisMonth', 'repeatShippedThisMonth'],
+  },
+  {
+    id: 'totalShippingThisMonth',
+    label: 'В отгрузке',
+    rowIds: ['salesShippingThisMonth', 'repeatShippingThisMonth'],
+  },
+  {
+    id: 'totalInvoiceThisMonth',
+    label: 'Счета, которые успеют купить и отгрузиться',
+    rowIds: ['salesInvoiceThisMonth', 'repeatInvoiceThisMonth'],
+  },
+  {
+    id: 'totalQuoteThisMonth',
+    label: 'КП, которые успеют купить и отгрузиться',
+    rowIds: ['salesQuoteThisMonth', 'repeatQuoteThisMonth'],
+  },
+  {
+    id: 'totalNotThisMonth',
+    label: 'Не успеют отгрузиться',
+    rowIds: ['salesNotThisMonth', 'repeatNotThisMonth'],
+  },
+];
+
+function buildRevenueForecastTotalRows(rows: RevenueForecastRow[]): RevenueForecastRow[] {
+  const rowsById = new Map(rows.map((row) => [row.id, row]));
+  return revenueForecastTotalGroups.map((group) => {
+    const sourceRows = group.rowIds.map((rowId) => rowsById.get(rowId)).filter(Boolean) as RevenueForecastRow[];
+    return {
+      id: group.id,
+      label: group.label,
+      count: sourceRows.reduce((sum, row) => sum + Number(row.count ?? 0), 0),
+      revenue: Math.round(sourceRows.reduce((sum, row) => sum + Number(row.revenue ?? 0), 0)),
+      profit: Math.round(sourceRows.reduce((sum, row) => sum + Number(row.profit ?? 0), 0)),
+      deals: sourceRows
+        .flatMap((row) => row.deals ?? [])
+        .sort((a, b) => String(a.predictedShipAt ?? '').localeCompare(String(b.predictedShipAt ?? ''))),
+    };
+  });
+}
+
 function RevenueProfitForecastReport({ amoDomain, result }: { amoDomain: string; result: Record<string, any> }) {
   const rows = (result.rows ?? []) as RevenueForecastRow[];
-  const totalRows = (result.totals ?? []) as RevenueForecastRow[];
+  const apiTotalRows = (result.totals ?? []) as RevenueForecastRow[];
+  const totalRows = apiTotalRows.length > 0 ? apiTotalRows : buildRevenueForecastTotalRows(rows);
   const summary = result.summary ?? {};
   const shippingCycle = result.shippingCycle ?? {};
   const profitAvailable = Boolean(result.profit?.available);
@@ -5962,6 +6008,17 @@ function RevenueProfitForecastReport({ amoDomain, result }: { amoDomain: string;
 
   return (
     <div className="revenue-forecast-report">
+      {totalRows.length > 0 && (
+        <RevenueForecastTable
+          amoDomain={amoDomain}
+          expandedRows={expandedRows}
+          profitAvailable={profitAvailable}
+          rows={totalRows}
+          setExpandedRows={setExpandedRows}
+          title="Всего"
+        />
+      )}
+
       <div className="revenue-forecast-summary">
         <div className="revenue-forecast-card">
           <span>До конца месяца</span>
@@ -5991,16 +6048,6 @@ function RevenueProfitForecastReport({ amoDomain, result }: { amoDomain: string;
         </div>
       )}
 
-      {totalRows.length > 0 && (
-        <RevenueForecastTable
-          amoDomain={amoDomain}
-          expandedRows={expandedRows}
-          profitAvailable={profitAvailable}
-          rows={totalRows}
-          setExpandedRows={setExpandedRows}
-          title="Всего"
-        />
-      )}
       <RevenueForecastTable
         amoDomain={amoDomain}
         expandedRows={expandedRows}
