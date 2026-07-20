@@ -557,6 +557,29 @@ describe('ReportsService data contract', () => {
     expect(weightedTotal.formula).not.toContain('Счета x 90%');
   });
 
+  it('removes assembly metrics from CSM in sales weighted funnel', async () => {
+    const prisma = createPrismaMock() as any;
+    prisma.crmGroup.findMany.mockResolvedValue([
+      { id: 'group-sales', name: 'Sales' },
+      { id: 'group-csm', name: 'CSM' },
+    ]);
+    const localService = new ReportsService(prisma, audit as any);
+
+    const salesTemplates = await (localService as any).buildSalesReportTemplates();
+    const templates = await (localService as any).buildCsmInSalesReportTemplates(salesTemplates);
+    const template = templates.find((item: any) => item.config?.builtinKey === 'csm_sales_weighted_funnel');
+    const metrics = template.config.contract.metrics;
+    const weightedTotal = metrics.find((metric: any) => metric.id === 'weighted_total');
+
+    expect(metrics.map((metric: any) => metric.id)).not.toEqual(expect.arrayContaining([
+      'count_assembly',
+      'sum_assembly',
+      'weighted_assembly',
+    ]));
+    expect(weightedTotal.formula).toBe('[КП презентовано x конверсия] + [Есть возражения x конверсия] + [Счета x конверсия]');
+    expect(template.config.description).toBe('Взвешенная сумма по КП и счетам по менеджерам CSM в воронке Продажи');
+  });
+
   it('keeps already shipped forecast buckets separate for sales and repeat sales', () => {
     const buckets = (service as any).createRevenueForecastBuckets();
     const refs = { csmGroup: { id: 'group-csm', name: 'CSM' } };
@@ -581,6 +604,44 @@ describe('ReportsService data contract', () => {
     expect((service as any).revenueForecastShippedBucket(repeatDeal, refs)).toBe('repeatShippedThisMonth');
     expect((service as any).revenueForecastShippingBucket(salesDeal, refs, true)).toBe('salesShippingThisMonth');
     expect((service as any).revenueForecastShippingBucket(repeatDeal, refs, true)).toBe('repeatShippingThisMonth');
+  });
+
+  it('builds forecast total rows across sales and repeat sales', () => {
+    const row = (id: string, count: number, revenue: number, profit: number, dealId: string) => ({
+      id,
+      label: id,
+      count,
+      revenue,
+      profit,
+      deals: [{ dealId, predictedShipAt: `2026-07-${dealId.padStart(2, '0')}T10:00:00.000Z` }],
+    });
+    const totals = (service as any).createRevenueForecastTotalRows([
+      row('salesShippedThisMonth', 1, 100, 32, '1'),
+      row('repeatShippedThisMonth', 2, 200, 64, '2'),
+      row('salesShippingThisMonth', 3, 300, 96, '3'),
+      row('repeatShippingThisMonth', 4, 400, 128, '4'),
+      row('salesInvoiceThisMonth', 5, 500, 160, '5'),
+      row('repeatInvoiceThisMonth', 6, 600, 192, '6'),
+      row('salesQuoteThisMonth', 7, 700, 224, '7'),
+      row('repeatQuoteThisMonth', 8, 800, 256, '8'),
+      row('salesNotThisMonth', 9, 900, 288, '9'),
+      row('repeatNotThisMonth', 10, 1000, 320, '10'),
+    ]);
+
+    expect(totals.map((item: any) => item.label)).toEqual([
+      'Уже отгружено',
+      'В отгрузке',
+      'Счета, которые успеют купить и отгрузиться',
+      'КП, которые успеют купить и отгрузиться',
+      'Не успеют отгрузиться',
+    ]);
+    expect(totals.map((item: any) => [item.count, item.revenue, item.profit])).toEqual([
+      [3, 300, 96],
+      [7, 700, 224],
+      [11, 1100, 352],
+      [15, 1500, 480],
+      [19, 1900, 608],
+    ]);
   });
 
   it('calculates stage success probability from the last 30 days', async () => {

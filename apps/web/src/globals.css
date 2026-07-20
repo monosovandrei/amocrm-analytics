@@ -1600,6 +1600,19 @@ button:disabled {
   font-weight: 700;
 }
 
+.revenue-forecast-section {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.revenue-forecast-table-title {
+  color: var(--pb-text-primary);
+  font-size: 14px;
+  font-weight: 900;
+  line-height: 1.2;
+}
+
 .lead-sla-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));

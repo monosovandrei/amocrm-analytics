@@ -5939,6 +5939,7 @@ type RevenueForecastRow = {
 
 function RevenueProfitForecastReport({ amoDomain, result }: { amoDomain: string; result: Record<string, any> }) {
   const rows = (result.rows ?? []) as RevenueForecastRow[];
+  const totalRows = (result.totals ?? []) as RevenueForecastRow[];
   const summary = result.summary ?? {};
   const shippingCycle = result.shippingCycle ?? {};
   const profitAvailable = Boolean(result.profit?.available);
@@ -5990,6 +5991,46 @@ function RevenueProfitForecastReport({ amoDomain, result }: { amoDomain: string;
         </div>
       )}
 
+      {totalRows.length > 0 && (
+        <RevenueForecastTable
+          amoDomain={amoDomain}
+          expandedRows={expandedRows}
+          profitAvailable={profitAvailable}
+          rows={totalRows}
+          setExpandedRows={setExpandedRows}
+          title="Всего"
+        />
+      )}
+      <RevenueForecastTable
+        amoDomain={amoDomain}
+        expandedRows={expandedRows}
+        profitAvailable={profitAvailable}
+        rows={rows}
+        setExpandedRows={setExpandedRows}
+        title="Детализация"
+      />
+    </div>
+  );
+}
+
+function RevenueForecastTable({
+  amoDomain,
+  expandedRows,
+  profitAvailable,
+  rows,
+  setExpandedRows,
+  title,
+}: {
+  amoDomain: string;
+  expandedRows: Record<string, boolean>;
+  profitAvailable: boolean;
+  rows: RevenueForecastRow[];
+  setExpandedRows: Dispatch<SetStateAction<Record<string, boolean>>>;
+  title: string;
+}) {
+  return (
+    <section className="revenue-forecast-section" aria-label={title}>
+      <h3 className="revenue-forecast-table-title">{title}</h3>
       <div className="revenue-forecast-table-wrap">
         <table className="revenue-forecast-table">
           <thead>
@@ -6059,7 +6100,7 @@ function RevenueProfitForecastReport({ amoDomain, result }: { amoDomain: string;
           </tbody>
         </table>
       </div>
-    </div>
+    </section>
   );
 }
 

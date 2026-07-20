@@ -814,7 +814,7 @@ export class ReportsService {
         conditionLabel: 'Воронка Продажи: полученные лиды, КП, счета, оплаты и конверсии по менеджерам CSM',
       }],
       ['sales_weighted_funnel', {
-        description: 'Взвешенная сумма по КП, счетам и сборке по менеджерам CSM в воронке Продажи',
+        description: 'Взвешенная сумма по КП и счетам по менеджерам CSM в воронке Продажи',
       }],
       ['sales_assigned_stage_speed', {
         description: 'Среднее время взятия сделок менеджерами CSM в воронке Продажи',
@@ -836,7 +836,7 @@ export class ReportsService {
         const salesKey = template.config.builtinKey ?? '';
         const csmSalesKey = salesKey.replace(/^sales_/, 'csm_sales_');
         const config: ReportConfig = {
-          ...this.cloneReportConfig(template.config),
+          ...this.buildCsmInSalesConfig(template.config, salesKey),
           ...(descriptionsBySalesKey.get(salesKey) ?? {}),
           builtinKey: csmSalesKey,
           dashboardSection: 'csmSales',
@@ -862,6 +862,29 @@ export class ReportsService {
 
   private cloneReportConfig(config: ReportConfig): ReportConfig {
     return JSON.parse(JSON.stringify(config)) as ReportConfig;
+  }
+
+  private buildCsmInSalesConfig(config: ReportConfig, salesKey: string): ReportConfig {
+    const cloned = this.cloneReportConfig(config);
+    if (salesKey !== 'sales_weighted_funnel') return cloned;
+
+    const assemblyMetricIds = new Set(['count_assembly', 'sum_assembly', 'weighted_assembly']);
+    const metrics = (cloned.contract?.metrics ?? []).filter((metric) => !assemblyMetricIds.has(metric.id));
+    const weightedTotalParts = metrics
+      .filter((metric) => metric.id.startsWith('weighted_') && metric.id !== 'weighted_total')
+      .map((metric) => `[${metric.label}]`);
+
+    return {
+      ...cloned,
+      contract: {
+        ...(cloned.contract ?? {}),
+        metrics: metrics.map((metric) => (
+          metric.id === 'weighted_total'
+            ? { ...metric, formula: weightedTotalParts.join(' + ') }
+            : metric
+        )),
+      },
+    };
   }
 
   private buildRevenueForecastReportTemplate(): BuiltinReportTemplate {
@@ -3476,6 +3499,7 @@ ${sheets}
         ready: false,
         warnings: refs.warnings,
         rows: [],
+        totals: [],
         summary: { revenue: 0, profit: null, count: 0 },
       };
     }
@@ -3740,6 +3764,7 @@ ${sheets}
         allProfit: Math.round(summaryProfit),
       },
       rows,
+      totals: this.createRevenueForecastTotalRows(rows),
     };
   }
 
@@ -4174,6 +4199,39 @@ ${sheets}
         deals: [] as any[],
       },
     };
+  }
+
+  private createRevenueForecastTotalRows(rows: Array<{
+    id: string;
+    count: number;
+    revenue: number;
+    profit: number | null;
+    deals: any[];
+  }>) {
+    const rowsById = new Map(rows.map((row) => [row.id, row]));
+    const combine = (id: string, label: string, rowIds: RevenueForecastBucketKey[]) => {
+      const sourceRows = rowIds.map((rowId) => rowsById.get(rowId)).filter(Boolean) as typeof rows;
+      const deals = sourceRows
+        .flatMap((row) => row.deals ?? [])
+        .sort((a: any, b: any) => String(a.predictedShipAt ?? '').localeCompare(String(b.predictedShipAt ?? '')));
+
+      return {
+        id,
+        label,
+        count: sourceRows.reduce((sum, row) => sum + Number(row.count ?? 0), 0),
+        revenue: Math.round(sourceRows.reduce((sum, row) => sum + Number(row.revenue ?? 0), 0)),
+        profit: Math.round(sourceRows.reduce((sum, row) => sum + Number(row.profit ?? 0), 0)),
+        deals,
+      };
+    };
+
+    return [
+      combine('totalShippedThisMonth', 'Уже отгружено', ['salesShippedThisMonth', 'repeatShippedThisMonth']),
+      combine('totalShippingThisMonth', 'В отгрузке', ['salesShippingThisMonth', 'repeatShippingThisMonth']),
+      combine('totalInvoiceThisMonth', 'Счета, которые успеют купить и отгрузиться', ['salesInvoiceThisMonth', 'repeatInvoiceThisMonth']),
+      combine('totalQuoteThisMonth', 'КП, которые успеют купить и отгрузиться', ['salesQuoteThisMonth', 'repeatQuoteThisMonth']),
+      combine('totalNotThisMonth', 'Не успеют отгрузиться', ['salesNotThisMonth', 'repeatNotThisMonth']),
+    ];
   }
 
   private revenueForecastShippedBucket(deal: any, refs: { csmGroup?: { id: string; name: string } | null }): RevenueForecastBucketKey {
