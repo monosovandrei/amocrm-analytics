@@ -257,6 +257,13 @@ describe('ReportsService data contract', () => {
     service = new ReportsService(createPrismaMock() as any, audit as any);
   });
 
+  it('treats date-only report filters as full Moscow days', () => {
+    const range = (service as any).dateRange({ dateFrom: '2026-07-20', dateTo: '2026-07-20' });
+
+    expect(range.gte.toISOString()).toBe('2026-07-19T21:00:00.000Z');
+    expect(range.lte.toISOString()).toBe('2026-07-20T20:59:59.999Z');
+  });
+
   it('queues stale cached report refresh instead of recomputing inside API', async () => {
     const cachedPayload = { rows: [{ id: 'cached-row' }] };
     const db = {

@@ -443,6 +443,7 @@ export class AmoSyncService {
       }, {
         status: 'ACTIVE',
         lastError: null,
+        lastIncrementalSyncAt: startedAt,
       });
 
       return { status: 'ok', from: syncFrom, stats };
@@ -696,16 +697,16 @@ export class AmoSyncService {
 
   private getRecentReconcileLookbackMinutes() {
     const rawMinutes = this.config.get<string>('AMOCRM_RECENT_RECONCILE_LOOKBACK_MINUTES');
-    if (!rawMinutes) return 30;
+    if (!rawMinutes) return 24 * 60;
     const parsed = Number(rawMinutes);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : 30;
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 24 * 60;
   }
 
   private getRecentReconcileOverlapMinutes() {
     const rawMinutes = this.config.get<string>('AMOCRM_RECENT_RECONCILE_OVERLAP_MINUTES');
-    if (!rawMinutes) return 10;
+    if (!rawMinutes) return 60;
     const parsed = Number(rawMinutes);
-    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 10;
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 60;
   }
 
   private getRecentReconcileMaxDeals() {

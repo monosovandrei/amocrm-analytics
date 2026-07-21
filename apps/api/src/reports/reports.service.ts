@@ -10,6 +10,7 @@ import {
   endOfMonth,
   median,
   moscowBusinessDurationDays,
+  moscowDate,
   moscowWeekdayDurationDays,
   startOfMonth,
   toDateFromAmoTimestamp,
@@ -4621,9 +4622,10 @@ ${sheets}
 
   private parseFilterDate(value: string, endOfDay: boolean) {
     if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
-      const date = new Date(`${value}T00:00:00`);
-      if (endOfDay) date.setHours(23, 59, 59, 999);
-      return date;
+      const [year, month, day] = value.split('-').map(Number);
+      return endOfDay
+        ? moscowDate(year, month, day, 23, 59, 59, 999)
+        : moscowDate(year, month, day, 0, 0, 0, 0);
     }
     return new Date(value);
   }
