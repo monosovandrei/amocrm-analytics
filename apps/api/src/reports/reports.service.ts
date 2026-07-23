@@ -265,10 +265,13 @@ export class ReportsService {
         SET
           name = $2,
           report_config = $3::jsonb,
-          refresh_status = CASE WHEN refresh_status = 'RUNNING' THEN refresh_status ELSE 'QUEUED' END,
-          refresh_requested_at = CASE WHEN refresh_status = 'RUNNING' THEN refresh_requested_at ELSE NOW() END,
-          refresh_error = NULL,
-          updated_at = NOW()
+          refresh_status = CASE WHEN refresh_status IN ('QUEUED', 'RUNNING') THEN refresh_status ELSE 'QUEUED' END,
+          refresh_requested_at = CASE
+            WHEN refresh_status IN ('QUEUED', 'RUNNING') THEN refresh_requested_at
+            ELSE NOW()
+          END,
+          refresh_error = CASE WHEN refresh_status IN ('QUEUED', 'RUNNING') THEN refresh_error ELSE NULL END,
+          updated_at = CASE WHEN refresh_status IN ('QUEUED', 'RUNNING') THEN updated_at ELSE NOW() END
         WHERE cache_key = $1
       `,
       cacheKey,
@@ -329,6 +332,9 @@ export class ReportsService {
 
   async enqueueStaleReportCacheRefreshJobs(limit = 25) {
     await this.ensureReportCacheTable();
+    const normalizedLimit = Math.floor(limit);
+    if (!Number.isFinite(normalizedLimit) || normalizedLimit <= 0) return { queued: 0 };
+
     const latestSyncAt = await this.latestReportSourceSyncAt();
     if (!latestSyncAt) return { queued: 0 };
 
@@ -364,7 +370,7 @@ export class ReportsService {
         WHERE cache.cache_key = stale.cache_key
       `,
       latestSyncAt,
-      Math.max(1, Math.floor(limit)),
+      normalizedLimit,
     );
 
     return { queued };

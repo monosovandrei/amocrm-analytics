@@ -311,6 +311,19 @@ describe('ReportsService data contract', () => {
     );
   });
 
+  it('does not queue proactive stale report caches when the batch size is disabled', async () => {
+    const db = { $executeRawUnsafe: jest.fn(() => Promise.resolve(3)) };
+    const localService = new ReportsService(db as any, audit as any);
+    jest.spyOn(localService as any, 'ensureReportCacheTable').mockResolvedValue(undefined);
+    const latestSyncSpy = jest.spyOn(localService as any, 'latestReportSourceSyncAt').mockResolvedValue(new Date('2026-01-02T00:00:00.000Z'));
+
+    const result = await localService.enqueueStaleReportCacheRefreshJobs(0);
+
+    expect(result).toEqual({ queued: 0 });
+    expect(latestSyncSpy).not.toHaveBeenCalled();
+    expect(db.$executeRawUnsafe).not.toHaveBeenCalled();
+  });
+
   it('computes count, stage transitions, field conditions, sums, conversion and durations in one contract', async () => {
     const result = await service.compute(
       {

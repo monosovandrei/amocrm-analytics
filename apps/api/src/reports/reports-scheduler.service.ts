@@ -28,7 +28,11 @@ export class ReportsSchedulerService {
     if (this.cacheRefreshBusy) return;
     this.cacheRefreshBusy = true;
     try {
-      const stale = await this.reports.enqueueStaleReportCacheRefreshJobs(this.resolveStaleQueueBatchSize());
+      const staleQueueBatchSize = this.resolveStaleQueueBatchSize();
+      const stale =
+        staleQueueBatchSize > 0
+          ? await this.reports.enqueueStaleReportCacheRefreshJobs(staleQueueBatchSize)
+          : { queued: 0 };
       const refreshed = await this.reports.processReportCacheRefreshJobs(this.resolveRefreshBatchSize());
       if (stale.queued || refreshed.processed) {
         this.logger.log(`Report cache refresh: queued=${stale.queued}, processed=${refreshed.processed}`);
@@ -42,7 +46,7 @@ export class ReportsSchedulerService {
 
   private resolveStaleQueueBatchSize() {
     const value = Number(process.env.REPORT_CACHE_STALE_QUEUE_BATCH_SIZE);
-    return Number.isFinite(value) && value > 0 ? Math.floor(value) : 25;
+    return Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
   }
 
   private resolveRefreshBatchSize() {
