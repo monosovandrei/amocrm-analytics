@@ -329,8 +329,11 @@ export class ReportsService {
             AND refresh_status NOT IN ('QUEUED', 'RUNNING')
             AND (source_sync_at IS NULL OR source_sync_at < $1)
             AND (
-              report_config #>> '{dto,filters,dateTo}' IS NULL
-              OR (report_config #>> '{dto,filters,dateTo}')::timestamptz >= NOW() - INTERVAL '2 days'
+              NULLIF(report_config #>> '{dto,filters,dateTo}', '') IS NULL
+              OR (
+                NULLIF(report_config #>> '{dto,filters,dateTo}', '') ~ '^\\d{4}-\\d{2}-\\d{2}'
+                AND (report_config #>> '{dto,filters,dateTo}')::timestamptz >= NOW() - INTERVAL '2 days'
+              )
             )
           ORDER BY source_sync_at ASC NULLS FIRST, updated_at ASC
           LIMIT $2
