@@ -315,6 +315,38 @@ export class ReportsService {
     return { processed: jobs.length };
   }
 
+  async enqueueStaleReportCacheRefreshJobs(limit = 25) {
+    await this.ensureReportCacheTable();
+    const latestSyncAt = await this.latestReportSourceSyncAt();
+    if (!latestSyncAt) return { queued: 0 };
+
+    const queued = await this.prisma.$executeRawUnsafe(
+      `
+        WITH stale AS (
+          SELECT cache_key
+          FROM report_result_cache
+          WHERE report_config IS NOT NULL
+            AND refresh_status NOT IN ('QUEUED', 'RUNNING')
+            AND (source_sync_at IS NULL OR source_sync_at < $1)
+          ORDER BY source_sync_at ASC NULLS FIRST, updated_at ASC
+          LIMIT $2
+        )
+        UPDATE report_result_cache cache
+        SET
+          refresh_status = 'QUEUED',
+          refresh_requested_at = NOW(),
+          refresh_error = NULL,
+          updated_at = NOW()
+        FROM stale
+        WHERE cache.cache_key = stale.cache_key
+      `,
+      latestSyncAt,
+      Math.max(1, Math.floor(limit)),
+    );
+
+    return { queued };
+  }
+
   private async requeueStaleReportCacheLocks() {
     await this.prisma.$executeRawUnsafe(`
       UPDATE report_result_cache

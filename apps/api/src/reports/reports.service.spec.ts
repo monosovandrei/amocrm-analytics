@@ -295,6 +295,22 @@ describe('ReportsService data contract', () => {
     ).toBe(true);
   });
 
+  it('queues stale report caches for worker refresh after source sync advances', async () => {
+    const db = { $executeRawUnsafe: jest.fn(() => Promise.resolve(3)) };
+    const localService = new ReportsService(db as any, audit as any);
+    jest.spyOn(localService as any, 'ensureReportCacheTable').mockResolvedValue(undefined);
+    jest.spyOn(localService as any, 'latestReportSourceSyncAt').mockResolvedValue(new Date('2026-01-02T00:00:00.000Z'));
+
+    const result = await localService.enqueueStaleReportCacheRefreshJobs(10);
+
+    expect(result).toEqual({ queued: 3 });
+    expect(db.$executeRawUnsafe).toHaveBeenCalledWith(
+      expect.stringContaining('WITH stale AS'),
+      new Date('2026-01-02T00:00:00.000Z'),
+      10,
+    );
+  });
+
   it('computes count, stage transitions, field conditions, sums, conversion and durations in one contract', async () => {
     const result = await service.compute(
       {
