@@ -264,17 +264,18 @@ describe('ReportsService data contract', () => {
     expect(range.lte.toISOString()).toBe('2026-07-20T20:59:59.999Z');
   });
 
-  it('recomputes stale cached report before returning it', async () => {
+  it('queues stale cached report refresh instead of recomputing inside API', async () => {
     const cachedPayload = { rows: [{ id: 'cached-row' }] };
-    const freshPayload = { rows: [{ id: 'fresh-row' }] };
-    const localService = new ReportsService({} as any, audit as any);
-    jest.spyOn(localService as any, 'latestReportSourceSyncAt').mockResolvedValue(new Date('2026-01-02T00:00:00.000Z'));
-    jest.spyOn(localService as any, 'getCachedReport').mockResolvedValue({
-      payload: cachedPayload,
-      sourceSyncAt: new Date('2026-01-01T00:00:00.000Z'),
-    });
-    const computeFresh = jest.spyOn(localService as any, 'computeFresh').mockResolvedValue(freshPayload);
-    const saveCachedReport = jest.spyOn(localService as any, 'saveCachedReport').mockResolvedValue(undefined);
+    const db = {
+      $executeRawUnsafe: jest.fn(() => Promise.resolve(1)),
+      $queryRaw: jest.fn(() => Promise.resolve([{ payload: cachedPayload, source_sync_at: new Date('2026-01-01T00:00:00.000Z') }])),
+      amoConnection: {
+        findFirst: jest.fn(() =>
+          Promise.resolve({ lastIncrementalSyncAt: new Date('2026-01-02T00:00:00.000Z'), lastFullSyncAt: null }),
+        ),
+      },
+    };
+    const localService = new ReportsService(db as any, audit as any);
 
     const result = await localService.compute(
       {
@@ -286,16 +287,12 @@ describe('ReportsService data contract', () => {
       { id: 'user-1', role: 'ADMIN' as any },
     );
 
-    expect(result).toBe(freshPayload);
-    expect(computeFresh).toHaveBeenCalledTimes(1);
-    expect(saveCachedReport).toHaveBeenCalledWith(
-      expect.any(String),
-      'Cached report',
-      freshPayload,
-      new Date('2026-01-02T00:00:00.000Z'),
-      expect.any(Object),
-      { id: 'user-1', role: 'ADMIN' },
-    );
+    expect(result).toBe(cachedPayload);
+    expect(
+      db.$executeRawUnsafe.mock.calls.some(
+        (call: any[]) => String(call[0]).includes('WHERE cache_key = $1') && String(call[0]).includes("ELSE 'QUEUED'"),
+      ),
+    ).toBe(true);
   });
 
   it('computes count, stage transitions, field conditions, sums, conversion and durations in one contract', async () => {
