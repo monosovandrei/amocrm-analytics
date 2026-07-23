@@ -172,6 +172,7 @@ export class ReportsService {
         refresh_requested_at TIMESTAMPTZ,
         refreshing_at TIMESTAMPTZ,
         refresh_error TEXT,
+        last_accessed_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
@@ -181,6 +182,7 @@ export class ReportsService {
     await this.prisma.$executeRawUnsafe(`ALTER TABLE report_result_cache ADD COLUMN IF NOT EXISTS refresh_requested_at TIMESTAMPTZ`);
     await this.prisma.$executeRawUnsafe(`ALTER TABLE report_result_cache ADD COLUMN IF NOT EXISTS refreshing_at TIMESTAMPTZ`);
     await this.prisma.$executeRawUnsafe(`ALTER TABLE report_result_cache ADD COLUMN IF NOT EXISTS refresh_error TEXT`);
+    await this.prisma.$executeRawUnsafe(`ALTER TABLE report_result_cache ADD COLUMN IF NOT EXISTS last_accessed_at TIMESTAMPTZ`);
     await this.prisma.$executeRawUnsafe(`
       CREATE INDEX IF NOT EXISTS report_result_cache_refresh_idx
       ON report_result_cache (refresh_status, refresh_requested_at)
@@ -197,7 +199,15 @@ export class ReportsService {
     `;
     const row = rows[0];
     if (!row) return null;
+    await this.touchReportCacheAccess(cacheKey);
     return { payload: row.payload as Record<string, any>, sourceSyncAt: row.source_sync_at };
+  }
+
+  private async touchReportCacheAccess(cacheKey: string) {
+    await this.prisma.$executeRawUnsafe(
+      `UPDATE report_result_cache SET last_accessed_at = NOW() WHERE cache_key = $1`,
+      cacheKey,
+    );
   }
 
   private async saveCachedReport(
@@ -222,9 +232,10 @@ export class ReportsService {
           refresh_requested_at,
           refreshing_at,
           refresh_error,
+          last_accessed_at,
           updated_at
         )
-        VALUES ($1, $2, $3::jsonb, $4::jsonb, $5, 'IDLE', NULL, NULL, NULL, NOW())
+        VALUES ($1, $2, $3::jsonb, $4::jsonb, $5, 'IDLE', NULL, NULL, NULL, NOW(), NOW())
         ON CONFLICT (cache_key)
         DO UPDATE SET
           name = EXCLUDED.name,
@@ -235,6 +246,7 @@ export class ReportsService {
           refresh_requested_at = NULL,
           refreshing_at = NULL,
           refresh_error = NULL,
+          last_accessed_at = NOW(),
           updated_at = NOW()
       `,
       cacheKey,
@@ -328,6 +340,10 @@ export class ReportsService {
           WHERE report_config IS NOT NULL
             AND refresh_status NOT IN ('QUEUED', 'RUNNING')
             AND (source_sync_at IS NULL OR source_sync_at < $1)
+            AND (
+              refresh_requested_at >= NOW() - INTERVAL '30 minutes'
+              OR last_accessed_at >= NOW() - INTERVAL '30 minutes'
+            )
             AND (
               NULLIF(report_config #>> '{dto,filters,dateTo}', '') IS NULL
               OR (
