@@ -8,7 +8,7 @@ Type=simple
 WorkingDirectory=/opt/analytics/apps/api
 Environment=NODE_ENV=production
 Environment=NODE_OPTIONS=--max-old-space-size=768
-ExecStart=/usr/bin/node --expose-gc dist/export-worker.js
+ExecStart=/usr/bin/node dist/export-worker.js
 Restart=always
 RestartSec=5
 User=ameri
