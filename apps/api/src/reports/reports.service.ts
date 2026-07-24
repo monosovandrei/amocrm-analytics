@@ -96,6 +96,7 @@ const LOSS_REASON_CUSTOM_FIELD_NAMES = new Set(['причина отказа', '
 const MISSING_LOSS_REASON_LABEL = 'Не указано';
 const DEFAULT_REPORT_FRESH_COMPUTE_CONCURRENCY = 2;
 const DEFAULT_WORKER_RECYCLE_RSS_MB = 850;
+const DEFAULT_REPORT_CACHE_STALE_TOLERANCE_SECONDS = 90;
 const EXPORTS_DIR = process.env.REPORT_EXPORT_DIR || '/tmp/amocrm-analytics-exports';
 const MB = 1024 * 1024;
 
@@ -464,13 +465,14 @@ export class ReportsService {
 
     const latestSyncAt = await this.latestReportSourceSyncAt();
     if (!latestSyncAt) return { queued: 0 };
+    const staleBefore = this.reportCacheStaleBefore(latestSyncAt);
 
     const staleRows = await this.prisma.$queryRaw<Array<{ cache_key: string; report_config: unknown }>>`
       SELECT cache_key, report_config
       FROM report_snapshot snapshot
       WHERE report_config IS NOT NULL
         AND refresh_status NOT IN ('QUEUED', 'RUNNING')
-        AND (source_sync_at IS NULL OR source_sync_at < ${latestSyncAt})
+        AND (source_sync_at IS NULL OR source_sync_at < ${staleBefore})
         AND (
           refresh_requested_at >= NOW() - INTERVAL '30 minutes'
           OR last_accessed_at >= NOW() - INTERVAL '30 minutes'
@@ -554,7 +556,17 @@ export class ReportsService {
   private cacheIsStale(cachedSyncAt: Date | null, latestSyncAt: Date | null) {
     if (!latestSyncAt) return false;
     if (!cachedSyncAt) return true;
-    return cachedSyncAt.getTime() < latestSyncAt.getTime();
+    return cachedSyncAt.getTime() < this.reportCacheStaleBefore(latestSyncAt).getTime();
+  }
+
+  private reportCacheStaleBefore(latestSyncAt: Date) {
+    return new Date(latestSyncAt.getTime() - this.reportCacheStaleToleranceSeconds() * 1000);
+  }
+
+  private reportCacheStaleToleranceSeconds() {
+    const value = Number(process.env.REPORT_CACHE_STALE_TOLERANCE_SECONDS);
+    if (!Number.isFinite(value) || value < 0) return DEFAULT_REPORT_CACHE_STALE_TOLERANCE_SECONDS;
+    return Math.min(120, Math.floor(value));
   }
 
   private get db() {

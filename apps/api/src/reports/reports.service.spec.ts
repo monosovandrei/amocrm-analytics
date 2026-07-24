@@ -317,6 +317,14 @@ describe('ReportsService data contract', () => {
     expect(db.$executeRawUnsafe.mock.calls.some((call: any[]) => String(call[0]).includes('INSERT INTO report_snapshot_job'))).toBe(true);
   });
 
+  it('does not mark report cache stale inside the realtime freshness tolerance', () => {
+    const localService = new ReportsService({} as any, audit as any) as any;
+    const latestSyncAt = new Date('2026-01-02T00:01:00.000Z');
+    const cachedSyncAt = new Date('2026-01-02T00:00:15.000Z');
+
+    expect(localService.cacheIsStale(cachedSyncAt, latestSyncAt)).toBe(false);
+  });
+
   it('does not queue proactive stale report caches when the batch size is disabled', async () => {
     const db = { $executeRawUnsafe: jest.fn(() => Promise.resolve(3)) };
     const localService = new ReportsService(db as any, audit as any);
