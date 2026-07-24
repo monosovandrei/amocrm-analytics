@@ -268,6 +268,7 @@ describe('ReportsService data contract', () => {
     const cachedPayload = { rows: [{ id: 'cached-row' }] };
     const db = {
       $executeRawUnsafe: jest.fn(() => Promise.resolve(1)),
+      $queryRawUnsafe: jest.fn(() => Promise.resolve([])),
       $queryRaw: jest.fn(() => Promise.resolve([{ payload: cachedPayload, source_sync_at: new Date('2026-01-01T00:00:00.000Z') }])),
       amoConnection: {
         findFirst: jest.fn(() =>
@@ -296,7 +297,14 @@ describe('ReportsService data contract', () => {
   });
 
   it('queues stale report caches for worker refresh after source sync advances', async () => {
-    const db = { $executeRawUnsafe: jest.fn(() => Promise.resolve(3)) };
+    const db = {
+      $executeRawUnsafe: jest.fn(() => Promise.resolve(1)),
+      $queryRaw: jest.fn(() => Promise.resolve([
+        { cache_key: 'cache-1', report_config: { dto: { name: 'R1' }, user: { id: 'user-1', role: 'ADMIN' } } },
+        { cache_key: 'cache-2', report_config: { dto: { name: 'R2' }, user: { id: 'user-1', role: 'ADMIN' } } },
+        { cache_key: 'cache-3', report_config: { dto: { name: 'R3' }, user: { id: 'user-1', role: 'ADMIN' } } },
+      ])),
+    };
     const localService = new ReportsService(db as any, audit as any);
     jest.spyOn(localService as any, 'ensureReportCacheTable').mockResolvedValue(undefined);
     jest.spyOn(localService as any, 'latestReportSourceSyncAt').mockResolvedValue(new Date('2026-01-02T00:00:00.000Z'));
@@ -304,11 +312,9 @@ describe('ReportsService data contract', () => {
     const result = await localService.enqueueStaleReportCacheRefreshJobs(10);
 
     expect(result).toEqual({ queued: 3 });
-    expect(db.$executeRawUnsafe).toHaveBeenCalledWith(
-      expect.stringContaining('WITH stale AS'),
-      new Date('2026-01-02T00:00:00.000Z'),
-      10,
-    );
+    const queryRawCalls = db.$queryRaw.mock.calls as any[];
+    expect(String(queryRawCalls[0][0])).toContain('FROM report_snapshot snapshot');
+    expect(db.$executeRawUnsafe.mock.calls.some((call: any[]) => String(call[0]).includes('INSERT INTO report_snapshot_job'))).toBe(true);
   });
 
   it('does not queue proactive stale report caches when the batch size is disabled', async () => {
@@ -349,7 +355,10 @@ describe('ReportsService data contract', () => {
     expect(result.reports[0]).toMatchObject({ name: 'Dashboard report', status: 'PENDING', payload: null });
     expect(computeFreshSpy).not.toHaveBeenCalled();
     expect(
-      db.$executeRawUnsafe.mock.calls.some((call: any[]) => String(call[0]).includes('INSERT INTO report_result_cache')),
+      db.$executeRawUnsafe.mock.calls.some((call: any[]) => String(call[0]).includes('INSERT INTO report_snapshot')),
+    ).toBe(true);
+    expect(
+      db.$executeRawUnsafe.mock.calls.some((call: any[]) => String(call[0]).includes('INSERT INTO report_snapshot_job')),
     ).toBe(true);
   });
 
@@ -1235,6 +1244,7 @@ function createPrismaMock() {
       return callback(this);
     }),
     $executeRawUnsafe: jest.fn(() => Promise.resolve(undefined)),
+    $queryRawUnsafe: jest.fn(() => Promise.resolve([])),
     $queryRaw: jest.fn(() => Promise.resolve([])),
     amoConnection: {
       findFirst: jest.fn(() => Promise.resolve(null)),

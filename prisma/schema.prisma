@@ -697,6 +697,46 @@ model ReportTemplate {
   reportSchedules ReportSchedule[]
 }
 
+model ReportSnapshot {
+  cacheKey           String   @id @map("cache_key")
+  name               String?
+  payload            Json     @default("{}")
+  reportConfig       Json?    @map("report_config")
+  sourceSyncAt       DateTime? @map("source_sync_at")
+  refreshStatus      String   @default("IDLE") @map("refresh_status")
+  refreshRequestedAt DateTime? @map("refresh_requested_at")
+  refreshingAt       DateTime? @map("refreshing_at")
+  refreshError       String?  @map("refresh_error")
+  lastAccessedAt     DateTime? @map("last_accessed_at")
+  createdAt          DateTime @default(now()) @map("created_at")
+  updatedAt          DateTime @updatedAt @map("updated_at")
+
+  jobs ReportSnapshotJob[]
+
+  @@index([refreshStatus, refreshRequestedAt])
+  @@index([sourceSyncAt])
+  @@map("report_snapshot")
+}
+
+model ReportSnapshotJob {
+  id               String   @id @default(uuid())
+  snapshotCacheKey String   @map("snapshot_cache_key")
+  status           String   @default("QUEUED")
+  reportConfig     Json?    @map("report_config")
+  requestedAt      DateTime @default(now()) @map("requested_at")
+  startedAt        DateTime? @map("started_at")
+  finishedAt       DateTime? @map("finished_at")
+  error            String?
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  snapshot ReportSnapshot @relation(fields: [snapshotCacheKey], references: [cacheKey], onDelete: Cascade)
+
+  @@index([status, requestedAt])
+  @@index([snapshotCacheKey, status])
+  @@map("report_snapshot_job")
+}
+
 model DashboardLayout {
   id        String   @id @default(uuid())
   userId    String
