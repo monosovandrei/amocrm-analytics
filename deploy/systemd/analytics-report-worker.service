@@ -1,0 +1,22 @@
+[Unit]
+Description=amoCRM Analytics Report Worker
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/analytics/apps/api
+Environment=NODE_ENV=production
+Environment=NODE_OPTIONS=--max-old-space-size=768
+ExecStart=/usr/bin/node --expose-gc dist/report-worker.js
+Restart=always
+RestartSec=5
+User=ameri
+Group=ameri
+MemoryHigh=850M
+MemoryMax=1000M
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

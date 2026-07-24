@@ -1,0 +1,22 @@
+[Unit]
+Description=amoCRM Analytics Notification Worker
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/analytics/apps/api
+Environment=NODE_ENV=production
+Environment=NODE_OPTIONS=--max-old-space-size=384
+ExecStart=/usr/bin/node --expose-gc dist/notification-worker.js
+Restart=always
+RestartSec=5
+User=ameri
+Group=ameri
+MemoryHigh=450M
+MemoryMax=600M
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
