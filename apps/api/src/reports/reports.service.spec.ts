@@ -324,6 +324,35 @@ describe('ReportsService data contract', () => {
     expect(db.$executeRawUnsafe).not.toHaveBeenCalled();
   });
 
+  it('returns pending report snapshots without computing missing reports inside API', async () => {
+    const db = {
+      $queryRaw: jest.fn(() => Promise.resolve([])),
+      $executeRawUnsafe: jest.fn(() => Promise.resolve(1)),
+    };
+    const localService = new ReportsService(db as any, audit as any);
+    jest.spyOn(localService as any, 'ensureReportCacheTable').mockResolvedValue(undefined);
+    jest.spyOn(localService as any, 'latestReportSourceSyncAt').mockResolvedValue(new Date('2026-01-02T00:00:00.000Z'));
+    const computeFreshSpy = jest.spyOn(localService as any, 'computeFresh');
+
+    const result = await localService.snapshots(
+      [
+        {
+          name: 'Dashboard report',
+          sourceType: 'CURRENT' as any,
+          filters: {},
+          config: { metric: 'contract', contract: { groupBy: 'none', metrics: [] } },
+        } as any,
+      ],
+      { id: 'user-1', role: 'ADMIN' as any },
+    );
+
+    expect(result.reports[0]).toMatchObject({ name: 'Dashboard report', status: 'PENDING', payload: null });
+    expect(computeFreshSpy).not.toHaveBeenCalled();
+    expect(
+      db.$executeRawUnsafe.mock.calls.some((call: any[]) => String(call[0]).includes('INSERT INTO report_result_cache')),
+    ).toBe(true);
+  });
+
   it('computes count, stage transitions, field conditions, sums, conversion and durations in one contract', async () => {
     const result = await service.compute(
       {

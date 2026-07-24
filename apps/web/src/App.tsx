@@ -367,6 +367,20 @@ const periodPresetLabels: Record<PeriodPreset, string> = {
 };
 
 const workspacePeriodPresets: PeriodPreset[] = ['today', 'yesterday', 'this_week', 'this_month'];
+type DashboardReportSnapshot = {
+  cacheKey: string;
+  name: string;
+  status: 'READY' | 'PENDING' | 'ERROR';
+  stale: boolean;
+  payload: Record<string, any> | null;
+  sourceSyncAt?: string | null;
+  updatedAt?: string | null;
+  refreshError?: string | null;
+};
+type DashboardReportSnapshotsResponse = {
+  latestSourceSyncAt?: string | null;
+  reports: Array<DashboardReportSnapshot & { index: number }>;
+};
 
 const relativeUnitLabels: Record<RelativeUnit, string> = {
   hours: 'часов',
@@ -1052,6 +1066,66 @@ function WorkspaceTab({
   const csmSalesTemplates = reportTemplates.filter((template) => dashboardSectionKey(template) === 'csmSales');
   const csmTemplates = reportTemplates.filter((template) => dashboardSectionKey(template) === 'csm');
   const forecastTemplates = reportTemplates.filter((template) => dashboardSectionKey(template) === 'forecast');
+  const [snapshotByTemplateId, setSnapshotByTemplateId] = useState<Record<string, DashboardReportSnapshot>>({});
+  const [snapshotError, setSnapshotError] = useState('');
+  const [snapshotPollStamp, setSnapshotPollStamp] = useState(0);
+  const dashboardQueries = useMemo(
+    () =>
+      reportTemplates.map((template) => ({
+        templateId: template.id,
+        query: buildQueryFromTemplate(template, filters),
+      })),
+    [filters, reportTemplates],
+  );
+  const dashboardQueryKey = useMemo(
+    () => stableStringify(dashboardQueries.map((item) => ({ templateId: item.templateId, query: item.query }))),
+    [dashboardQueries],
+  );
+
+  useEffect(() => {
+    if (dashboardQueries.length === 0) {
+      setSnapshotByTemplateId({});
+      setSnapshotError('');
+      return;
+    }
+
+    let cancelled = false;
+    let pollTimer: number | undefined;
+    async function loadSnapshots() {
+      try {
+        const response = await api<DashboardReportSnapshotsResponse>('/reports/snapshots', {
+          method: 'POST',
+          body: JSON.stringify({ reports: dashboardQueries.map((item) => item.query) }),
+        });
+        if (cancelled) return;
+
+        const nextSnapshots: Record<string, DashboardReportSnapshot> = {};
+        for (const snapshot of response.reports ?? []) {
+          const source = dashboardQueries[snapshot.index];
+          if (source) nextSnapshots[source.templateId] = snapshot;
+        }
+        setSnapshotByTemplateId(nextSnapshots);
+        setSnapshotError('');
+
+        const hasPendingWithoutPayload = (response.reports ?? []).some(
+          (snapshot) => snapshot.status === 'PENDING' && (!snapshot.payload || snapshot.payload.type === 'pending'),
+        );
+        if (hasPendingWithoutPayload) {
+          pollTimer = window.setTimeout(() => setSnapshotPollStamp((value) => value + 1), 20_000);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setSnapshotError(err instanceof Error ? err.message : 'Не удалось загрузить отчёты');
+        }
+      }
+    }
+
+    void loadSnapshots();
+    return () => {
+      cancelled = true;
+      if (pollTimer) window.clearTimeout(pollTimer);
+    };
+  }, [dashboardQueryKey, refreshStamp, snapshotPollStamp]);
 
   const renderWidget = (template: ReportTemplate) => (
     <ReportWidget
@@ -1059,6 +1133,8 @@ function WorkspaceTab({
       amoDomain={amoDomain}
       filters={filters}
       refreshStamp={refreshStamp}
+      snapshot={snapshotByTemplateId[template.id]}
+      snapshotError={snapshotError}
       template={template}
     />
   );
@@ -1322,11 +1398,15 @@ function ReportWidget({
   amoDomain,
   filters,
   refreshStamp,
+  snapshot,
+  snapshotError,
   template,
 }: {
   amoDomain: string;
   filters: ReportFilters;
   refreshStamp: number;
+  snapshot?: DashboardReportSnapshot;
+  snapshotError?: string;
   template: ReportTemplate;
 }) {
   const [result, setResult] = useState<Record<string, any> | null>(null);
@@ -1346,36 +1426,34 @@ function ReportWidget({
   }, [cacheKey]);
 
   useEffect(() => {
-    let cancelled = false;
-    async function load() {
-      const initialLoad = !hasLoadedRef.current;
-      setLoading(initialLoad);
-      if (initialLoad) setError('');
-      try {
-        const next = await api<Record<string, any>>('/reports/compute', {
-          method: 'POST',
-          body: JSON.stringify(query),
-        });
-        if (!cancelled) {
-          setResult(next);
-          writeReportWidgetCache(cacheKey, next);
-          hasLoadedRef.current = true;
-        }
-      } catch (err) {
-        if (!cancelled && initialLoad) {
-          setError(err instanceof Error ? err.message : 'Не удалось посчитать отчёт');
-        }
-      } finally {
-        if (!cancelled) {
-          setLoading(false);
-        }
+    const currentSnapshot = snapshot?.cacheKey === cacheKey ? snapshot : null;
+    if (!currentSnapshot) {
+      if (snapshotError && !hasLoadedRef.current) {
+        setError(snapshotError);
+        setLoading(false);
       }
+      return;
     }
-    void load();
-    return () => {
-      cancelled = true;
-    };
-  }, [cacheKey, query, refreshStamp]);
+
+    const payload = currentSnapshot.payload;
+    if (payload && payload.type !== 'pending') {
+      setResult(payload);
+      writeReportWidgetCache(cacheKey, payload);
+      hasLoadedRef.current = true;
+      setError('');
+      setLoading(false);
+      return;
+    }
+
+    if (currentSnapshot.status === 'ERROR' && !hasLoadedRef.current) {
+      setError(currentSnapshot.refreshError || 'Не удалось посчитать отчёт');
+      setLoading(false);
+      return;
+    }
+
+    setError('');
+    setLoading(!hasLoadedRef.current);
+  }, [cacheKey, refreshStamp, snapshot, snapshotError]);
 
   const metric = getMetric(template, result);
   const isWideReport = isWideMetric(template.config.metric);
@@ -6512,4 +6590,3 @@ function restoreContractFilters(metric: ContractMetricPayload): ContractFilterDr
   }
   return filters;
 }
-

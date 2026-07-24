@@ -72,6 +72,14 @@ type ReportCacheConfig = {
   dto?: ReportQueryDto;
   user?: { id: string; role: UserRole };
 };
+type ReportCacheRow = {
+  cache_key: string;
+  payload: unknown;
+  source_sync_at: Date | null;
+  refresh_status: string;
+  refresh_error: string | null;
+  updated_at: Date;
+};
 type RevenueForecastBucketKey =
   | 'salesShippedThisMonth'
   | 'salesShippingThisMonth'
@@ -132,6 +140,67 @@ export class ReportsService {
     const report = await this.computeFresh(dto, user);
     await this.saveCachedReport(cacheKey, dto.name, report, latestSyncAt, dto, user);
     return report;
+  }
+
+  async snapshots(dtos: ReportQueryDto[], user: { id: string; role: UserRole }) {
+    await this.ensureReportCacheTable();
+    const latestSyncAt = await this.latestReportSourceSyncAt();
+    const reports = dtos.map((dto, index) => ({
+      index,
+      dto,
+      cacheKey: this.reportCacheKey(dto, user),
+    }));
+    const uniqueCacheKeys = [...new Set(reports.map((report) => report.cacheKey))];
+    const rows = uniqueCacheKeys.length
+      ? await this.prisma.$queryRaw<ReportCacheRow[]>`
+          SELECT cache_key, payload, source_sync_at, refresh_status, refresh_error, updated_at
+          FROM report_result_cache
+          WHERE cache_key IN (${Prisma.join(uniqueCacheKeys)})
+        `
+      : [];
+    const rowsByKey = new Map(rows.map((row) => [row.cache_key, row]));
+
+    const items = [];
+    for (const report of reports) {
+      const row = rowsByKey.get(report.cacheKey);
+      if (!row) {
+        await this.enqueueMissingReportSnapshot(report.cacheKey, report.dto, user);
+        items.push({
+          index: report.index,
+          cacheKey: report.cacheKey,
+          name: report.dto.name,
+          status: 'PENDING',
+          stale: true,
+          payload: null,
+          sourceSyncAt: null,
+          updatedAt: null,
+          refreshError: null,
+        });
+        continue;
+      }
+
+      await this.touchReportCacheAccess(report.cacheKey);
+      const stale = this.cacheIsStale(row.source_sync_at, latestSyncAt);
+      if (stale) {
+        await this.enqueueReportCacheRefresh(report.cacheKey, report.dto, user);
+      }
+      const payload = row.payload as Record<string, any> | null;
+      const placeholderPayload = payload?.type === 'pending';
+
+      items.push({
+        index: report.index,
+        cacheKey: report.cacheKey,
+        name: report.dto.name,
+        status: row.refresh_status === 'ERROR' ? 'ERROR' : row.refresh_status === 'RUNNING' || row.refresh_status === 'QUEUED' ? 'PENDING' : 'READY',
+        stale,
+        payload: placeholderPayload ? null : row.payload,
+        sourceSyncAt: row.source_sync_at,
+        updatedAt: row.updated_at,
+        refreshError: row.refresh_error,
+      });
+    }
+
+    return { latestSourceSyncAt: latestSyncAt, reports: items };
   }
 
   private async computeFresh(dto: ReportQueryDto, user: { id: string; role: UserRole }) {
@@ -276,6 +345,43 @@ export class ReportsService {
       `,
       cacheKey,
       dto.name,
+      JSON.stringify({ dto, user: { id: user.id, role: user.role } }),
+    );
+  }
+
+  private async enqueueMissingReportSnapshot(cacheKey: string, dto: ReportQueryDto, user: { id: string; role: UserRole }) {
+    await this.ensureReportCacheTable();
+    await this.prisma.$executeRawUnsafe(
+      `
+        INSERT INTO report_result_cache (
+          cache_key,
+          name,
+          payload,
+          report_config,
+          source_sync_at,
+          refresh_status,
+          refresh_requested_at,
+          refreshing_at,
+          refresh_error,
+          last_accessed_at,
+          updated_at
+        )
+        VALUES ($1, $2, $3::jsonb, $4::jsonb, NULL, 'QUEUED', NOW(), NULL, NULL, NOW(), NOW())
+        ON CONFLICT (cache_key)
+        DO UPDATE SET
+          name = EXCLUDED.name,
+          report_config = EXCLUDED.report_config,
+          refresh_status = CASE WHEN report_result_cache.refresh_status IN ('QUEUED', 'RUNNING') THEN report_result_cache.refresh_status ELSE 'QUEUED' END,
+          refresh_requested_at = CASE
+            WHEN report_result_cache.refresh_status IN ('QUEUED', 'RUNNING') THEN report_result_cache.refresh_requested_at
+            ELSE NOW()
+          END,
+          last_accessed_at = NOW(),
+          updated_at = CASE WHEN report_result_cache.refresh_status IN ('QUEUED', 'RUNNING') THEN report_result_cache.updated_at ELSE NOW() END
+      `,
+      cacheKey,
+      dto.name,
+      JSON.stringify({ type: 'pending' }),
       JSON.stringify({ dto, user: { id: user.id, role: user.role } }),
     );
   }

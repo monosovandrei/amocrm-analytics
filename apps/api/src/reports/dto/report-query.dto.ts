@@ -1,4 +1,4 @@
-import { IsIn, IsObject, IsOptional, IsString } from 'class-validator';
+import { IsArray, IsIn, IsObject, IsOptional, IsString } from 'class-validator';
 
 export class ReportQueryDto {
   @IsString()
@@ -18,4 +18,9 @@ export class SaveReportTemplateDto extends ReportQueryDto {
   @IsOptional()
   @IsString()
   id?: string;
+}
+
+export class ReportSnapshotsDto {
+  @IsArray()
+  reports!: ReportQueryDto[];
 }

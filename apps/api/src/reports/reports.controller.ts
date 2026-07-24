@@ -1,7 +1,7 @@
 import { Body, Controller, Delete, Get, Param, Post, Request, StreamableFile, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { ReportsService } from './reports.service';
-import { ReportQueryDto, SaveReportTemplateDto } from './dto/report-query.dto';
+import { ReportQueryDto, ReportSnapshotsDto, SaveReportTemplateDto } from './dto/report-query.dto';
 
 @Controller('reports')
 @UseGuards(JwtAuthGuard)
@@ -11,6 +11,11 @@ export class ReportsController {
   @Post('compute')
   compute(@Body() dto: ReportQueryDto, @Request() req: any) {
     return this.reports.compute(dto, req.user);
+  }
+
+  @Post('snapshots')
+  snapshots(@Body() dto: ReportSnapshotsDto, @Request() req: any) {
+    return this.reports.snapshots(dto.reports ?? [], req.user);
   }
 
   @Get('templates')
