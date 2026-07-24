@@ -764,6 +764,7 @@ describe('ReportsService data contract', () => {
           .mockResolvedValueOnce([...successEntries, ...lossEntries])
           .mockResolvedValueOnce([...stageEntries, ...successEntries, ...lossEntries, outOfWindowEntry]),
       },
+      $queryRaw: probabilityFactQueryMock([...stageEntries, ...successEntries, ...lossEntries, outOfWindowEntry]),
     };
     const localService = new ReportsService(db as any, audit as any);
 
@@ -776,15 +777,7 @@ describe('ReportsService data contract', () => {
     });
 
     const probability = model.probability(stageId, managerId);
-    expect(db.dealStageHistory.findMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: expect.objectContaining({
-        movedAt: {
-          gte: new Date('2026-06-08T12:00:00.000Z'),
-          lte: now,
-        },
-        deal: { deletedAt: null },
-      }),
-    }));
+    expect(db.$queryRaw).toHaveBeenCalledTimes(2);
     expect(probability).toMatchObject({
       source: 'personal',
       personalSample: 10,
@@ -799,6 +792,7 @@ describe('ReportsService data contract', () => {
     const currentPipelineId = 'pipeline-assembly';
     const stageId = 'stage-kp-sales';
     const successStageId = 'stage-won-sales';
+    const lossStageId = 'stage-lost-sales';
     const managerId = 'manager-sales';
     const stageEntries = Array.from({ length: 10 }, (_, index) => ({
       dealId: `deal-moved-${index}`,
@@ -812,16 +806,25 @@ describe('ReportsService data contract', () => {
       movedAt: new Date(`2026-06-${20 + index}T10:00:00.000Z`),
       deal: { pipelineId: currentPipelineId, responsibleId: managerId },
     }));
+    const lossEntries = stageEntries.slice(6).map((entry, index) => ({
+      dealId: entry.dealId,
+      fromStageId: stageId,
+      toStageId: lossStageId,
+      movedAt: new Date(`2026-06-${26 + index}T10:00:00.000Z`),
+      deal: { pipelineId: currentPipelineId, responsibleId: managerId },
+    }));
     const db = {
       pipelineStage: {
         findMany: jest.fn().mockResolvedValue([
           { id: stageId, pipelineId: salesPipelineId },
           { id: successStageId, pipelineId: salesPipelineId },
+          { id: lossStageId, pipelineId: salesPipelineId, isLost: true },
         ]),
       },
       dealStageHistory: {
-        findMany: jest.fn().mockResolvedValue([...stageEntries, ...successEntries]),
+        findMany: jest.fn().mockResolvedValue([...stageEntries, ...successEntries, ...lossEntries]),
       },
+      $queryRaw: probabilityFactQueryMock([...stageEntries, ...successEntries, ...lossEntries]),
     };
     const localService = new ReportsService(db as any, audit as any);
 
@@ -834,11 +837,7 @@ describe('ReportsService data contract', () => {
     });
 
     const probability = model.probability(stageId, managerId);
-    expect(db.dealStageHistory.findMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: expect.objectContaining({
-        deal: { deletedAt: null },
-      }),
-    }));
+    expect(db.$queryRaw).toHaveBeenCalledTimes(2);
     expect(probability).toMatchObject({
       source: 'personal',
       personalSample: 10,
@@ -853,6 +852,7 @@ describe('ReportsService data contract', () => {
     const assignedPipelineId = 'pipeline-assigned';
     const offerStageId = 'stage-base-offer';
     const assignedSuccessStageId = 'stage-assigned-paid';
+    const lossStageId = 'stage-base-lost';
     const managerId = 'manager-csm';
     const stageEntries = Array.from({ length: 10 }, (_, index) => ({
       dealId: `deal-csm-${index}`,
@@ -866,16 +866,25 @@ describe('ReportsService data contract', () => {
       movedAt: new Date(`2026-06-${20 + index}T10:00:00.000Z`),
       deal: { pipelineId: assignedPipelineId, responsibleId: managerId },
     }));
+    const lossEntries = stageEntries.slice(7).map((entry, index) => ({
+      dealId: entry.dealId,
+      fromStageId: offerStageId,
+      toStageId: lossStageId,
+      movedAt: new Date(`2026-06-${27 + index}T10:00:00.000Z`),
+      deal: { pipelineId: assignedPipelineId, responsibleId: managerId },
+    }));
     const db = {
       pipelineStage: {
         findMany: jest.fn().mockResolvedValue([
           { id: offerStageId, pipelineId: basePipelineId },
           { id: assignedSuccessStageId, pipelineId: assignedPipelineId },
+          { id: lossStageId, pipelineId: basePipelineId, isLost: true },
         ]),
       },
       dealStageHistory: {
-        findMany: jest.fn().mockResolvedValue([...stageEntries, ...successEntries]),
+        findMany: jest.fn().mockResolvedValue([...stageEntries, ...successEntries, ...lossEntries]),
       },
+      $queryRaw: probabilityFactQueryMock([...stageEntries, ...successEntries, ...lossEntries]),
     };
     const localService = new ReportsService(db as any, audit as any);
 
@@ -903,6 +912,7 @@ describe('ReportsService data contract', () => {
     const baseOfferStageId = 'stage-base-offer';
     const assignedOfferStageId = 'stage-assigned-offer';
     const baseSuccessStageId = 'stage-base-paid';
+    const lossStageId = 'stage-base-lost';
     const managerId = 'manager-csm';
     const stageEntries = Array.from({ length: 10 }, (_, index) => ({
       dealId: `deal-csm-merged-${index}`,
@@ -922,17 +932,26 @@ describe('ReportsService data contract', () => {
       movedAt: new Date(`2026-06-${20 + index}T10:00:00.000Z`),
       deal: { pipelineId: assignedPipelineId, responsibleId: managerId },
     }));
+    const lossEntries = stageEntries.slice(6).map((entry, index) => ({
+      dealId: entry.dealId,
+      fromStageId: baseOfferStageId,
+      toStageId: lossStageId,
+      movedAt: new Date(`2026-06-${26 + index}T10:00:00.000Z`),
+      deal: { pipelineId: assignedPipelineId, responsibleId: managerId },
+    }));
     const db = {
       pipelineStage: {
         findMany: jest.fn().mockResolvedValue([
           { id: baseOfferStageId, pipelineId: basePipelineId },
           { id: assignedOfferStageId, pipelineId: assignedPipelineId },
           { id: baseSuccessStageId, pipelineId: basePipelineId },
+          { id: lossStageId, pipelineId: basePipelineId, isLost: true },
         ]),
       },
       dealStageHistory: {
-        findMany: jest.fn().mockResolvedValue([...stageEntries, duplicateSiblingStageEntry, ...successEntries]),
+        findMany: jest.fn().mockResolvedValue([...stageEntries, duplicateSiblingStageEntry, ...successEntries, ...lossEntries]),
       },
+      $queryRaw: probabilityFactQueryMock([...stageEntries, duplicateSiblingStageEntry, ...successEntries, ...lossEntries]),
     };
     const localService = new ReportsService(db as any, audit as any);
 
@@ -1002,6 +1021,7 @@ describe('ReportsService data contract', () => {
           .mockResolvedValueOnce([...successEntries, ...freeBaseEntries])
           .mockResolvedValueOnce(historyEntries),
       },
+      $queryRaw: probabilityFactQueryMock(historyEntries),
     };
     const localService = new ReportsService(db as any, audit as any);
 
@@ -1212,6 +1232,32 @@ describe('ReportsService data contract', () => {
     expect(value.samples.map((sample: any) => Math.round(sample.durationDays * 24 * 60))).toEqual([18, 1, 1]);
   });
 });
+
+function probabilityFactQueryMock(entries: any[]) {
+  return jest.fn((strings: any, ...values: any[]) => {
+    const sql = flattenSql(strings, values);
+    const stageIds = sql.values.filter((value) => typeof value === 'string' && value.startsWith('stage-'));
+    const dealIds = sql.values.filter((value) => typeof value === 'string' && value.startsWith('deal-'));
+    const dates = sql.values.filter((value) => value instanceof Date) as Date[];
+    const [from, to] = dates;
+
+    let rows = entries;
+    if (stageIds.length) rows = rows.filter((entry) => stageIds.includes(entry.toStageId));
+    if (dealIds.length) rows = rows.filter((entry) => dealIds.includes(entry.dealId));
+    if (from && to) rows = rows.filter((entry) => entry.movedAt >= from && entry.movedAt <= to);
+    else if (from && sql.text.includes('"moved_at" <=')) rows = rows.filter((entry) => entry.movedAt <= from);
+    else if (from) rows = rows.filter((entry) => entry.movedAt >= from);
+
+    return Promise.resolve(rows.map((entry) => ({
+      dealId: entry.dealId,
+      fromStageId: entry.fromStageId ?? null,
+      toStageId: entry.toStageId,
+      movedAt: entry.movedAt,
+      pipelineId: entry.deal?.pipelineId ?? null,
+      responsibleId: entry.deal?.responsibleId ?? null,
+    })));
+  });
+}
 
 function createPrismaMock() {
   const templates: any[] = [];
@@ -1484,12 +1530,21 @@ function mockFactIntervalQuery(sql: { text: string; values: any[] }, rows: any[]
   const stageIds = sql.values.filter((value) => typeof value === 'string' && value.startsWith('stage-'));
   const dates = sql.values.filter((value) => value instanceof Date) as Date[];
   const [from, to] = dates;
+  const contractDurationQuery = sql.text.includes('transition."id" IS NOT NULL');
+  const enteredUpperBoundOnly = /"entered_at"\s*<=\s*\?/.test(sql.text) && !/"entered_at"\s*>=/.test(sql.text);
 
   return rows.filter((row) => {
     if (managerIds.length && !managerIds.includes(row.responsible_id)) return false;
     if (pipelineIds.length && !pipelineIds.includes(row.pipeline_id)) return false;
     if (sql.text.includes('"is_current" = true')) {
       return row.is_current && !row.stage_is_won && !row.stage_is_lost;
+    }
+    if (contractDurationQuery) {
+      if (stageIds.length && !stageIds.includes(row.stage_id)) return false;
+      if (from && enteredUpperBoundOnly && row.entered_at > from) return false;
+      if (from && !enteredUpperBoundOnly && row.entered_at < from) return false;
+      if (to && row.entered_at > to) return false;
+      return true;
     }
     if (!row.stage_is_won && !row.stage_is_lost) {
       if (!row.exited_at) return false;
@@ -1537,7 +1592,18 @@ function mockFactTransitionQuery(sql: { text: string; values: any[] }) {
   });
 
   if (sql.text.includes('AS "dealId"')) {
-    return rows.map((entry) => ({ dealId: entry.dealId, movedAt: entry.movedAt }));
+    return rows.map((entry) => {
+      const deal = deals.find((item) => item.id === entry.dealId)!;
+      return {
+        dealId: entry.dealId,
+        fromStageId: entry.fromStageId ?? null,
+        toStageId: entry.toStageId,
+        movedAt: entry.movedAt,
+        pipelineId: deal.pipelineId,
+        responsibleId: deal.responsibleId,
+        createdAt: deal.createdAt,
+      };
+    });
   }
 
   return rows.map((entry) => {

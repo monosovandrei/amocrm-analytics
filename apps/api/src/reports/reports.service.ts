@@ -2261,16 +2261,34 @@ ${sheets}
 
   private async findDealIdsFromFieldEvents(metric: DataContractMetric, filters: ReportFilters, role: UserRole) {
     const range = this.dateRange(filters);
-    const events = await this.db.crmEvent.findMany({
-      where: {
-        type: `custom_field_${metric.fieldId}_value_changed`,
-        dealId: { not: null },
-        createdAt: range,
-        deal: await this.buildDealWhere(filters, role, { ignorePipeline: true, ignoreStage: true }),
-      },
-      orderBy: [{ dealId: 'asc' }, { createdAt: 'asc' }],
-      select: { dealId: true, valueAfter: true },
-    });
+    const managerIds = await this.visibleManagerIds(role, filters.groupIds);
+    const allowedManagerIds = filters.managerIds?.length
+      ? filters.managerIds.filter((id) => managerIds.includes(id))
+      : managerIds;
+    if (!allowedManagerIds.length) return [];
+
+    const where: Prisma.Sql[] = [
+      Prisma.sql`event."type" = ${`custom_field_${metric.fieldId}_value_changed`}`,
+      Prisma.sql`event."dealId" IS NOT NULL`,
+      Prisma.sql`deal."deleted_at" IS NULL`,
+      Prisma.sql`deal."responsible_id" IN (${Prisma.join(allowedManagerIds)})`,
+    ];
+    if (range?.gte) where.push(Prisma.sql`event."createdAt" >= ${range.gte}`);
+    if (range?.lte) where.push(Prisma.sql`event."createdAt" <= ${range.lte}`);
+    if (filters.lossReasonIds?.length) where.push(Prisma.sql`deal."loss_reason_id" IN (${Prisma.join(filters.lossReasonIds)})`);
+    if (filters.amountFrom !== undefined) where.push(Prisma.sql`deal."amount" >= ${filters.amountFrom}`);
+    if (filters.amountTo !== undefined) where.push(Prisma.sql`deal."amount" <= ${filters.amountTo}`);
+    if (filters.tagIncludes?.length) {
+      where.push(Prisma.sql`deal."tags" && ARRAY[${Prisma.join(filters.tagIncludes)}]::TEXT[]`);
+    }
+
+    const events = await this.prisma.$queryRaw<Array<{ dealId: string | null; valueAfter: Prisma.JsonValue | null }>>`
+      SELECT event."dealId", event."valueAfter"
+      FROM "CrmEvent" event
+      JOIN "fact_deal_current" deal ON deal."deal_id" = event."dealId"
+      WHERE ${Prisma.join(where, ' AND ')}
+      ORDER BY event."dealId" ASC, event."createdAt" ASC
+    `;
 
     const firstEventByDeal = new Map<string, true>();
     for (const event of events) {
@@ -2430,21 +2448,29 @@ ${sheets}
       return { probability: () => this.defaultStageProbability(defaultProbability) };
     }
 
-    const terminalEntries = await this.db.dealStageHistory.findMany({
-      where: {
-        toStageId: { in: terminalStageIds },
-        movedAt: { gte: periodFrom, lte: periodTo },
-        deal: { deletedAt: null },
-      },
-      orderBy: [{ dealId: 'asc' }, { movedAt: 'asc' }],
-      select: {
-        dealId: true,
-        fromStageId: true,
-        toStageId: true,
-        movedAt: true,
-        deal: { select: { pipelineId: true, responsibleId: true } },
-      },
-    });
+    const terminalEntries = await this.prisma.$queryRaw<Array<{
+      dealId: string;
+      fromStageId: string | null;
+      toStageId: string;
+      movedAt: Date;
+      pipelineId: string;
+      responsibleId: string | null;
+    }>>`
+      SELECT
+        transition."deal_id" AS "dealId",
+        transition."from_stage_id" AS "fromStageId",
+        transition."to_stage_id" AS "toStageId",
+        transition."moved_at" AS "movedAt",
+        deal."pipeline_id" AS "pipelineId",
+        deal."responsible_id" AS "responsibleId"
+      FROM "fact_stage_transition" transition
+      JOIN "fact_deal_current" deal ON deal."deal_id" = transition."deal_id"
+      WHERE transition."to_stage_id" IN (${Prisma.join(terminalStageIds)})
+        AND transition."moved_at" >= ${periodFrom}
+        AND transition."moved_at" <= ${periodTo}
+        AND deal."deleted_at" IS NULL
+      ORDER BY transition."deal_id" ASC, transition."moved_at" ASC
+    `;
     if (!terminalEntries.length) {
       return { probability: () => this.defaultStageProbability(defaultProbability) };
     }
@@ -2453,19 +2479,22 @@ ${sheets}
     for (const entry of terminalEntries) {
       lastTerminalByDeal.set(entry.dealId, entry);
     }
-    const historyEntries = await this.db.dealStageHistory.findMany({
-      where: {
-        dealId: { in: [...lastTerminalByDeal.keys()] },
-        movedAt: { lte: periodTo },
-      },
-      orderBy: [{ dealId: 'asc' }, { movedAt: 'asc' }],
-      select: {
-        dealId: true,
-        fromStageId: true,
-        toStageId: true,
-        movedAt: true,
-      },
-    });
+    const historyEntries = await this.prisma.$queryRaw<Array<{
+      dealId: string;
+      fromStageId: string | null;
+      toStageId: string;
+      movedAt: Date;
+    }>>`
+      SELECT
+        transition."deal_id" AS "dealId",
+        transition."from_stage_id" AS "fromStageId",
+        transition."to_stage_id" AS "toStageId",
+        transition."moved_at" AS "movedAt"
+      FROM "fact_stage_transition" transition
+      WHERE transition."deal_id" IN (${Prisma.join([...lastTerminalByDeal.keys()])})
+        AND transition."moved_at" <= ${periodTo}
+      ORDER BY transition."deal_id" ASC, transition."moved_at" ASC
+    `;
 
     const stats = new Map<string, { sample: number; wins: number }>();
     const add = (key: string, win: boolean) => {
@@ -2481,7 +2510,7 @@ ${sheets}
     }
 
     for (const terminalEntry of lastTerminalByDeal.values()) {
-      const managerId = terminalEntry.deal.responsibleId ?? 'unassigned';
+      const managerId = terminalEntry.responsibleId ?? 'unassigned';
       const dealEntries = (byDeal.get(terminalEntry.dealId) ?? []).filter((entry) => entry.movedAt <= terminalEntry.movedAt);
       const won = successStageIds.includes(terminalEntry.toStageId);
       if (options.groupStageIds) {
@@ -2809,31 +2838,7 @@ ${sheets}
     const hasOnlyExitedDuration = durations.some((duration) => duration.onlyExited);
     const entryMovedAtFilter = hasOnlyExitedDuration && range?.lte ? { lte: range.lte } : range;
 
-    const entries = await this.db.dealStageHistory.findMany({
-      where: {
-        toStageId: { in: stageIds },
-        movedAt: entryMovedAtFilter,
-        NOT: [{ fromStageId: { in: stageIds } }],
-        deal: await this.buildDealWhere(filters, role),
-      },
-      include: {
-        deal: { include: { responsible: { include: { group: true } } } },
-      },
-      orderBy: [{ dealId: 'asc' }, { movedAt: 'asc' }],
-    });
-
-    const allHistory = entries.length
-      ? await this.db.dealStageHistory.findMany({
-          where: { dealId: { in: [...new Set(entries.map((entry) => entry.dealId))] } },
-          orderBy: [{ dealId: 'asc' }, { movedAt: 'asc' }],
-          select: { id: true, dealId: true, toStageId: true, movedAt: true },
-        })
-      : [];
-    const historiesByDeal = new Map<string, Array<{ id: string; dealId: string; toStageId: string; movedAt: Date }>>();
-    for (const item of allHistory) {
-      if (!historiesByDeal.has(item.dealId)) historiesByDeal.set(item.dealId, []);
-      historiesByDeal.get(item.dealId)!.push(item);
-    }
+    const entries = await this.contractDurationFactRows(filters, stageIds, role, entryMovedAtFilter);
 
     const needsSalesResponsibleTaskStart = durations.some((duration) => duration.startMode === 'sales_responsible_task');
     const eligibleManagers = needsSalesResponsibleTaskStart
@@ -2843,7 +2848,7 @@ ${sheets}
     const tasksByDeal = new Map<string, Array<{ responsibleId: string | null; createdAt: Date; raw: unknown }>>();
 
     if (needsSalesResponsibleTaskStart && entries.length > 0) {
-      const dealIds = [...new Set(entries.map((entry) => entry.dealId))];
+      const dealIds = [...new Set(entries.map((entry) => entry.deal_id))];
       const [responsibleHistory, tasks] = await Promise.all([
         this.db.dealResponsibleHistory.findMany({
           where: { dealId: { in: dealIds } },
@@ -2881,35 +2886,32 @@ ${sheets}
       byGroupValues.set('all', []);
       byGroupSamples.set('all', []);
 
-      for (const entry of entries.filter((item) => item.toStageId === duration.stageId)) {
-        const history = historiesByDeal.get(entry.dealId) ?? [];
-        const index = history.findIndex((item) => item.id === entry.id);
-        const nextEntry = index >= 0 ? history.slice(index + 1).find((item) => item.toStageId !== entry.toStageId) : null;
-        if (duration.onlyExited && !nextEntry) continue;
-        const endAt = nextEntry?.movedAt ?? new Date();
-        if (duration.onlyExited ? !this.isDateInRange(endAt, range) : !this.isDateInRange(entry.movedAt, range)) continue;
+      for (const entry of entries.filter((item) => item.stage_id === duration.stageId)) {
+        if (duration.onlyExited && !entry.exited_at) continue;
+        const endAt = entry.exited_at ?? new Date();
+        if (duration.onlyExited ? !this.isDateInRange(endAt, range) : !this.isDateInRange(entry.entered_at, range)) continue;
 
         const start = duration.startMode === 'sales_responsible_task'
           ? this.salesResponsibleTaskStart(
-              entry,
+              { dealId: entry.deal_id, movedAt: entry.entered_at, deal: { responsibleId: entry.responsible_id } },
               endAt,
               eligibleManagers,
-              responsibleHistoryByDeal.get(entry.dealId) ?? [],
-              tasksByDeal.get(entry.dealId) ?? [],
+              responsibleHistoryByDeal.get(entry.deal_id) ?? [],
+              tasksByDeal.get(entry.deal_id) ?? [],
             )
-          : { startedAt: entry.movedAt, managerId: entry.deal.responsibleId ?? 'unassigned' };
+          : { startedAt: entry.entered_at, managerId: entry.responsible_id ?? 'unassigned' };
         if (!start || endAt <= start.startedAt) continue;
 
         const days = duration.startMode === 'sales_responsible_task'
           ? this.businessDurationDays(start.startedAt, endAt)
           : this.durationDays(start.startedAt, endAt);
         if (days === null) continue;
-        const groupId = start.managerId ?? entry.deal.responsibleId ?? 'unassigned';
-        const groupName = groups.get(groupId)?.name ?? entry.deal.responsible?.name ?? 'Без менеджера';
+        const groupId = start.managerId ?? entry.responsible_id ?? 'unassigned';
+        const groupName = groups.get(groupId)?.name ?? entry.responsible_name ?? 'Без менеджера';
         const sample = {
-          dealId: entry.deal.id,
-          dealExternalId: entry.deal.externalId,
-          dealTitle: entry.deal.title,
+          dealId: entry.deal_id,
+          dealExternalId: entry.deal_external_id,
+          dealTitle: entry.title,
           durationDays: days,
         };
         groups.set(groupId, { id: groupId, name: groupName });
@@ -2939,6 +2941,76 @@ ${sheets}
     }
 
     return result;
+  }
+
+  private async contractDurationFactRows(
+    filters: ReportFilters,
+    stageIds: string[],
+    role: UserRole,
+    entryRange?: Record<string, Date>,
+  ) {
+    const managerIds = await this.visibleManagerIds(role, filters.groupIds);
+    const allowedManagerIds = filters.managerIds?.length
+      ? filters.managerIds.filter((id) => managerIds.includes(id))
+      : managerIds;
+    if (!allowedManagerIds.length) return [];
+
+    const where: Prisma.Sql[] = [
+      Prisma.sql`stage_interval."stage_id" IN (${Prisma.join(stageIds)})`,
+      Prisma.sql`transition."id" IS NOT NULL`,
+      Prisma.sql`(transition."from_stage_id" IS NULL OR transition."from_stage_id" NOT IN (${Prisma.join(stageIds)}))`,
+      Prisma.sql`deal."deleted_at" IS NULL`,
+      Prisma.sql`deal."responsible_id" IN (${Prisma.join(allowedManagerIds)})`,
+    ];
+    if (filters.pipelineIds?.length) {
+      where.push(Prisma.sql`deal."pipeline_id" IN (${Prisma.join(filters.pipelineIds)})`);
+    }
+    if (filters.stageIds?.length) {
+      where.push(Prisma.sql`deal."stage_id" IN (${Prisma.join(filters.stageIds)})`);
+    }
+    if (filters.excludeStageIds?.length) {
+      where.push(Prisma.sql`deal."stage_id" NOT IN (${Prisma.join(filters.excludeStageIds)})`);
+    }
+    if (filters.lossReasonIds?.length) {
+      where.push(Prisma.sql`deal."loss_reason_id" IN (${Prisma.join(filters.lossReasonIds)})`);
+    }
+    if (filters.amountFrom !== undefined) where.push(Prisma.sql`deal."amount" >= ${filters.amountFrom}`);
+    if (filters.amountTo !== undefined) where.push(Prisma.sql`deal."amount" <= ${filters.amountTo}`);
+    if (filters.tagIncludes?.length) {
+      where.push(Prisma.sql`deal."tags" && ARRAY[${Prisma.join(filters.tagIncludes)}]::TEXT[]`);
+    }
+    if (entryRange?.gte) where.push(Prisma.sql`stage_interval."entered_at" >= ${entryRange.gte}`);
+    if (entryRange?.lte) where.push(Prisma.sql`stage_interval."entered_at" <= ${entryRange.lte}`);
+    for (const customFilter of filters.customFields ?? []) {
+      const condition = this.factCustomFieldCondition(customFilter);
+      if (condition) where.push(condition);
+    }
+
+    return this.prisma.$queryRaw<Array<{
+      deal_id: string;
+      deal_external_id: string;
+      title: string;
+      stage_id: string;
+      responsible_id: string | null;
+      responsible_name: string | null;
+      entered_at: Date;
+      exited_at: Date | null;
+    }>>`
+      SELECT
+        stage_interval."deal_id",
+        stage_interval."deal_external_id",
+        deal."title",
+        stage_interval."stage_id",
+        stage_interval."responsible_id",
+        stage_interval."responsible_name",
+        stage_interval."entered_at",
+        stage_interval."exited_at"
+      FROM "fact_deal_stage_interval" stage_interval
+      JOIN "fact_deal_current" deal ON deal."deal_id" = stage_interval."deal_id"
+      LEFT JOIN "fact_stage_transition" transition ON transition."id" = stage_interval."id"
+      WHERE ${Prisma.join(where, ' AND ')}
+      ORDER BY stage_interval."deal_id" ASC, stage_interval."entered_at" ASC
+    `;
   }
 
   private salesResponsibleTaskStart(
@@ -3962,22 +4034,24 @@ ${sheets}
       });
     };
 
-    const alreadyShippedEntries = await this.db.dealStageHistory.findMany({
+    const alreadyShippedEntries = await this.prisma.factStageTransition.findMany({
       where: {
         toStageId: refs.shippingDoneStage!.id,
+        pipelineId: refs.assemblyPipeline!.id,
         movedAt: { gte: monthFrom, lte: monthTo },
-        deal: await this.buildDealWhere(this.fixedPipelineFilters(filters, refs.assemblyPipeline!.id, undefined, { ignoreTeam: true }), role),
       },
       orderBy: [{ dealId: 'asc' }, { movedAt: 'asc' }],
-      select: {
-        movedAt: true,
-        deal: { select: this.dealReportSelect() },
-      },
+      select: { dealId: true, movedAt: true },
     });
+    const alreadyShippedDeals = new Map((await this.findDealsByIds(alreadyShippedEntries.map((entry) => entry.dealId))).map((deal) => [deal.id, deal]));
+    const allowedShippedManagerIds = new Set(await this.visibleManagerIds(role));
     const alreadyShippedByDeal = new Map<string, { deal: any; shippedAt: Date }>();
     for (const entry of alreadyShippedEntries) {
-      if (!alreadyShippedByDeal.has(entry.deal.id)) {
-        alreadyShippedByDeal.set(entry.deal.id, { deal: entry.deal, shippedAt: entry.movedAt });
+      const deal = alreadyShippedDeals.get(entry.dealId);
+      if (!deal || deal.pipelineId !== refs.assemblyPipeline!.id) continue;
+      if (!deal.responsibleId || !allowedShippedManagerIds.has(deal.responsibleId)) continue;
+      if (!alreadyShippedByDeal.has(deal.id)) {
+        alreadyShippedByDeal.set(deal.id, { deal, shippedAt: entry.movedAt });
       }
     }
     for (const { deal, shippedAt } of alreadyShippedByDeal.values()) {
@@ -4128,28 +4202,34 @@ ${sheets}
     const closingStageId = filters.stageIds?.[0] ?? settings?.closingStageId ?? undefined;
 
     const closedDeals = closingStageId
-      ? await this.db.deal.findMany({
+      ? await this.prisma.factDealCurrent.findMany({
           where: {
             stageId: closingStageId,
             closedAt: { gte: monthFrom, lte: monthTo },
           },
-          select: { id: true, amount: true },
+          select: { dealId: true, amount: true },
         })
       : [];
 
-    const weightedDeals = await this.db.deal.findMany({
+    const weightedDeals = await this.prisma.factDealCurrent.findMany({
       where: {
         deletedAt: null,
-        stage: { isWon: false, isLost: false },
-      },
-      include: {
-        stage: { include: { probabilities: true } },
+        stageIsWon: false,
+        stageIsLost: false,
       },
     });
+    const stageRows = weightedDeals.length
+      ? await this.db.pipelineStage.findMany({
+          where: { id: { in: [...new Set(weightedDeals.map((deal) => deal.stageId))] } },
+          include: { probabilities: true },
+        })
+      : [];
+    const stageById = new Map(stageRows.map((stage) => [stage.id, stage]));
 
     const probabilityMode = settings?.probabilityMode ?? 'HYBRID';
     const weighted = weightedDeals.map((deal) => {
-      const probability = deal.stage.probabilities[0];
+      const stage = stageById.get(deal.stageId);
+      const probability = stage?.probabilities[0];
       const manual = probability?.manualPercent == null ? null : Number(probability.manualPercent);
       const auto = probability?.autoPercent == null ? null : Number(probability.autoPercent);
       const percent =
@@ -4159,9 +4239,9 @@ ${sheets}
             ? auto ?? 0
             : manual ?? auto ?? 0;
       return {
-        dealId: deal.id,
+        dealId: deal.dealId,
         title: deal.title,
-        stage: deal.stage.name,
+        stage: deal.stageName,
         amount: Number(deal.amount),
         probabilityPercent: percent,
         expectedAmount: Number(deal.amount) * (percent / 100),
@@ -4205,7 +4285,7 @@ ${sheets}
       return { configured: true, avgDays: null, medianDays: null, sampleSize: 0 };
     }
 
-    const entries = await this.db.dealStageHistory.findMany({
+    const entries = await this.prisma.factStageTransition.findMany({
       where: { toStageId: { in: stageIds } },
       orderBy: { movedAt: 'asc' },
       select: { dealId: true, toStageId: true, movedAt: true },
@@ -4628,19 +4708,24 @@ ${sheets}
     targetStageId: string,
     targetRange?: { gte: Date; lte: Date },
   ) {
-    const entries = await this.db.dealStageHistory.findMany({
-      where: {
-        toStageId: { in: [...fromStageIds, targetStageId] },
-        deal: { pipelineId, deletedAt: null },
-      },
-      orderBy: [{ dealId: 'asc' }, { movedAt: 'asc' }],
-      select: {
-        dealId: true,
-        toStageId: true,
-        movedAt: true,
-        deal: { select: { createdAt: true } },
-      },
-    });
+    const entries = await this.prisma.$queryRaw<Array<{
+      dealId: string;
+      toStageId: string;
+      movedAt: Date;
+      createdAt: Date;
+    }>>`
+      SELECT
+        transition."deal_id" AS "dealId",
+        transition."to_stage_id" AS "toStageId",
+        transition."moved_at" AS "movedAt",
+        deal."created_at" AS "createdAt"
+      FROM "fact_stage_transition" transition
+      JOIN "fact_deal_current" deal ON deal."deal_id" = transition."deal_id"
+      WHERE transition."to_stage_id" IN (${Prisma.join([...fromStageIds, targetStageId])})
+        AND transition."pipeline_id" = ${pipelineId}
+        AND deal."deleted_at" IS NULL
+      ORDER BY transition."deal_id" ASC, transition."moved_at" ASC
+    `;
     const byDeal = new Map<string, typeof entries>();
     for (const entry of entries) {
       if (!byDeal.has(entry.dealId)) byDeal.set(entry.dealId, []);
@@ -4652,7 +4737,7 @@ ${sheets}
       if (!targetEntry) continue;
       if (targetRange && !this.isDateInRange(targetEntry.movedAt, targetRange)) continue;
       const firstEntry = dealEntries.find((entry) => fromStageIds.includes(entry.toStageId) && entry.movedAt <= targetEntry.movedAt);
-      const startedAt = firstEntry?.movedAt ?? targetEntry.deal.createdAt;
+      const startedAt = firstEntry?.movedAt ?? targetEntry.createdAt;
       const duration = this.absoluteDurationDays(startedAt, targetEntry.movedAt);
       if (duration !== null) values.push(duration);
     }
@@ -4665,19 +4750,23 @@ ${sheets}
 
   private async computeStageToSuccessSpeed(pipelineId: string, fromStageIds: string[], successStageId: string | string[]) {
     const successStageIds = Array.isArray(successStageId) ? successStageId.filter(Boolean) : [successStageId].filter(Boolean);
-    const entries = await this.db.dealStageHistory.findMany({
-      where: {
-        toStageId: { in: [...fromStageIds, ...successStageIds] },
-        deal: { deletedAt: null },
-      },
-      orderBy: [{ dealId: 'asc' }, { movedAt: 'asc' }],
-      select: {
-        dealId: true,
-        toStageId: true,
-        movedAt: true,
-        deal: { select: { responsibleId: true } },
-      },
-    });
+    const entries = await this.prisma.$queryRaw<Array<{
+      dealId: string;
+      toStageId: string;
+      movedAt: Date;
+      responsibleId: string | null;
+    }>>`
+      SELECT
+        transition."deal_id" AS "dealId",
+        transition."to_stage_id" AS "toStageId",
+        transition."moved_at" AS "movedAt",
+        deal."responsible_id" AS "responsibleId"
+      FROM "fact_stage_transition" transition
+      JOIN "fact_deal_current" deal ON deal."deal_id" = transition."deal_id"
+      WHERE transition."to_stage_id" IN (${Prisma.join([...fromStageIds, ...successStageIds])})
+        AND deal."deleted_at" IS NULL
+      ORDER BY transition."deal_id" ASC, transition."moved_at" ASC
+    `;
     const fromStageRows = await this.db.pipelineStage.findMany({
       where: { id: { in: fromStageIds } },
       select: { id: true, pipelineId: true },
@@ -4696,7 +4785,7 @@ ${sheets}
     for (const dealEntries of byDeal.values()) {
       const successEntry = dealEntries.find((entry) => successStageIds.includes(entry.toStageId));
       if (!successEntry) continue;
-      const managerId = successEntry.deal.responsibleId ?? 'unassigned';
+      const managerId = successEntry.responsibleId ?? 'unassigned';
       for (const stageId of fromStageIds) {
         if (!validFromStageIds.has(stageId)) continue;
         const stageEntry = [...dealEntries]
@@ -4723,11 +4812,15 @@ ${sheets}
 
   private async firstStageEntryByDeal(dealIds: string[], stageIds: string[]) {
     if (!dealIds.length || !stageIds.length) return new Map<string, Date>();
-    const entries = await this.db.dealStageHistory.findMany({
-      where: { dealId: { in: dealIds }, toStageId: { in: stageIds } },
-      orderBy: [{ dealId: 'asc' }, { movedAt: 'asc' }],
-      select: { dealId: true, movedAt: true },
-    });
+    const entries = await this.prisma.$queryRaw<Array<{ dealId: string; movedAt: Date }>>`
+      SELECT
+        transition."deal_id" AS "dealId",
+        transition."moved_at" AS "movedAt"
+      FROM "fact_stage_transition" transition
+      WHERE transition."deal_id" IN (${Prisma.join(dealIds)})
+        AND transition."to_stage_id" IN (${Prisma.join(stageIds)})
+      ORDER BY transition."deal_id" ASC, transition."moved_at" ASC
+    `;
     const result = new Map<string, Date>();
     for (const entry of entries) {
       if (!result.has(entry.dealId)) result.set(entry.dealId, entry.movedAt);
@@ -4864,55 +4957,66 @@ ${sheets}
 
   private async findDealsByIds(dealIds: string[]) {
     if (dealIds.length === 0) return [];
-    return this.db.deal.findMany({
-      where: { id: { in: dealIds }, deletedAt: null },
-      select: this.dealReportSelect(),
+    const rows = await this.prisma.factDealCurrent.findMany({
+      where: { dealId: { in: dealIds }, deletedAt: null },
       orderBy: { updatedAt: 'desc' },
     });
+    return rows.map((deal) => this.factDealToReportDeal(deal));
   }
 
   private async findFilteredDeals(filters: ReportFilters, role: UserRole, extraWhere: Record<string, any> = {}) {
-    const deals = await this.db.deal.findMany({
-      where: {
-        ...(await this.buildDealWhere(filters, role)),
-        ...this.compactWhere(extraWhere),
-      },
-      select: this.dealReportSelect(),
+    const deals = await this.prisma.factDealCurrent.findMany({
+      where: await this.buildFactDealWhere(filters, role, extraWhere),
       orderBy: { updatedAt: 'desc' },
     });
-    return deals.filter((deal) => this.matchesCustomFieldFilters(deal.customFields as any, filters.customFields));
+    return deals
+      .filter((deal) => this.matchesCustomFieldFilters(deal.customFields as any, filters.customFields))
+      .map((deal) => this.factDealToReportDeal(deal));
   }
 
   private async findCurrentStageDealsFromFacts(filters: ReportFilters, role: UserRole) {
-    const where: Prisma.FactDealCurrentWhereInput = { deletedAt: null };
-    const visibleManagerIds = await this.visibleManagerIds(role, filters.groupIds);
-    const responsibleIds = filters.managerIds?.length
-      ? filters.managerIds.filter((id) => visibleManagerIds.includes(id))
-      : visibleManagerIds;
-
-    if (filters.pipelineIds?.length) where.pipelineId = { in: filters.pipelineIds };
-    if (filters.stageIds?.length || filters.excludeStageIds?.length) {
-      where.stageId = {};
-      if (filters.stageIds?.length) where.stageId.in = filters.stageIds;
-      if (filters.excludeStageIds?.length) where.stageId.notIn = filters.excludeStageIds;
-    }
-    where.responsibleId = { in: responsibleIds };
-    if (filters.lossReasonIds?.length) where.lossReasonId = { in: filters.lossReasonIds };
-    if (filters.amountFrom !== undefined || filters.amountTo !== undefined) {
-      where.amount = {};
-      if (filters.amountFrom !== undefined) where.amount.gte = filters.amountFrom;
-      if (filters.amountTo !== undefined) where.amount.lte = filters.amountTo;
-    }
-    if (filters.tagIncludes?.length) where.tags = { hasSome: filters.tagIncludes };
-
     const rows = await this.prisma.factDealCurrent.findMany({
-      where,
+      where: await this.buildFactDealWhere(filters, role),
       orderBy: { updatedAt: 'desc' },
     });
 
     return rows
       .filter((deal) => this.matchesCustomFieldFilters(deal.customFields as any, filters.customFields))
       .map((deal) => this.factDealToReportDeal(deal));
+  }
+
+  private async buildFactDealWhere(
+    filters: ReportFilters,
+    role: UserRole,
+    extraWhere: Record<string, any> = {},
+    options: { ignorePipeline?: boolean; ignoreStage?: boolean; ignoreLossReason?: boolean } = {},
+  ): Promise<Prisma.FactDealCurrentWhereInput> {
+    const where: Prisma.FactDealCurrentWhereInput = { deletedAt: null };
+
+    if (!options.ignorePipeline && filters.pipelineIds?.length) where.pipelineId = { in: filters.pipelineIds };
+    if (!options.ignoreStage && (filters.stageIds?.length || filters.excludeStageIds?.length)) {
+      where.stageId = {};
+      if (filters.stageIds?.length) where.stageId.in = filters.stageIds;
+      if (filters.excludeStageIds?.length) where.stageId.notIn = filters.excludeStageIds;
+    }
+    if (!options.ignoreLossReason && filters.lossReasonIds?.length) where.lossReasonId = { in: filters.lossReasonIds };
+    if (filters.amountFrom !== undefined || filters.amountTo !== undefined) {
+      where.amount = {};
+      if (filters.amountFrom !== undefined) where.amount.gte = filters.amountFrom;
+      if (filters.amountTo !== undefined) where.amount.lte = filters.amountTo;
+    }
+    if (filters.tagIncludes?.length) where.tags = { hasSome: filters.tagIncludes };
+    if (extraWhere.createdAt) where.createdAt = extraWhere.createdAt;
+    if (extraWhere.updatedAt) where.updatedAt = extraWhere.updatedAt;
+    if (extraWhere.closedAt) where.closedAt = extraWhere.closedAt;
+
+    const visibleManagerIds = await this.visibleManagerIds(role, filters.groupIds);
+    const responsibleIds = filters.managerIds?.length
+      ? filters.managerIds.filter((id) => visibleManagerIds.includes(id))
+      : visibleManagerIds;
+    where.responsibleId = { in: responsibleIds };
+
+    return where;
   }
 
   private factDealToReportDeal(deal: Prisma.FactDealCurrentGetPayload<Record<string, never>>) {
@@ -5200,8 +5304,8 @@ ${sheets}
 
   private async sumDealAmount(dealIds: string[]) {
     if (dealIds.length === 0) return 0;
-    const agg = await this.db.deal.aggregate({
-      where: { id: { in: dealIds } },
+    const agg = await this.prisma.factDealCurrent.aggregate({
+      where: { dealId: { in: dealIds } },
       _sum: { amount: true },
     });
     return Number(agg._sum.amount ?? 0);

@@ -116,7 +116,6 @@ export class CrmEventNotificationsService {
               responsible: { select: { id: true, name: true, group: { select: { name: true } } } },
               pipeline: { select: { id: true, name: true } },
               stage: { select: { id: true, name: true, isWon: true, isLost: true } },
-              stageHistory: { select: { toStageId: true, movedAt: true }, orderBy: { movedAt: 'desc' }, take: 20 },
             },
           },
         },
@@ -337,31 +336,19 @@ export class CrmEventNotificationsService {
     const maxDeals = 1000;
     const batchSize = 200;
     for (let skip = 0; skip < maxDeals; skip += batchSize) {
-      const deals = await this.prisma.deal.findMany({
+      const factDeals = await this.prisma.factDealCurrent.findMany({
         where: {
           deletedAt: null,
           createdAt: { lte: now },
           pipelineId: { in: salesPipelineIds },
-          stage: { isWon: false, isLost: false },
-        },
-        select: {
-          id: true,
-          externalId: true,
-          title: true,
-          amount: true,
-          createdAt: true,
-          updatedAt: true,
-          customFields: true,
-          stageId: true,
-          responsibleId: true,
-          responsible: { select: { id: true, name: true, group: { select: { name: true } } } },
-          pipeline: { select: { id: true, name: true } },
-          stage: { select: { id: true, name: true, isWon: true, isLost: true } },
+          stageIsWon: false,
+          stageIsLost: false,
         },
         orderBy: { createdAt: 'asc' },
         skip,
         take: batchSize,
       });
+      const deals = factDeals.map((deal) => this.factDealToNotificationDeal(deal));
       if (deals.length === 0) break;
 
       for (const deal of deals) {
@@ -700,37 +687,18 @@ export class CrmEventNotificationsService {
     const maxDeals = 2000;
     const batchSize = 200;
     for (let skip = 0; skip < maxDeals; skip += batchSize) {
-      const deals = await this.prisma.deal.findMany({
+      const factDeals = await this.prisma.factDealCurrent.findMany({
         where: {
           deletedAt: null,
           pipelineId: { in: salesPipelineIds },
-          stage: { isWon: false, isLost: false },
-        },
-        select: {
-          id: true,
-          externalId: true,
-          title: true,
-          amount: true,
-          createdAt: true,
-          updatedAt: true,
-          stageId: true,
-          responsibleId: true,
-          responsible: { select: { id: true, name: true, group: { select: { name: true } } } },
-          pipeline: { select: { id: true, name: true } },
-          stage: { select: { id: true, name: true, isWon: true, isLost: true } },
-          tasks: {
-            where: { isCompleted: false },
-            select: { id: true, responsibleId: true, isCompleted: true, createdAt: true, updatedAt: true, completedAt: true },
-            orderBy: { createdAt: 'asc' },
-          },
-          notes: { select: { createdAt: true }, orderBy: { createdAt: 'desc' }, take: 1 },
-          events: { select: { createdAt: true }, orderBy: { createdAt: 'desc' }, take: 1 },
-          stageHistory: { select: { toStageId: true, movedAt: true }, orderBy: { movedAt: 'desc' }, take: 20 },
+          stageIsWon: false,
+          stageIsLost: false,
         },
         orderBy: { createdAt: 'asc' },
         skip,
         take: batchSize,
       });
+      const deals = await this.attachNotificationActivity(factDeals.map((deal) => this.factDealToNotificationDeal(deal)));
       if (deals.length === 0) break;
 
       for (const deal of deals) {
@@ -1179,30 +1147,27 @@ export class CrmEventNotificationsService {
     const csmManagerIds = csmManagers.map((manager) => manager.id);
     if (!csmManagerIds.length) return new Map<string, number>();
 
-    const history = await this.prisma.dealStageHistory.findMany({
-      where: {
-        toStageId: { in: stageIds },
-        movedAt: { lte: endAt },
-        deal: {
-          deletedAt: null,
-          pipelineId: { in: refs.pipelineIds },
-          responsibleId: { in: csmManagerIds },
-        },
-      },
-      orderBy: [{ dealId: 'asc' }, { movedAt: 'asc' }],
-      select: {
-        dealId: true,
-        movedAt: true,
-        deal: { select: { responsibleId: true } },
-      },
-    });
+    const history = await this.prisma.$queryRaw<Array<{ dealId: string; movedAt: Date; responsibleId: string | null }>>`
+      SELECT
+        transition."deal_id" AS "dealId",
+        transition."moved_at" AS "movedAt",
+        deal."responsible_id" AS "responsibleId"
+      FROM "fact_stage_transition" transition
+      JOIN "fact_deal_current" deal ON deal."deal_id" = transition."deal_id"
+      WHERE transition."to_stage_id" IN (${Prisma.join(stageIds)})
+        AND transition."moved_at" <= ${endAt}
+        AND deal."deleted_at" IS NULL
+        AND deal."pipeline_id" IN (${Prisma.join(refs.pipelineIds)})
+        AND deal."responsible_id" IN (${Prisma.join(csmManagerIds)})
+      ORDER BY transition."deal_id" ASC, transition."moved_at" ASC
+    `;
 
     const firstEntryByDeal = new Map<string, { movedAt: Date; responsibleId: string | null }>();
     for (const entry of history) {
       if (!firstEntryByDeal.has(entry.dealId)) {
         firstEntryByDeal.set(entry.dealId, {
           movedAt: entry.movedAt,
-          responsibleId: entry.deal.responsibleId,
+          responsibleId: entry.responsibleId,
         });
       }
     }
@@ -1239,26 +1204,19 @@ export class CrmEventNotificationsService {
     }
 
     const now = new Date();
-    const deals = await this.prisma.deal.findMany({
+    const factDeals = await this.prisma.factDealCurrent.findMany({
       where: {
         deletedAt: null,
         pipelineId: { in: salesPipelineIds },
-        stage: {
-          isWon: false,
-          isLost: false,
-          name: { contains: '\u043d\u0430\u0437\u043d\u0430\u0447\u0435\u043d', mode: 'insensitive' },
-        },
-      },
-      include: {
-        responsible: { include: { group: true } },
-        pipeline: true,
-        stage: true,
+        stageIsWon: false,
+        stageIsLost: false,
       },
       orderBy: { createdAt: 'asc' },
       take: 1000,
     });
 
-    const cards = deals
+    const cards = factDeals
+      .map((deal) => this.factDealToNotificationDeal(deal))
       .filter((deal) => this.isAssignedResponsibleStage(deal.stage?.name))
       .map((deal) => this.leadSlaCard(deal, now, domain))
       .sort((a, b) => a.dueAt.localeCompare(b.dueAt));
@@ -1290,6 +1248,92 @@ export class CrmEventNotificationsService {
       cards: [],
       domain,
     };
+  }
+
+  private factDealToNotificationDeal(deal: Prisma.FactDealCurrentGetPayload<Record<string, never>>) {
+    return {
+      id: deal.dealId,
+      externalId: deal.dealExternalId,
+      title: deal.title,
+      amount: deal.amount,
+      createdAt: deal.createdAt,
+      updatedAt: deal.updatedAt,
+      customFields: deal.customFields,
+      stageId: deal.stageId,
+      responsibleId: deal.responsibleId,
+      responsible: deal.responsibleId || deal.responsibleName || deal.groupName
+        ? {
+            id: deal.responsibleId,
+            name: deal.responsibleName ?? 'Без менеджера',
+            group: deal.groupName ? { name: deal.groupName } : null,
+          }
+        : null,
+      pipeline: { id: deal.pipelineId, name: deal.pipelineName },
+      stage: { id: deal.stageId, name: deal.stageName, isWon: deal.stageIsWon, isLost: deal.stageIsLost },
+    };
+  }
+
+  private async attachNotificationActivity(deals: any[]) {
+    if (!deals.length) return deals;
+    const dealIds = deals.map((deal) => deal.id).filter(Boolean);
+    if (!dealIds.length) return deals;
+
+    const [tasks, latestNotes, latestEvents, currentIntervals] = await Promise.all([
+      this.prisma.task.findMany({
+        where: { dealId: { in: dealIds }, isCompleted: false },
+        select: {
+          id: true,
+          dealId: true,
+          responsibleId: true,
+          isCompleted: true,
+          createdAt: true,
+          updatedAt: true,
+          completedAt: true,
+          raw: true,
+        },
+        orderBy: { createdAt: 'asc' },
+      }),
+      this.prisma.$queryRaw<Array<{ dealId: string; createdAt: Date }>>`
+        SELECT DISTINCT ON ("dealId") "dealId", "createdAt"
+        FROM "Note"
+        WHERE "dealId" IN (${Prisma.join(dealIds)})
+        ORDER BY "dealId" ASC, "createdAt" DESC
+      `,
+      this.prisma.$queryRaw<Array<{ dealId: string; createdAt: Date }>>`
+        SELECT DISTINCT ON ("dealId") "dealId", "createdAt"
+        FROM "CrmEvent"
+        WHERE "dealId" IN (${Prisma.join(dealIds)})
+        ORDER BY "dealId" ASC, "createdAt" DESC
+      `,
+      this.prisma.$queryRaw<Array<{ dealId: string; stageId: string; enteredAt: Date }>>`
+        SELECT "deal_id" AS "dealId", "stage_id" AS "stageId", "entered_at" AS "enteredAt"
+        FROM "fact_deal_stage_interval"
+        WHERE "deal_id" IN (${Prisma.join(dealIds)}) AND "is_current" = true
+      `,
+    ]);
+
+    const tasksByDeal = new Map<string, typeof tasks>();
+    for (const task of tasks) {
+      if (!task.dealId) continue;
+      if (!tasksByDeal.has(task.dealId)) tasksByDeal.set(task.dealId, []);
+      tasksByDeal.get(task.dealId)!.push(task);
+    }
+    const noteByDeal = new Map(latestNotes.map((note) => [note.dealId, note]));
+    const eventByDeal = new Map(latestEvents.map((event) => [event.dealId, event]));
+    const intervalByDeal = new Map(currentIntervals.map((interval) => [interval.dealId, interval]));
+
+    return deals.map((deal) => {
+      const note = noteByDeal.get(deal.id);
+      const event = eventByDeal.get(deal.id);
+      const interval = intervalByDeal.get(deal.id);
+      return {
+        ...deal,
+        tasks: tasksByDeal.get(deal.id) ?? [],
+        notes: note ? [{ createdAt: note.createdAt }] : [],
+        events: event ? [{ createdAt: event.createdAt }] : [],
+        stageHistory: interval ? [{ toStageId: interval.stageId, movedAt: interval.enteredAt }] : [],
+      };
+    });
   }
 
   private leadSlaCard(deal: any, now: Date, domain: string) {
