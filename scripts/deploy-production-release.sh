@@ -73,13 +73,19 @@ mv -Tf "$LIVE_LINK.next" "$LIVE_LINK"
 systemctl restart "${SERVICES[@]}"
 systemctl --no-pager --plain is-active "${SERVICES[@]}"
 
-curl -fsS "$HEALTH_URL" | node -e '
+HEALTH_BODY="$(mktemp)"
+HEALTH_SUMMARY="$(mktemp)"
+HEALTH_OK=0
+
+for _ in $(seq 1 90); do
+  if curl -fsS "$HEALTH_URL" > "$HEALTH_BODY" 2>/dev/null; then
+    if node -e '
 const fs = require("fs");
-const health = JSON.parse(fs.readFileSync(0, "utf8"));
+const health = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
 const red = health.redConditions || {};
 const activeRed = Object.entries(red).filter(([key, value]) => value && key !== "workerRestarted");
 if (activeRed.length > 0) {
-  console.error(JSON.stringify({ status: health.status, activeRed }, null, 2));
+  console.error(JSON.stringify({ status: health.status, activeRed }));
   process.exit(1);
 }
 console.log(JSON.stringify({
@@ -90,7 +96,23 @@ console.log(JSON.stringify({
   apiP95Ms: health.api?.p95Ms,
   workerRestartedRecently: Boolean(red.workerRestarted)
 }, null, 2));
-'
+' "$HEALTH_BODY" > "$HEALTH_SUMMARY" 2>/dev/null; then
+      HEALTH_OK=1
+      break
+    fi
+  fi
+  sleep 2
+done
+
+if [[ "$HEALTH_OK" != "1" ]]; then
+  echo "Health smoke failed after deploy" >&2
+  cat "$HEALTH_BODY" >&2 || true
+  rm -f "$HEALTH_BODY" "$HEALTH_SUMMARY"
+  exit 1
+fi
+
+cat "$HEALTH_SUMMARY"
+rm -f "$HEALTH_BODY" "$HEALTH_SUMMARY"
 
 find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' |
   sort -rn |
