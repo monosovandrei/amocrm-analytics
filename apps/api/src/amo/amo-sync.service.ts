@@ -13,6 +13,7 @@ import { PlatformService } from '../platform/platform.service';
 type SyncJobWithConnection = Prisma.SyncJobGetPayload<{ include: { connection: true } }>;
 type WebhookEventGroup = {
   ids: string[];
+  webhookEventIds: string[];
   entity: string;
   externalId: string | null;
   actions: string[];
@@ -159,6 +160,7 @@ export class AmoSyncService {
   async triggerWebhookQueue(actorUserId?: string) {
     const connection = await this.amo.getActiveConnectionOrFail();
     await this.expireStaleJobs(connection.id);
+    const now = new Date();
 
     const result = await this.prisma.$transaction(async (tx) => {
       const locked = await this.tryAdvisoryTransactionLock(tx, `amo-webhook-sync:${connection.id}`);
@@ -170,12 +172,8 @@ export class AmoSyncService {
         };
       }
 
-      const pendingWebhooks = await tx.webhookEvent.count({
-        where: {
-          connectionId: connection.id,
-          processedAt: null,
-          status: { in: ['received', 'error'] },
-        },
+      const pendingWebhooks = await tx.rawAmoEventInbox.count({
+        where: this.rawAmoEventsReadyWhere(connection.id, now),
       });
       if (pendingWebhooks === 0) {
         return {
@@ -526,6 +524,13 @@ export class AmoSyncService {
         lastWebhookAt: null,
         lastProcessedWebhookAt: null,
         webhookLagSeconds: 0,
+        pendingRawAmoEvents: 0,
+        readyRawAmoEvents: 0,
+        failedRawAmoEvents: 0,
+        lastRawAmoEventAt: null,
+        lastAppliedRawAmoEventAt: null,
+        rawAmoEventLagSeconds: 0,
+        syncLagSeconds: 0,
         webhookSubscriptionEnsuredAt: null,
         webhookSubscriptionLagSeconds: null,
         webhookSubscriptionStale: true,
@@ -548,6 +553,12 @@ export class AmoSyncService {
       lastWebhook,
       lastProcessedWebhook,
       oldestPendingWebhook,
+      pendingRawAmoEvents,
+      readyRawAmoEvents,
+      failedRawAmoEvents,
+      lastRawAmoEvent,
+      lastAppliedRawAmoEvent,
+      oldestPendingRawAmoEvent,
     ] = await Promise.all([
       this.prisma.webhookEvent.count({
         where: {
@@ -598,6 +609,44 @@ export class AmoSyncService {
         orderBy: { receivedAt: 'asc' },
         select: { receivedAt: true, status: true },
       }),
+      this.prisma.rawAmoEventInbox.count({
+        where: {
+          connectionId: connection.id,
+          appliedAt: null,
+          status: { in: ['received', 'error'] },
+        },
+      }),
+      this.prisma.rawAmoEventInbox.count({
+        where: this.rawAmoEventsReadyWhere(connection.id, new Date()),
+      }),
+      this.prisma.rawAmoEventInbox.count({
+        where: {
+          connectionId: connection.id,
+          status: 'error',
+        },
+      }),
+      this.prisma.rawAmoEventInbox.findFirst({
+        where: { connectionId: connection.id },
+        orderBy: { receivedAt: 'desc' },
+        select: { receivedAt: true, status: true },
+      }),
+      this.prisma.rawAmoEventInbox.findFirst({
+        where: {
+          connectionId: connection.id,
+          appliedAt: { not: null },
+        },
+        orderBy: { appliedAt: 'desc' },
+        select: { appliedAt: true, receivedAt: true, status: true },
+      }),
+      this.prisma.rawAmoEventInbox.findFirst({
+        where: {
+          connectionId: connection.id,
+          appliedAt: null,
+          status: { in: ['received', 'error'] },
+        },
+        orderBy: { receivedAt: 'asc' },
+        select: { receivedAt: true, status: true },
+      }),
     ]);
 
     const connectionConfig = this.connectionConfig(connection);
@@ -635,11 +684,17 @@ export class AmoSyncService {
     const webhookLagSeconds = oldestPendingWebhook
       ? Math.max(0, Math.floor((Date.now() - oldestPendingWebhook.receivedAt.getTime()) / 1000))
       : 0;
+    const rawAmoEventLagSeconds = oldestPendingRawAmoEvent
+      ? Math.max(0, Math.floor((Date.now() - oldestPendingRawAmoEvent.receivedAt.getTime()) / 1000))
+      : 0;
+    const syncLagSeconds = Math.max(webhookLagSeconds, rawAmoEventLagSeconds);
     const healthy =
       !hasBlockingError &&
       staleJobs === 0 &&
       pendingWebhooks < 1000 &&
+      pendingRawAmoEvents < 1000 &&
       webhookLagSeconds < 120 &&
+      rawAmoEventLagSeconds < 120 &&
       !hasWebhookSubscriptionProblem;
     const message = healthy
       ? syncMode === 'WEBHOOK' && !hasReceivedWebhooks
@@ -669,6 +724,13 @@ export class AmoSyncService {
       lastWebhookAt: lastWebhook?.receivedAt ?? null,
       lastProcessedWebhookAt: lastProcessedWebhook?.processedAt ?? null,
       webhookLagSeconds,
+      pendingRawAmoEvents,
+      readyRawAmoEvents,
+      failedRawAmoEvents,
+      lastRawAmoEventAt: lastRawAmoEvent?.receivedAt ?? null,
+      lastAppliedRawAmoEventAt: lastAppliedRawAmoEvent?.appliedAt ?? null,
+      rawAmoEventLagSeconds,
+      syncLagSeconds,
       webhookSubscriptionEnsuredAt,
       webhookSubscriptionLagSeconds,
       webhookSubscriptionStale,
@@ -897,12 +959,8 @@ export class AmoSyncService {
 
     const stats: Record<string, number> = {};
     try {
-      const events = await this.prisma.webhookEvent.findMany({
-        where: {
-          connectionId: job.connectionId,
-          processedAt: null,
-          status: { in: ['received', 'error'] },
-        },
+      const events = await this.prisma.rawAmoEventInbox.findMany({
+        where: this.rawAmoEventsReadyWhere(job.connectionId, startedAt),
         orderBy: { receivedAt: 'asc' },
         take: WEBHOOK_EVENT_BATCH_SIZE,
       });
@@ -910,6 +968,7 @@ export class AmoSyncService {
       const earliestEventAt = events[0]?.receivedAt ?? startedAt;
       const groups = this.groupWebhookEvents(events);
       const actionableGroups = groups.filter((group) => group.externalId);
+      stats.rawAmoEvents = events.length;
       stats.webhookEvents = events.length;
       stats.webhookGroups = groups.length;
 
@@ -925,25 +984,21 @@ export class AmoSyncService {
         try {
           if (!group.externalId) {
             stats.webhookSkippedNoId = (stats.webhookSkippedNoId ?? 0) + 1;
-            await this.prisma.webhookEvent.updateMany({
-              where: { id: { in: group.ids } },
-              data: { processedAt: new Date(), status: 'processed', error: null },
-            });
+            const appliedAt = new Date();
+            await this.markWebhookEvents(group.webhookEventIds, 'processed', appliedAt);
+            await this.markRawAmoEvents(group.ids, 'skipped', appliedAt);
             continue;
           }
 
           if (!client) throw new Error('amoCRM client was not initialized for actionable webhook group');
           await this.processWebhookGroup(client, maps, group, stats);
-          await this.prisma.webhookEvent.updateMany({
-            where: { id: { in: group.ids } },
-            data: { processedAt: new Date(), status: 'processed', error: null },
-          });
+          const appliedAt = new Date();
+          await this.markWebhookEvents(group.webhookEventIds, 'processed', appliedAt);
+          await this.markRawAmoEvents(group.ids, 'applied', appliedAt);
         } catch (error: any) {
           stats.webhookErrors = (stats.webhookErrors ?? 0) + group.ids.length;
-          await this.prisma.webhookEvent.updateMany({
-            where: { id: { in: group.ids } },
-            data: { status: 'error', error: error.message },
-          });
+          await this.markWebhookEvents(group.webhookEventIds, 'error', null, error.message);
+          await this.markRawAmoEvents(group.ids, 'error', new Date(), error.message);
           this.logger.warn(`Webhook group ${group.entity}:${group.externalId ?? 'no-id'} failed: ${error.message}`);
         }
       }
@@ -1070,6 +1125,7 @@ export class AmoSyncService {
   private groupWebhookEvents(
     events: Array<{
       id: string;
+      webhookEventId: string | null;
       entity: string;
       action: string;
       externalId: string | null;
@@ -1080,6 +1136,7 @@ export class AmoSyncService {
       string,
       {
         ids: string[];
+        webhookEventIds: string[];
         entity: string;
         externalId: string | null;
         actions: Set<string>;
@@ -1093,12 +1150,14 @@ export class AmoSyncService {
       const key = `${entity}:${externalId ?? event.id}`;
       const group = groups.get(key) ?? {
         ids: [],
+        webhookEventIds: [],
         entity,
         externalId,
         actions: new Set<string>(),
         payloads: [],
       };
       group.ids.push(event.id);
+      if (event.webhookEventId) group.webhookEventIds.push(event.webhookEventId);
       group.actions.add(String(event.action ?? '').toLowerCase());
       group.payloads.push(event.payload);
       groups.set(key, group);
@@ -1172,6 +1231,54 @@ export class AmoSyncService {
     }
 
     stats.webhookSkippedUnsupported = (stats.webhookSkippedUnsupported ?? 0) + 1;
+  }
+
+  private async markWebhookEvents(
+    webhookEventIds: string[],
+    status: 'processed' | 'error',
+    processedAt: Date | null,
+    error?: string,
+  ) {
+    if (webhookEventIds.length === 0) return;
+    await this.prisma.webhookEvent.updateMany({
+      where: { id: { in: webhookEventIds } },
+      data: {
+        status,
+        processedAt,
+        error: error ?? null,
+      },
+    });
+  }
+
+  private async markRawAmoEvents(eventIds: string[], status: 'applied' | 'skipped' | 'error', processedAt: Date, error?: string) {
+    if (eventIds.length === 0) return;
+    await this.prisma.rawAmoEventInbox.updateMany({
+      where: { id: { in: eventIds } },
+      data: {
+        status,
+        processedAt,
+        appliedAt: status === 'error' ? null : processedAt,
+        nextAttemptAt: status === 'error' ? this.nextRawAmoEventAttemptAt() : null,
+        error: error ?? null,
+        attempts: { increment: 1 },
+      },
+    });
+  }
+
+  private rawAmoEventsReadyWhere(connectionId: string, now: Date): Prisma.RawAmoEventInboxWhereInput {
+    return {
+      connectionId,
+      appliedAt: null,
+      status: { in: ['received', 'error'] },
+      OR: [
+        { nextAttemptAt: null },
+        { nextAttemptAt: { lte: now } },
+      ],
+    };
+  }
+
+  private nextRawAmoEventAttemptAt() {
+    return new Date(Date.now() + 60_000);
   }
 
   private webhookGroupNeedsLeadSideEffects(group: WebhookEventGroup) {

@@ -16,6 +16,7 @@ export class PlatformSchedulerService {
 
   @Interval(30_000)
   async syncTelegramUpdates() {
+    if (!this.runsNotificationWorker()) return;
     if (this.telegramBusy) return;
     this.telegramBusy = true;
     try {
@@ -29,6 +30,7 @@ export class PlatformSchedulerService {
 
   @Interval(60_000)
   async processPlatformJobs() {
+    if (!this.runsNotificationWorker()) return;
     if (this.jobsBusy) return;
     this.jobsBusy = true;
     try {
@@ -39,5 +41,10 @@ export class PlatformSchedulerService {
     } finally {
       this.jobsBusy = false;
     }
+  }
+
+  private runsNotificationWorker() {
+    const role = process.env.WORKER_ROLE || 'all';
+    return role === 'all' || role === 'notification';
   }
 }

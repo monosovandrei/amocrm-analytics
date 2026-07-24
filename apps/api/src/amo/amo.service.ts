@@ -182,14 +182,39 @@ export class AmoService {
 
   async recordWebhook(connectionId: string, events: AmoWebhookItem[]) {
     if (events.length === 0) return;
-    await this.prisma.webhookEvent.createMany({
-      data: events.map((event) => ({
-        connectionId,
-        entity: event.entity,
-        action: event.action,
-        externalId: event.externalId,
-        payload: event.payload as Prisma.InputJsonValue,
-      })),
+    await this.prisma.$transaction(async (tx) => {
+      const webhookEvents = await tx.webhookEvent.createManyAndReturn({
+        data: events.map((event) => ({
+          connectionId,
+          entity: event.entity,
+          action: event.action,
+          externalId: event.externalId,
+          payload: event.payload as Prisma.InputJsonValue,
+        })),
+        select: {
+          id: true,
+          entity: true,
+          action: true,
+          externalId: true,
+          payload: true,
+          receivedAt: true,
+        },
+      });
+
+      await tx.rawAmoEventInbox.createMany({
+        data: webhookEvents.map((event) => ({
+          connectionId,
+          webhookEventId: event.id,
+          dedupeKey: this.rawWebhookDedupeKey(connectionId, event.entity, event.action, event.externalId, event.payload),
+          entity: event.entity,
+          action: event.action,
+          externalId: event.externalId,
+          payload: event.payload as Prisma.InputJsonValue,
+          amoUpdatedAt: this.webhookPayloadUpdatedAt(event.payload),
+          receivedAt: event.receivedAt,
+        })),
+        skipDuplicates: true,
+      });
     });
   }
 
@@ -282,6 +307,62 @@ export class AmoService {
       }
       current = current[part];
     });
+  }
+
+  private webhookPayloadUpdatedAt(payload: unknown) {
+    const item = payload && typeof payload === 'object' && !Array.isArray(payload)
+      ? payload as Record<string, unknown>
+      : {};
+    const note = item.note && typeof item.note === 'object' && !Array.isArray(item.note)
+      ? item.note as Record<string, unknown>
+      : {};
+    const raw = this.firstTimestampValue([
+      item.updated_at,
+      item.modified_at,
+      item.created_at,
+      note.updated_at,
+      note.created_at,
+    ]);
+    return raw ? new Date(raw) : undefined;
+  }
+
+  private firstTimestampValue(values: unknown[]) {
+    for (const value of values) {
+      if (value === undefined || value === null || value === '') continue;
+      const numeric = Number(value);
+      const date = Number.isFinite(numeric) ? new Date(numeric * 1000) : new Date(String(value));
+      if (!Number.isNaN(date.getTime())) return date.toISOString();
+    }
+    return null;
+  }
+
+  private rawWebhookDedupeKey(
+    connectionId: string,
+    entity: string,
+    action: string,
+    externalId: string | null,
+    payload: unknown,
+  ) {
+    const source = [
+      connectionId,
+      entity,
+      action,
+      externalId ?? '',
+      this.stableJson(payload),
+    ].join('|');
+    return crypto.createHash('sha256').update(source).digest('hex');
+  }
+
+  private stableJson(value: unknown): string {
+    if (Array.isArray(value)) return `[${value.map((item) => this.stableJson(item)).join(',')}]`;
+    if (value && typeof value === 'object') {
+      const record = value as Record<string, unknown>;
+      return `{${Object.keys(record)
+        .sort()
+        .map((key) => `${JSON.stringify(key)}:${this.stableJson(record[key])}`)
+        .join(',')}}`;
+    }
+    return JSON.stringify(value);
   }
 
   private webhookExternalId(entity: string, action: string, item: Record<string, any>) {

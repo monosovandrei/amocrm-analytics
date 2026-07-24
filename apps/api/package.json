@@ -7,6 +7,11 @@
     "build": "nest build",
     "start": "node dist/main.js",
     "start:worker": "node dist/worker.js",
+    "start:sync-worker": "node dist/sync-worker.js",
+    "start:report-worker": "node dist/report-worker.js",
+    "start:notification-worker": "node dist/notification-worker.js",
+    "start:export-worker": "node dist/export-worker.js",
+    "start:bootstrap-worker": "node dist/bootstrap-worker.js",
     "typecheck": "tsc --noEmit",
     "test": "jest"
   },

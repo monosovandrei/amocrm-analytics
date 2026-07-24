@@ -168,6 +168,7 @@ model AmoConnection {
 
   syncJobs      SyncJob[]
   webhookEvents WebhookEvent[]
+  rawAmoEventInbox RawAmoEventInbox[]
 }
 
 model AmoAccountSnapshot {
@@ -217,6 +218,35 @@ model WebhookEvent {
   @@index([connectionId, receivedAt])
   @@index([connectionId, status, processedAt])
   @@index([entity, action])
+}
+
+model RawAmoEventInbox {
+  id             String   @id @default(uuid())
+  connectionId   String
+  webhookEventId String?  @unique
+  dedupeKey      String   @unique
+  entity         String
+  action         String
+  externalId     String?
+  payload        Json     @default("{}")
+  status         String   @default("received")
+  attempts       Int      @default(0)
+  error          String?
+  amoUpdatedAt   DateTime?
+  receivedAt     DateTime @default(now())
+  nextAttemptAt  DateTime?
+  processedAt    DateTime?
+  appliedAt      DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  connection AmoConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@index([connectionId, status, receivedAt])
+  @@index([connectionId, status, nextAttemptAt])
+  @@index([connectionId, appliedAt])
+  @@index([entity, externalId])
+  @@map("raw_amo_event_inbox")
 }
 
 model CrmGroup {

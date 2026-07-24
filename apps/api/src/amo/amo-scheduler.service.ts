@@ -25,6 +25,7 @@ export class AmoSchedulerService {
 
   @Interval(60_000)
   async tick() {
+    if (!this.runsSyncWorker()) return;
     if (this.pullSyncBusy) return;
     const connection = await this.prisma.amoConnection.findFirst({
       where: { status: { in: ['ACTIVE', 'ERROR', 'SYNCING'] } },
@@ -76,6 +77,7 @@ export class AmoSchedulerService {
 
   @Interval(5_000)
   async processWebhookQueue() {
+    if (!this.runsSyncWorker()) return;
     if (this.webhookBusy) return;
     this.webhookBusy = true;
     try {
@@ -85,11 +87,15 @@ export class AmoSchedulerService {
       });
       if (!connection) return;
 
-      const pending = await this.prisma.webhookEvent.count({
+      const pending = await this.prisma.rawAmoEventInbox.count({
         where: {
           connectionId: connection.id,
-          processedAt: null,
+          appliedAt: null,
           status: { in: ['received', 'error'] },
+          OR: [
+            { nextAttemptAt: null },
+            { nextAttemptAt: { lte: new Date() } },
+          ],
         },
       });
       if (pending === 0) return;
@@ -104,6 +110,7 @@ export class AmoSchedulerService {
 
   @Interval(60_000)
   async syncRecentEmailNotes() {
+    if (!this.runsSyncWorker()) return;
     if (this.emailNotesBusy) return;
     const intervalSeconds = this.getEmailNotesSyncIntervalSeconds();
     if (intervalSeconds <= 0) return;
@@ -130,6 +137,7 @@ export class AmoSchedulerService {
 
   @Interval(60_000)
   async reconcileRecentAmoChanges() {
+    if (!this.runsSyncWorker()) return;
     if (this.recentReconcileBusy) return;
     const intervalSeconds = this.getRecentReconcileIntervalSeconds();
     if (intervalSeconds <= 0) return;
@@ -162,6 +170,7 @@ export class AmoSchedulerService {
 
   @Interval(60_000)
   async reconcileLeadSlaCandidates() {
+    if (!this.runsSyncWorker()) return;
     if (this.leadSlaReconcileBusy) return;
     const intervalSeconds = this.getLeadSlaReconcileIntervalSeconds();
     if (intervalSeconds <= 0) return;
@@ -193,6 +202,7 @@ export class AmoSchedulerService {
 
   @Interval(60_000)
   async ensureWebhookSubscription() {
+    if (!this.runsSyncWorker()) return;
     if (this.webhookSubscriptionBusy) return;
     const checkIntervalMinutes = this.getWebhookSubscriptionCheckMinutes();
     if (checkIntervalMinutes <= 0) return;
@@ -219,6 +229,7 @@ export class AmoSchedulerService {
 
   @Interval(60_000)
   async processCrmStateNotifications() {
+    if (!this.runsNotificationWorker()) return;
     if (this.crmStateNotificationsBusy) return;
     const intervalSeconds = this.getCrmStateNotificationsIntervalSeconds();
     if (intervalSeconds <= 0) return;
@@ -295,5 +306,19 @@ export class AmoSchedulerService {
     if (typeof raw !== 'string') return null;
     const date = new Date(raw);
     return Number.isNaN(date.getTime()) ? null : date;
+  }
+
+  private workerRole() {
+    return process.env.WORKER_ROLE || 'all';
+  }
+
+  private runsSyncWorker() {
+    const role = this.workerRole();
+    return role === 'all' || role === 'sync' || role === 'bootstrap';
+  }
+
+  private runsNotificationWorker() {
+    const role = this.workerRole();
+    return role === 'all' || role === 'notification';
   }
 }

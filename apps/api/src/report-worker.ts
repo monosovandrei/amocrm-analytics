@@ -1,3 +1,3 @@
 import { bootstrapWorker } from './worker-bootstrap';
 
-bootstrapWorker(process.env.WORKER_ROLE || 'all');
+bootstrapWorker('report');

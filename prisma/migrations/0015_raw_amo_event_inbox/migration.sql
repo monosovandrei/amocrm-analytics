@@ -1,0 +1,72 @@
+CREATE TABLE "raw_amo_event_inbox" (
+  "id" TEXT NOT NULL,
+  "connectionId" TEXT NOT NULL,
+  "webhookEventId" TEXT,
+  "dedupeKey" TEXT NOT NULL,
+  "entity" TEXT NOT NULL,
+  "action" TEXT NOT NULL,
+  "externalId" TEXT,
+  "payload" JSONB NOT NULL DEFAULT '{}',
+  "status" TEXT NOT NULL DEFAULT 'received',
+  "attempts" INTEGER NOT NULL DEFAULT 0,
+  "error" TEXT,
+  "amoUpdatedAt" TIMESTAMP(3),
+  "receivedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  "nextAttemptAt" TIMESTAMP(3),
+  "processedAt" TIMESTAMP(3),
+  "appliedAt" TIMESTAMP(3),
+  "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+  CONSTRAINT "raw_amo_event_inbox_pkey" PRIMARY KEY ("id")
+);
+
+CREATE UNIQUE INDEX "raw_amo_event_inbox_webhookEventId_key" ON "raw_amo_event_inbox"("webhookEventId");
+CREATE UNIQUE INDEX "raw_amo_event_inbox_dedupeKey_key" ON "raw_amo_event_inbox"("dedupeKey");
+CREATE INDEX "raw_amo_event_inbox_connectionId_status_receivedAt_idx" ON "raw_amo_event_inbox"("connectionId", "status", "receivedAt");
+CREATE INDEX "raw_amo_event_inbox_connectionId_status_nextAttemptAt_idx" ON "raw_amo_event_inbox"("connectionId", "status", "nextAttemptAt");
+CREATE INDEX "raw_amo_event_inbox_connectionId_appliedAt_idx" ON "raw_amo_event_inbox"("connectionId", "appliedAt");
+CREATE INDEX "raw_amo_event_inbox_entity_externalId_idx" ON "raw_amo_event_inbox"("entity", "externalId");
+
+ALTER TABLE "raw_amo_event_inbox"
+  ADD CONSTRAINT "raw_amo_event_inbox_connectionId_fkey"
+  FOREIGN KEY ("connectionId") REFERENCES "AmoConnection"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+INSERT INTO "raw_amo_event_inbox" (
+  "id",
+  "connectionId",
+  "webhookEventId",
+  "dedupeKey",
+  "entity",
+  "action",
+  "externalId",
+  "payload",
+  "status",
+  "attempts",
+  "error",
+  "receivedAt",
+  "processedAt",
+  "appliedAt",
+  "createdAt",
+  "updatedAt"
+)
+SELECT
+  "id",
+  "connectionId",
+  "id",
+  md5(concat_ws('|', "connectionId", "entity", "action", coalesce("externalId", ''), "payload"::text)),
+  "entity",
+  "action",
+  "externalId",
+  "payload",
+  CASE WHEN "processedAt" IS NULL THEN "status" ELSE 'applied' END,
+  CASE WHEN "processedAt" IS NULL THEN 0 ELSE 1 END,
+  "error",
+  "receivedAt",
+  "processedAt",
+  "processedAt",
+  "createdAt",
+  "updatedAt"
+FROM "WebhookEvent"
+WHERE "processedAt" IS NULL OR "receivedAt" >= now() - interval '1 day'
+ON CONFLICT ("dedupeKey") DO NOTHING;

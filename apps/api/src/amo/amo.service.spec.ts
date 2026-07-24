@@ -113,4 +113,69 @@ describe('AmoService webhook parsing', () => {
       },
     ]);
   });
+
+  it('records webhook events into the raw amo event inbox', async () => {
+    const receivedAt = new Date('2026-07-24T07:00:00.000Z');
+    const webhookCreateManyAndReturn = jest.fn().mockResolvedValue([
+      {
+        id: 'webhook-1',
+        entity: 'leads',
+        action: 'update',
+        externalId: '25399013',
+        payload: { id: '25399013', updated_at: 1784876400 },
+        receivedAt,
+      },
+    ]);
+    const rawInboxCreateMany = jest.fn().mockResolvedValue({});
+    const prisma = {
+      $transaction: jest.fn((callback: any) =>
+        callback({
+          webhookEvent: { createManyAndReturn: webhookCreateManyAndReturn },
+          rawAmoEventInbox: { createMany: rawInboxCreateMany },
+        }),
+      ),
+    };
+    const localService = new AmoService(prisma as any, {} as any, {} as any, {} as any);
+
+    await localService.recordWebhook('connection-1', [
+      {
+        entity: 'leads',
+        action: 'update',
+        externalId: '25399013',
+        payload: { id: '25399013', updated_at: 1784876400 },
+      },
+    ]);
+
+    expect(webhookCreateManyAndReturn).toHaveBeenCalledWith({
+      data: [{
+        connectionId: 'connection-1',
+        entity: 'leads',
+        action: 'update',
+        externalId: '25399013',
+        payload: { id: '25399013', updated_at: 1784876400 },
+      }],
+      select: {
+        id: true,
+        entity: true,
+        action: true,
+        externalId: true,
+        payload: true,
+        receivedAt: true,
+      },
+    });
+    expect(rawInboxCreateMany).toHaveBeenCalledWith({
+      data: [expect.objectContaining({
+        connectionId: 'connection-1',
+        webhookEventId: 'webhook-1',
+        dedupeKey: expect.any(String),
+        entity: 'leads',
+        action: 'update',
+        externalId: '25399013',
+        payload: { id: '25399013', updated_at: 1784876400 },
+        receivedAt,
+        amoUpdatedAt: expect.any(Date),
+      })],
+      skipDuplicates: true,
+    });
+  });
 });
