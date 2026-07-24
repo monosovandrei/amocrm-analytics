@@ -607,6 +607,160 @@ model EmailThreadState {
   @@index([lastMessageAt])
 }
 
+model FactDealCurrent {
+  dealId              String   @id @map("deal_id")
+  dealExternalId      String   @unique @map("deal_external_id")
+  pipelineId          String   @map("pipeline_id")
+  pipelineName        String   @map("pipeline_name")
+  stageId             String   @map("stage_id")
+  stageName           String   @map("stage_name")
+  stagePosition       Int      @map("stage_position")
+  stageColor          String?  @map("stage_color")
+  stageIsWon          Boolean  @default(false) @map("stage_is_won")
+  stageIsLost         Boolean  @default(false) @map("stage_is_lost")
+  responsibleId       String?  @map("responsible_id")
+  responsibleName     String?  @map("responsible_name")
+  responsibleExternalId String? @map("responsible_external_id")
+  groupId             String?  @map("group_id")
+  groupName           String?  @map("group_name")
+  contactId           String?  @map("contact_id")
+  contactExternalId   String?  @map("contact_external_id")
+  contactName         String?  @map("contact_name")
+  contactEmail        String?  @map("contact_email")
+  lossReasonId        String?  @map("loss_reason_id")
+  lossReasonName      String?  @map("loss_reason_name")
+  title               String
+  amount              Decimal  @default(0)
+  currency            String   @default("RUB")
+  source              String?
+  tags                String[] @default([])
+  customFields        Json     @default("{}") @map("custom_fields")
+  closedAt            DateTime? @map("closed_at")
+  expectedCloseAt     DateTime? @map("expected_close_at")
+  createdAt           DateTime @map("created_at")
+  updatedAt           DateTime @map("updated_at")
+  deletedAt           DateTime? @map("deleted_at")
+  factUpdatedAt       DateTime @default(now()) @map("fact_updated_at")
+
+  @@index([pipelineId, stageId])
+  @@index([responsibleId])
+  @@index([groupId])
+  @@index([createdAt])
+  @@index([updatedAt])
+  @@index([closedAt])
+  @@map("fact_deal_current")
+}
+
+model FactStageTransition {
+  id                    String   @id
+  dealId                String   @map("deal_id")
+  dealExternalId        String   @map("deal_external_id")
+  dealTitle             String   @map("deal_title")
+  dealAmount            Decimal  @default(0) @map("deal_amount")
+  dealCurrency          String   @default("RUB") @map("deal_currency")
+  pipelineId            String   @map("pipeline_id")
+  pipelineName          String   @map("pipeline_name")
+  fromStageId           String?  @map("from_stage_id")
+  fromStageName         String?  @map("from_stage_name")
+  toStageId             String   @map("to_stage_id")
+  toStageName           String   @map("to_stage_name")
+  toStagePosition       Int      @map("to_stage_position")
+  toStageIsWon          Boolean  @default(false) @map("to_stage_is_won")
+  toStageIsLost         Boolean  @default(false) @map("to_stage_is_lost")
+  responsibleId         String?  @map("responsible_id")
+  responsibleName       String?  @map("responsible_name")
+  groupId               String?  @map("group_id")
+  groupName             String?  @map("group_name")
+  movedAt               DateTime @map("moved_at")
+  movedById             String?  @map("moved_by_id")
+  source                String   @default("sync")
+  factUpdatedAt         DateTime @default(now()) @map("fact_updated_at")
+
+  @@index([dealId, movedAt])
+  @@index([pipelineId, toStageId, movedAt])
+  @@index([responsibleId, movedAt])
+  @@index([groupId, movedAt])
+  @@map("fact_stage_transition")
+}
+
+model FactDealStageInterval {
+  id                    String   @id
+  dealId                String   @map("deal_id")
+  dealExternalId        String   @map("deal_external_id")
+  pipelineId            String   @map("pipeline_id")
+  pipelineName          String   @map("pipeline_name")
+  stageId               String   @map("stage_id")
+  stageName             String   @map("stage_name")
+  stagePosition         Int      @map("stage_position")
+  stageIsWon            Boolean  @default(false) @map("stage_is_won")
+  stageIsLost           Boolean  @default(false) @map("stage_is_lost")
+  responsibleId         String?  @map("responsible_id")
+  responsibleName       String?  @map("responsible_name")
+  responsibleExternalId String?  @map("responsible_external_id")
+  groupId               String?  @map("group_id")
+  groupName             String?  @map("group_name")
+  enteredAt             DateTime @map("entered_at")
+  exitedAt              DateTime? @map("exited_at")
+  durationSeconds       Int?     @map("duration_seconds")
+  isCurrent             Boolean  @default(false) @map("is_current")
+  factUpdatedAt         DateTime @default(now()) @map("fact_updated_at")
+
+  @@index([dealId, enteredAt])
+  @@index([pipelineId, stageId, enteredAt])
+  @@index([responsibleId, enteredAt])
+  @@index([isCurrent, stageId])
+  @@map("fact_deal_stage_interval")
+}
+
+model FactEmailThreadState {
+  id                         String   @id
+  dealId                     String   @map("deal_id")
+  dealExternalId             String   @map("deal_external_id")
+  dealTitle                  String   @map("deal_title")
+  dealAmount                 Decimal  @default(0) @map("deal_amount")
+  dealCurrency               String   @default("RUB") @map("deal_currency")
+  pipelineId                 String   @map("pipeline_id")
+  pipelineName               String   @map("pipeline_name")
+  stageId                    String   @map("stage_id")
+  stageName                  String   @map("stage_name")
+  stageIsWon                 Boolean  @default(false) @map("stage_is_won")
+  stageIsLost                Boolean  @default(false) @map("stage_is_lost")
+  responsibleId              String?  @map("responsible_id")
+  responsibleName            String?  @map("responsible_name")
+  responsibleExternalId      String?  @map("responsible_external_id")
+  groupId                    String?  @map("group_id")
+  groupName                  String?  @map("group_name")
+  contactId                  String?  @map("contact_id")
+  contactExternalId          String?  @map("contact_external_id")
+  contactName                String?  @map("contact_name")
+  contactEmail               String?  @map("contact_email")
+  threadId                   String   @map("thread_id")
+  lastIncomingNoteExternalId String?  @map("last_incoming_note_external_id")
+  lastIncomingAt             DateTime? @map("last_incoming_at")
+  lastOutgoingAt             DateTime? @map("last_outgoing_at")
+  lastMessageAt              DateTime @map("last_message_at")
+  subject                    String?
+  summary                    String?
+  body                       String?
+  from                       String?
+  to                         String?
+  attachCount                Int      @default(0) @map("attach_count")
+  deliveryStatus             String?  @map("delivery_status")
+  messages                   Json     @default("[]")
+  isPending                  Boolean  @default(false) @map("is_pending")
+  sourceUpdatedAt            DateTime @map("source_updated_at")
+  factUpdatedAt              DateTime @default(now()) @map("fact_updated_at")
+
+  @@unique([dealId, threadId])
+  @@index([isPending, lastIncomingAt])
+  @@index([dealId, isPending])
+  @@index([responsibleId, isPending])
+  @@index([responsibleExternalId, isPending])
+  @@index([pipelineId, isPending])
+  @@index([stageIsWon, stageIsLost])
+  @@map("fact_email_thread_state")
+}
+
 model CrmEvent {
   id         String   @id @default(uuid())
   externalId String  @unique
@@ -735,6 +889,21 @@ model ReportSnapshotJob {
   @@index([status, requestedAt])
   @@index([snapshotCacheKey, status])
   @@map("report_snapshot_job")
+}
+
+model WorkerRuntime {
+  role        String   @id
+  processId   Int      @map("process_id")
+  startedAt   DateTime @map("started_at")
+  heartbeatAt DateTime @map("heartbeat_at")
+  rssMb       Int      @default(0) @map("rss_mb")
+  heapUsedMb  Int      @default(0) @map("heap_used_mb")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@index([heartbeatAt])
+  @@index([startedAt])
+  @@map("worker_runtime")
 }
 
 model DashboardLayout {

@@ -14,6 +14,7 @@ import {
 import { AuthUser } from '../auth/jwt.strategy';
 import { AuditService } from '../audit/audit.service';
 import { isMoscowBusinessDay, moscowDate, moscowParts } from '../common/date.util';
+import { FactMartsService } from '../facts/fact-marts.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { ReportsService } from '../reports/reports.service';
 import { DataContractMetric, ReportConfig, ReportFilters } from '../reports/report-types';
@@ -160,6 +161,7 @@ export class PlatformService {
     private readonly audit: AuditService,
     private readonly telegram: TelegramService,
     private readonly crmEventNotifications: CrmEventNotificationsService,
+    private readonly facts: FactMartsService,
   ) {}
 
   async overview(user: AuthUser) {
@@ -379,19 +381,29 @@ export class PlatformService {
 
     const now = new Date();
     const domain = await this.resolveAmoDomain();
-    const states = await this.prisma.emailThreadState.findMany({
+    const factRows = await this.prisma.factEmailThreadState.findMany({
       where: {
         isPending: true,
         lastIncomingAt: { not: null },
         lastIncomingNoteExternalId: { not: null },
-        deal: {
-          deletedAt: null,
-          stage: { isWon: false, isLost: false },
-        },
+        stageIsWon: false,
+        stageIsLost: false,
       },
       orderBy: { lastIncomingAt: 'asc' },
       select: {
         dealId: true,
+        dealExternalId: true,
+        dealTitle: true,
+        dealAmount: true,
+        pipelineName: true,
+        stageName: true,
+        responsibleName: true,
+        responsibleExternalId: true,
+        groupName: true,
+        contactId: true,
+        contactExternalId: true,
+        contactName: true,
+        contactEmail: true,
         threadId: true,
         lastIncomingNoteExternalId: true,
         lastIncomingAt: true,
@@ -399,21 +411,41 @@ export class PlatformService {
         summary: true,
         attachCount: true,
         messages: true,
-        deal: {
-          select: {
-            id: true,
-            externalId: true,
-            title: true,
-            amount: true,
-            contactId: true,
-            pipeline: { select: { name: true } },
-            stage: { select: { name: true } },
-            responsible: { select: { name: true, externalId: true, group: { select: { name: true } } } },
-            contact: { select: { externalId: true, name: true, email: true } },
-          },
-        },
       },
     });
+    const states: EmailThreadStateView[] = factRows.map((state) => ({
+      dealId: state.dealId,
+      threadId: state.threadId,
+      lastIncomingNoteExternalId: state.lastIncomingNoteExternalId,
+      lastIncomingAt: state.lastIncomingAt,
+      subject: state.subject,
+      summary: state.summary,
+      attachCount: state.attachCount,
+      messages: state.messages,
+      deal: {
+        id: state.dealId,
+        externalId: state.dealExternalId,
+        title: state.dealTitle,
+        amount: state.dealAmount,
+        contactId: state.contactId,
+        pipeline: { name: state.pipelineName },
+        stage: { name: state.stageName },
+        responsible: state.responsibleName || state.responsibleExternalId || state.groupName
+          ? {
+            name: state.responsibleName ?? '',
+            externalId: state.responsibleExternalId ?? '',
+            group: state.groupName ? { name: state.groupName } : null,
+          }
+          : null,
+        contact: state.contactName || state.contactExternalId || state.contactEmail
+          ? {
+            externalId: state.contactExternalId ?? '',
+            name: state.contactName ?? '',
+            email: state.contactEmail,
+          }
+          : null,
+      },
+    }));
     const dealIds = [...new Set(states.map((state) => state.dealId))];
     const dismissals = dealIds.length
       ? await this.prisma.emailThreadDismissal.findMany({
@@ -549,10 +581,12 @@ export class PlatformService {
     for (const chunk of this.chunks(rows, EMAIL_THREAD_CREATE_BATCH_SIZE)) {
       await this.prisma.emailThreadState.createMany({ data: chunk, skipDuplicates: true });
     }
+    const factCounts = await this.facts.refreshEmailThreadFactsOnly(dealIds);
 
     return {
       total: rows.length,
       pending: rows.filter((row) => row.isPending).length,
+      factEmailThreads: factCounts.emailThreads,
     };
   }
 

@@ -2231,7 +2231,7 @@ ${sheets}
     if (metric.type === 'current_stage' || metric.type === 'weighted_stage_sum') {
       const stageIds = metric.stageIds?.filter(Boolean) ?? [];
       if (stageIds.length === 0) return [];
-      return applyMetricFilters(await this.findFilteredDeals({ ...scopedFilters, stageIds }, role));
+      return applyMetricFilters(await this.findCurrentStageDealsFromFacts({ ...scopedFilters, stageIds }, role));
     }
 
     if (metric.type === 'field_condition' && metric.fieldId) {
@@ -3184,15 +3184,13 @@ ${sheets}
   }
 
   private async computeDealCycleReport(filters: ReportFilters, role: UserRole) {
-    const deals = await this.findFilteredDeals(filters, role);
     const range = this.dateRange(filters);
-    const pipelineIds = filters.pipelineIds?.length
-      ? filters.pipelineIds
-      : [...new Set(deals.map((deal) => deal.pipelineId).filter(Boolean))];
+    const managers = await this.visibleManagers(role, filters.groupIds, filters.managerIds);
+    const managerIds = managers.map((manager) => manager.id);
 
     const stageRows = await this.db.pipelineStage.findMany({
       where: this.compactWhere({
-        pipelineId: pipelineIds.length ? { in: pipelineIds } : undefined,
+        pipelineId: filters.pipelineIds?.length ? { in: filters.pipelineIds } : undefined,
         isVisible: true,
       }),
       orderBy: [{ pipelineId: 'asc' }, { position: 'asc' }],
@@ -3209,34 +3207,8 @@ ${sheets}
 
     const timelineStages = stageRows.filter((stage) => !this.isBusinessWonStage(stage) && !this.isBusinessLostStage(stage));
     const timelineStageIds = new Set(timelineStages.map((stage) => stage.id));
-    const wonStageIds = new Set(stageRows.filter((stage) => this.isBusinessWonStage(stage)).map((stage) => stage.id));
-    const lostStageIds = new Set(stageRows.filter((stage) => this.isBusinessLostStage(stage)).map((stage) => stage.id));
-    const managers = await this.visibleManagers(role, filters.groupIds, filters.managerIds);
     const groups = new Map<string, { id: string; name: string }>();
     for (const manager of managers) groups.set(manager.id, { id: manager.id, name: manager.name });
-
-    const dealIds = deals.map((deal) => deal.id);
-    const history = dealIds.length
-      ? await this.db.dealStageHistory.findMany({
-          where: { dealId: { in: dealIds } },
-          orderBy: [{ dealId: 'asc' }, { movedAt: 'asc' }],
-          select: {
-            dealId: true,
-            fromStageId: true,
-            toStageId: true,
-            movedAt: true,
-          },
-        })
-      : [];
-
-    const historyByDeal = new Map<
-      string,
-      Array<{ dealId: string; fromStageId: string | null; toStageId: string; movedAt: Date }>
-    >();
-    for (const entry of history) {
-      if (!historyByDeal.has(entry.dealId)) historyByDeal.set(entry.dealId, []);
-      historyByDeal.get(entry.dealId)!.push(entry);
-    }
 
     const stageValues = new Map<string, Map<string, number[]>>();
     const stageSamples = new Map<string, Map<string, Array<{ dealId: string; dealExternalId: string; dealTitle: string; durationDays: number }>>>();
@@ -3272,40 +3244,45 @@ ${sheets}
       dealCounts.get(groupId)!.add(dealId);
       dealCounts.get(allGroupId)!.add(dealId);
     };
-    for (const deal of deals) {
-      const groupId = deal.responsibleId ?? 'unassigned';
-      const groupName = deal.responsible?.name ?? 'Без менеджера';
+    const factRows = managerIds.length ? await this.dealCycleFactRows(filters, managerIds, range) : [];
+    const terminalSuccessDealIds = new Set<string>();
+    const terminalLostDealIds = new Set<string>();
+    for (const row of factRows) {
+      const groupId = row.responsible_id ?? 'unassigned';
+      const groupName = row.responsible_name ?? 'Без менеджера';
       groups.set(groupId, { id: groupId, name: groupName });
 
-      const dealHistory = (historyByDeal.get(deal.id) ?? []).filter((entry) => entry.movedAt >= deal.createdAt);
+      const sample = {
+        dealId: row.deal_id,
+        dealExternalId: row.deal_external_id,
+        dealTitle: row.title,
+        durationDays: 0,
+      };
 
-      for (let index = 0; index < dealHistory.length; index += 1) {
-        const entry = dealHistory[index];
-        if (!timelineStageIds.has(entry.toStageId)) continue;
-        if (entry.fromStageId && entry.fromStageId === entry.toStageId) continue;
-
-        const exitEntry = dealHistory.slice(index + 1).find((nextEntry) => nextEntry.toStageId !== entry.toStageId);
-        if (!exitEntry || !this.isDateInRange(exitEntry.movedAt, range)) continue;
-        const duration = exitEntry ? this.durationDays(entry.movedAt, exitEntry.movedAt) : null;
-        if (duration === null) continue;
-
-        stageValuesFor(groupId, entry.toStageId).push(duration);
-        stageValuesFor(allGroupId, entry.toStageId).push(duration);
-        const sample = { dealId: deal.id, dealExternalId: deal.externalId, dealTitle: deal.title, durationDays: duration };
-        stageSamplesFor(groupId, entry.toStageId).push(sample);
-        stageSamplesFor(allGroupId, entry.toStageId).push(sample);
-        addDealToScope(groupId, deal.id);
+      if (!row.stage_is_won && !row.stage_is_lost && row.exited_at && timelineStageIds.has(row.stage_id)) {
+        const duration = this.durationDays(row.entered_at, row.exited_at);
+        if (duration !== null) {
+          sample.durationDays = duration;
+          stageValuesFor(groupId, row.stage_id).push(duration);
+          stageValuesFor(allGroupId, row.stage_id).push(duration);
+          stageSamplesFor(groupId, row.stage_id).push(sample);
+          stageSamplesFor(allGroupId, row.stage_id).push(sample);
+          addDealToScope(groupId, row.deal_id);
+        }
+        continue;
       }
 
-      const successAt = this.terminalCycleAt(deal, dealHistory, wonStageIds, (stage) => this.isBusinessWonStage(stage));
-      const lostAt = this.terminalCycleAt(deal, dealHistory, lostStageIds, (stage) => this.isBusinessLostStage(stage));
-      if (successAt && this.isDateInRange(successAt, range)) {
-        addCycleValue(successValues, groupId, this.terminalDurationDays(deal.createdAt, successAt));
-        addDealToScope(groupId, deal.id);
+      if (row.stage_is_won && !terminalSuccessDealIds.has(row.deal_id)) {
+        const duration = this.terminalDurationDays(row.created_at, row.entered_at);
+        addCycleValue(successValues, groupId, duration);
+        addDealToScope(groupId, row.deal_id);
+        terminalSuccessDealIds.add(row.deal_id);
       }
-      if (lostAt && this.isDateInRange(lostAt, range)) {
-        addCycleValue(lostValues, groupId, this.terminalDurationDays(deal.createdAt, lostAt));
-        addDealToScope(groupId, deal.id);
+      if (row.stage_is_lost && !terminalLostDealIds.has(row.deal_id)) {
+        const duration = this.terminalDurationDays(row.created_at, row.entered_at);
+        addCycleValue(lostValues, groupId, duration);
+        addDealToScope(groupId, row.deal_id);
+        terminalLostDealIds.add(row.deal_id);
       }
     }
 
@@ -3370,10 +3347,86 @@ ${sheets}
     };
   }
 
+  private async dealCycleFactRows(filters: ReportFilters, managerIds: string[], range?: Record<string, Date>) {
+    const where: Prisma.Sql[] = [
+      Prisma.sql`deal."deleted_at" IS NULL`,
+      Prisma.sql`deal."responsible_id" IN (${Prisma.join(managerIds)})`,
+    ];
+    if (filters.pipelineIds?.length) {
+      where.push(Prisma.sql`deal."pipeline_id" IN (${Prisma.join(filters.pipelineIds)})`);
+    }
+    if (filters.stageIds?.length) {
+      where.push(Prisma.sql`deal."stage_id" IN (${Prisma.join(filters.stageIds)})`);
+    }
+    if (filters.excludeStageIds?.length) {
+      where.push(Prisma.sql`deal."stage_id" NOT IN (${Prisma.join(filters.excludeStageIds)})`);
+    }
+    if (filters.lossReasonIds?.length) {
+      where.push(Prisma.sql`deal."loss_reason_id" IN (${Prisma.join(filters.lossReasonIds)})`);
+    }
+    if (filters.amountFrom !== undefined) where.push(Prisma.sql`deal."amount" >= ${filters.amountFrom}`);
+    if (filters.amountTo !== undefined) where.push(Prisma.sql`deal."amount" <= ${filters.amountTo}`);
+    if (filters.tagIncludes?.length) {
+      where.push(Prisma.sql`deal."tags" && ARRAY[${Prisma.join(filters.tagIncludes)}]::TEXT[]`);
+    }
+    for (const customFilter of filters.customFields ?? []) {
+      const condition = this.factCustomFieldCondition(customFilter);
+      if (condition) where.push(condition);
+    }
+
+    const exitedStageWhere: Prisma.Sql[] = [
+      Prisma.sql`stage_interval."stage_is_won" = false`,
+      Prisma.sql`stage_interval."stage_is_lost" = false`,
+      Prisma.sql`stage_interval."exited_at" IS NOT NULL`,
+    ];
+    if (range?.gte) exitedStageWhere.push(Prisma.sql`stage_interval."exited_at" >= ${range.gte}`);
+    if (range?.lte) exitedStageWhere.push(Prisma.sql`stage_interval."exited_at" <= ${range.lte}`);
+
+    const terminalWhere: Prisma.Sql[] = [
+      Prisma.sql`(stage_interval."stage_is_won" = true OR stage_interval."stage_is_lost" = true)`,
+    ];
+    if (range?.gte) terminalWhere.push(Prisma.sql`stage_interval."entered_at" >= ${range.gte}`);
+    if (range?.lte) terminalWhere.push(Prisma.sql`stage_interval."entered_at" <= ${range.lte}`);
+
+    where.push(Prisma.sql`((${Prisma.join(exitedStageWhere, ' AND ')}) OR (${Prisma.join(terminalWhere, ' AND ')}))`);
+
+    return this.prisma.$queryRaw<Array<{
+      deal_id: string;
+      deal_external_id: string;
+      title: string;
+      created_at: Date;
+      stage_id: string;
+      stage_is_won: boolean;
+      stage_is_lost: boolean;
+      responsible_id: string | null;
+      responsible_name: string | null;
+      entered_at: Date;
+      exited_at: Date | null;
+    }>>`
+      SELECT
+        stage_interval."deal_id",
+        stage_interval."deal_external_id",
+        deal."title",
+        deal."created_at",
+        stage_interval."stage_id",
+        stage_interval."stage_is_won",
+        stage_interval."stage_is_lost",
+        stage_interval."responsible_id",
+        stage_interval."responsible_name",
+        stage_interval."entered_at",
+        stage_interval."exited_at"
+      FROM "fact_deal_stage_interval" stage_interval
+      JOIN "fact_deal_current" deal ON deal."deal_id" = stage_interval."deal_id"
+      WHERE ${Prisma.join(where, ' AND ')}
+      ORDER BY stage_interval."deal_id" ASC, stage_interval."entered_at" ASC
+    `;
+  }
+
   private async computeLossReasonsReport(filters: ReportFilters, role: UserRole) {
     const range = this.dateRange(filters);
     const managers = await this.visibleManagers(role, filters.groupIds, filters.managerIds);
-    const managerIds = new Set(managers.map((manager) => manager.id));
+    const managerIds = managers.map((manager) => manager.id);
+    const managerIdSet = new Set(managerIds);
     const stageRows = await this.db.pipelineStage.findMany({
       where: this.compactWhere({
         pipelineId: filters.pipelineIds?.length ? { in: filters.pipelineIds } : undefined,
@@ -3396,29 +3449,14 @@ ${sheets}
       };
     }
 
-    const dealWhere = await this.buildDealWhere(filters, role, { ignoreStage: true, ignoreLossReason: true });
-    const entries = await this.db.dealStageHistory.findMany({
-      where: this.compactWhere({
-        toStageId: { in: lostStageIds },
-        movedAt: range,
-        deal: dealWhere,
-      }),
-      orderBy: [{ dealId: 'asc' }, { movedAt: 'asc' }],
-      include: {
-        deal: {
-          select: {
-            ...this.dealReportSelect(),
-            lossReason: { select: { id: true, name: true } },
-          },
-        },
-      },
-    });
+    const entries = managerIds.length
+      ? await this.lossReasonFactRows(filters, lostStageIds, managerIds, range)
+      : [];
 
-    const firstEntryByDeal = new Map<string, any>();
-    for (const entry of entries as any[]) {
-      if (firstEntryByDeal.has(entry.dealId)) continue;
-      if (!this.matchesCustomFieldFilters(entry.deal?.customFields as any, filters.customFields)) continue;
-      firstEntryByDeal.set(entry.dealId, entry);
+    const firstEntryByDeal = new Map<string, (typeof entries)[number]>();
+    for (const entry of entries) {
+      if (firstEntryByDeal.has(entry.deal_id)) continue;
+      firstEntryByDeal.set(entry.deal_id, entry);
     }
 
     const percent = (value: number, denominator: number) =>
@@ -3429,10 +3467,9 @@ ${sheets}
     let total = 0;
 
     for (const entry of firstEntryByDeal.values()) {
-      const deal = entry.deal;
-      const managerId = deal?.responsibleId;
-      if (!managerId || !managerIds.has(managerId)) continue;
-      const { reasonId, reasonName } = this.lossReasonFromCustomField(deal?.customFields as Record<string, any>);
+      const managerId = entry.responsible_id;
+      if (!managerId || !managerIdSet.has(managerId)) continue;
+      const { reasonId, reasonName } = this.lossReasonFromCustomField(entry.custom_fields as Record<string, any>);
       if (!valuesByReason.has(reasonId)) {
         valuesByReason.set(reasonId, {
           reasonId,
@@ -3477,15 +3514,57 @@ ${sheets}
     };
   }
 
+  private async lossReasonFactRows(
+    filters: ReportFilters,
+    lostStageIds: string[],
+    managerIds: string[],
+    range?: Record<string, Date>,
+  ) {
+    const where: Prisma.Sql[] = [
+      Prisma.sql`transition."to_stage_id" IN (${Prisma.join(lostStageIds)})`,
+      Prisma.sql`deal."deleted_at" IS NULL`,
+      Prisma.sql`deal."responsible_id" IN (${Prisma.join(managerIds)})`,
+    ];
+    if (filters.pipelineIds?.length) {
+      where.push(Prisma.sql`deal."pipeline_id" IN (${Prisma.join(filters.pipelineIds)})`);
+    }
+    if (range?.gte) where.push(Prisma.sql`transition."moved_at" >= ${range.gte}`);
+    if (range?.lte) where.push(Prisma.sql`transition."moved_at" <= ${range.lte}`);
+    if (filters.amountFrom !== undefined) where.push(Prisma.sql`deal."amount" >= ${filters.amountFrom}`);
+    if (filters.amountTo !== undefined) where.push(Prisma.sql`deal."amount" <= ${filters.amountTo}`);
+    if (filters.tagIncludes?.length) {
+      where.push(Prisma.sql`deal."tags" && ARRAY[${Prisma.join(filters.tagIncludes)}]::TEXT[]`);
+    }
+    for (const customFilter of filters.customFields ?? []) {
+      const condition = this.factCustomFieldCondition(customFilter);
+      if (condition) where.push(condition);
+    }
+
+    return this.prisma.$queryRaw<Array<{
+      deal_id: string;
+      responsible_id: string | null;
+      custom_fields: Prisma.JsonValue;
+      moved_at: Date;
+    }>>`
+      SELECT
+        transition."deal_id",
+        deal."responsible_id",
+        deal."custom_fields",
+        transition."moved_at"
+      FROM "fact_stage_transition" transition
+      JOIN "fact_deal_current" deal ON deal."deal_id" = transition."deal_id"
+      WHERE ${Prisma.join(where, ' AND ')}
+      ORDER BY transition."deal_id" ASC, transition."moved_at" ASC
+    `;
+  }
+
   private async computeCurrentStageAgeReport(filters: ReportFilters, role: UserRole) {
-    const deals = await this.findFilteredDeals(filters, role);
-    const pipelineIds = filters.pipelineIds?.length
-      ? filters.pipelineIds
-      : [...new Set(deals.map((deal) => deal.pipelineId).filter(Boolean))];
+    const managers = await this.visibleManagers(role, filters.groupIds, filters.managerIds);
+    const managerIds = managers.map((manager) => manager.id);
 
     const stageRows = await this.db.pipelineStage.findMany({
       where: this.compactWhere({
-        pipelineId: pipelineIds.length ? { in: pipelineIds } : undefined,
+        pipelineId: filters.pipelineIds?.length ? { in: filters.pipelineIds } : undefined,
         isVisible: true,
       }),
       orderBy: [{ pipelineId: 'asc' }, { position: 'asc' }],
@@ -3502,29 +3581,8 @@ ${sheets}
 
     const timelineStages = stageRows.filter((stage) => !this.isBusinessWonStage(stage) && !this.isBusinessLostStage(stage));
     const timelineStageIds = new Set(timelineStages.map((stage) => stage.id));
-    const managers = await this.visibleManagers(role, filters.groupIds, filters.managerIds);
     const groups = new Map<string, { id: string; name: string }>();
     for (const manager of managers) groups.set(manager.id, { id: manager.id, name: manager.name });
-
-    const openDeals = deals.filter((deal) => timelineStageIds.has(deal.stageId));
-    const dealIds = openDeals.map((deal) => deal.id);
-    const history = dealIds.length
-      ? await this.db.dealStageHistory.findMany({
-          where: { dealId: { in: dealIds } },
-          orderBy: [{ dealId: 'asc' }, { movedAt: 'asc' }],
-          select: {
-            dealId: true,
-            toStageId: true,
-            movedAt: true,
-          },
-        })
-      : [];
-
-    const historyByDeal = new Map<string, Array<{ dealId: string; toStageId: string; movedAt: Date }>>();
-    for (const entry of history) {
-      if (!historyByDeal.has(entry.dealId)) historyByDeal.set(entry.dealId, []);
-      historyByDeal.get(entry.dealId)!.push(entry);
-    }
 
     const stageValues = new Map<string, Map<string, number[]>>();
     const stageSamples = new Map<string, Map<string, Array<{ dealId: string; dealExternalId: string; dealTitle: string; durationDays: number }>>>();
@@ -3551,23 +3609,30 @@ ${sheets}
       dealCounts.get(allGroupId)!.add(dealId);
     };
 
-    for (const deal of openDeals) {
-      const groupId = deal.responsibleId ?? 'unassigned';
-      const groupName = deal.responsible?.name ?? 'Без менеджера';
+    const factRows = managerIds.length
+      ? await this.currentStageAgeFactRows(filters, managerIds)
+      : [];
+
+    for (const deal of factRows) {
+      if (!timelineStageIds.has(deal.stage_id)) continue;
+      const groupId = deal.responsible_id ?? 'unassigned';
+      const groupName = deal.responsible_name ?? 'Без менеджера';
       groups.set(groupId, { id: groupId, name: groupName });
 
-      const dealHistory = historyByDeal.get(deal.id) ?? [];
-      const currentStageEntry = [...dealHistory].reverse().find((entry) => entry.toStageId === deal.stageId);
-      const enteredAt = currentStageEntry?.movedAt ?? deal.createdAt;
-      const duration = this.durationDays(enteredAt, now);
+      const duration = this.durationDays(deal.entered_at, now);
       if (duration === null) continue;
 
-      stageValuesFor(groupId, deal.stageId).push(duration);
-      stageValuesFor(allGroupId, deal.stageId).push(duration);
-      const sample = { dealId: deal.id, dealExternalId: deal.externalId, dealTitle: deal.title, durationDays: duration };
-      stageSamplesFor(groupId, deal.stageId).push(sample);
-      stageSamplesFor(allGroupId, deal.stageId).push(sample);
-      addDealToScope(groupId, deal.id);
+      stageValuesFor(groupId, deal.stage_id).push(duration);
+      stageValuesFor(allGroupId, deal.stage_id).push(duration);
+      const sample = {
+        dealId: deal.deal_id,
+        dealExternalId: deal.deal_external_id,
+        dealTitle: deal.title,
+        durationDays: duration,
+      };
+      stageSamplesFor(groupId, deal.stage_id).push(sample);
+      stageSamplesFor(allGroupId, deal.stage_id).push(sample);
+      addDealToScope(groupId, deal.deal_id);
     }
 
     const buildStageItems = (groupId: string) =>
@@ -3630,6 +3695,96 @@ ${sheets}
     };
   }
 
+  private async currentStageAgeFactRows(filters: ReportFilters, managerIds: string[]) {
+    const where: Prisma.Sql[] = [
+      Prisma.sql`stage_interval."is_current" = true`,
+      Prisma.sql`stage_interval."stage_is_won" = false`,
+      Prisma.sql`stage_interval."stage_is_lost" = false`,
+      Prisma.sql`deal."deleted_at" IS NULL`,
+      Prisma.sql`stage_interval."responsible_id" IN (${Prisma.join(managerIds)})`,
+    ];
+
+    if (filters.pipelineIds?.length) {
+      where.push(Prisma.sql`stage_interval."pipeline_id" IN (${Prisma.join(filters.pipelineIds)})`);
+    }
+    if (filters.stageIds?.length) {
+      where.push(Prisma.sql`stage_interval."stage_id" IN (${Prisma.join(filters.stageIds)})`);
+    }
+    if (filters.excludeStageIds?.length) {
+      where.push(Prisma.sql`stage_interval."stage_id" NOT IN (${Prisma.join(filters.excludeStageIds)})`);
+    }
+    if (filters.lossReasonIds?.length) {
+      where.push(Prisma.sql`deal."loss_reason_id" IN (${Prisma.join(filters.lossReasonIds)})`);
+    }
+    if (filters.amountFrom !== undefined) {
+      where.push(Prisma.sql`deal."amount" >= ${filters.amountFrom}`);
+    }
+    if (filters.amountTo !== undefined) {
+      where.push(Prisma.sql`deal."amount" <= ${filters.amountTo}`);
+    }
+    if (filters.tagIncludes?.length) {
+      where.push(Prisma.sql`deal."tags" && ARRAY[${Prisma.join(filters.tagIncludes)}]::TEXT[]`);
+    }
+    for (const customFilter of filters.customFields ?? []) {
+      const condition = this.factCustomFieldCondition(customFilter);
+      if (condition) where.push(condition);
+    }
+
+    return this.prisma.$queryRaw<Array<{
+      deal_id: string;
+      deal_external_id: string;
+      title: string;
+      stage_id: string;
+      responsible_id: string | null;
+      responsible_name: string | null;
+      entered_at: Date;
+    }>>`
+      SELECT
+        stage_interval."deal_id",
+        stage_interval."deal_external_id",
+        deal."title",
+        stage_interval."stage_id",
+        stage_interval."responsible_id",
+        stage_interval."responsible_name",
+        stage_interval."entered_at"
+      FROM "fact_deal_stage_interval" stage_interval
+      JOIN "fact_deal_current" deal ON deal."deal_id" = stage_interval."deal_id"
+      WHERE ${Prisma.join(where, ' AND ')}
+      ORDER BY stage_interval."responsible_name" ASC, stage_interval."stage_position" ASC, stage_interval."entered_at" ASC
+    `;
+  }
+
+  private factCustomFieldCondition(filter: NonNullable<ReportFilters['customFields']>[number]) {
+    if (!filter.fieldId) return null;
+    if (filter.operator === 'is_set') {
+      return Prisma.sql`deal."custom_fields" ? ${filter.fieldId}`;
+    }
+
+    const fieldText = Prisma.sql`LOWER(CAST(deal."custom_fields" -> ${filter.fieldId} AS TEXT))`;
+    const expectedText = String(filter.value ?? '').toLowerCase();
+    if (filter.operator === 'contains') {
+      return Prisma.sql`${fieldText} LIKE ${`%${expectedText}%`}`;
+    }
+    if (filter.operator === 'equals') {
+      return Prisma.sql`${fieldText} LIKE ${`%${expectedText}%`}`;
+    }
+
+    const numericValue = this.toNumber(filter.value);
+    if (numericValue === null) return null;
+    const numericField = Prisma.sql`
+      CASE
+        WHEN COALESCE(deal."custom_fields" -> ${filter.fieldId} ->> 'value', deal."custom_fields" ->> ${filter.fieldId}, '') ~ '^-?[0-9]+([\\.,][0-9]+)?$'
+        THEN REPLACE(COALESCE(deal."custom_fields" -> ${filter.fieldId} ->> 'value', deal."custom_fields" ->> ${filter.fieldId}), ',', '.')::NUMERIC
+        ELSE NULL
+      END
+    `;
+    if (filter.operator === 'lt') return Prisma.sql`${numericField} < ${numericValue}`;
+    if (filter.operator === 'lte') return Prisma.sql`${numericField} <= ${numericValue}`;
+    if (filter.operator === 'gt') return Prisma.sql`${numericField} > ${numericValue}`;
+    if (filter.operator === 'gte') return Prisma.sql`${numericField} >= ${numericValue}`;
+    return null;
+  }
+
   private currentStageTotal(
     stages: Array<{
       avgDays: number | null;
@@ -3660,7 +3815,7 @@ ${sheets}
   }
 
   private async computeCurrentSnapshot(filters: ReportFilters, role: UserRole) {
-    const deals = await this.findFilteredDeals(filters, role);
+    const deals = await this.findCurrentStageDealsFromFacts(filters, role);
     const totalAmount = deals.reduce((sum, deal) => sum + Number(deal.amount), 0);
 
     return {
@@ -3829,7 +3984,7 @@ ${sheets}
       addDeal(this.revenueForecastShippedBucket(deal, refs), deal, 1, 'Отгружено', shippedAt, null, 0);
     }
 
-    const assemblyDeals = (await this.findFilteredDeals(this.fixedPipelineFilters(filters, refs.assemblyPipeline!.id, undefined, { ignoreTeam: true }), role))
+    const assemblyDeals = (await this.findCurrentStageDealsFromFacts(this.fixedPipelineFilters(filters, refs.assemblyPipeline!.id, undefined, { ignoreTeam: true }), role))
       .filter((deal) => !this.isBusinessWonStage(deal.stage) && !this.isBusinessLostStage(deal.stage));
     const assemblyEntryByDeal = await this.firstStageEntryByDeal(assemblyDeals.map((deal) => deal.id), shippingStageIds);
     for (const deal of assemblyDeals) {
@@ -3840,7 +3995,7 @@ ${sheets}
       addDeal(this.revenueForecastShippingBucket(deal, refs, predictedShipAt <= monthTo), deal, 1, 'Сборка', predictedShipAt, null, remainingDays);
     }
 
-    const invoiceDeals = await this.findFilteredDeals(
+    const invoiceDeals = await this.findCurrentStageDealsFromFacts(
       this.fixedPipelineFilters(filters, refs.salesPipeline!.id, [refs.invoiceStage!.id]),
       role,
     );
@@ -3858,7 +4013,7 @@ ${sheets}
       );
     }
 
-    const quoteDeals = await this.findFilteredDeals(
+    const quoteDeals = await this.findCurrentStageDealsFromFacts(
       this.fixedPipelineFilters(filters, refs.salesPipeline!.id, refs.quoteStages.map((stage) => stage.id)),
       role,
     );
@@ -3878,7 +4033,7 @@ ${sheets}
 
     for (const pipeline of repeatSpeeds) {
       if (pipeline.invoiceStage && pipeline.invoiceSpeed && pipeline.invoiceProbability) {
-        const deals = await this.findFilteredDeals(
+        const deals = await this.findCurrentStageDealsFromFacts(
           this.fixedPipelineFilters(filters, pipeline.id, [pipeline.invoiceStage.id]),
           role,
         );
@@ -3898,7 +4053,7 @@ ${sheets}
       }
 
       if (pipeline.quoteStages.length && pipeline.quoteSpeed && pipeline.quoteProbability) {
-        const deals = await this.findFilteredDeals(
+        const deals = await this.findCurrentStageDealsFromFacts(
           this.fixedPipelineFilters(filters, pipeline.id, pipeline.quoteStages.map((stage) => stage.id)),
           role,
         );
@@ -4621,7 +4776,7 @@ ${sheets}
       );
     }
     if (step.type === 'current_stage' && step.stageId) {
-      const deals = await this.findFilteredDeals({ ...filters, stageIds: [step.stageId] }, role);
+      const deals = await this.findCurrentStageDealsFromFacts({ ...filters, stageIds: [step.stageId] }, role);
       return deals.map((deal) => deal.id);
     }
     if (step.type === 'current_field' && step.fieldId) {
@@ -4647,16 +4802,40 @@ ${sheets}
 
   private async findDealIdsFromHistoryMany(stageIds: string[], filters: ReportFilters, role: UserRole, fromStageId?: string) {
     const range = this.dateRange(filters);
-    const history = await this.db.dealStageHistory.findMany({
-      where: {
-        toStageId: { in: stageIds },
-        fromStageId: fromStageId || undefined,
-        movedAt: range,
-        deal: await this.buildDealWhere(filters, role, { ignorePipeline: true, ignoreStage: true }),
-      },
-      orderBy: [{ dealId: 'asc' }, { movedAt: 'asc' }],
-      select: { dealId: true, movedAt: true },
-    });
+    const managerIds = await this.visibleManagerIds(role, filters.groupIds);
+    const allowedManagerIds = filters.managerIds?.length
+      ? filters.managerIds.filter((id) => managerIds.includes(id))
+      : managerIds;
+    if (!allowedManagerIds.length) return [];
+
+    const where: Prisma.Sql[] = [
+      Prisma.sql`transition."to_stage_id" IN (${Prisma.join(stageIds)})`,
+      Prisma.sql`deal."deleted_at" IS NULL`,
+      Prisma.sql`deal."responsible_id" IN (${Prisma.join(allowedManagerIds)})`,
+    ];
+    if (fromStageId) where.push(Prisma.sql`transition."from_stage_id" = ${fromStageId}`);
+    if (range?.gte) where.push(Prisma.sql`transition."moved_at" >= ${range.gte}`);
+    if (range?.lte) where.push(Prisma.sql`transition."moved_at" <= ${range.lte}`);
+    if (filters.lossReasonIds?.length) {
+      where.push(Prisma.sql`deal."loss_reason_id" IN (${Prisma.join(filters.lossReasonIds)})`);
+    }
+    if (filters.amountFrom !== undefined) where.push(Prisma.sql`deal."amount" >= ${filters.amountFrom}`);
+    if (filters.amountTo !== undefined) where.push(Prisma.sql`deal."amount" <= ${filters.amountTo}`);
+    if (filters.tagIncludes?.length) {
+      where.push(Prisma.sql`deal."tags" && ARRAY[${Prisma.join(filters.tagIncludes)}]::TEXT[]`);
+    }
+    for (const customFilter of filters.customFields ?? []) {
+      const condition = this.factCustomFieldCondition(customFilter);
+      if (condition) where.push(condition);
+    }
+
+    const history = await this.prisma.$queryRaw<Array<{ dealId: string; movedAt: Date }>>`
+      SELECT transition."deal_id" AS "dealId", transition."moved_at" AS "movedAt"
+      FROM "fact_stage_transition" transition
+      JOIN "fact_deal_current" deal ON deal."deal_id" = transition."deal_id"
+      WHERE ${Prisma.join(where, ' AND ')}
+      ORDER BY transition."deal_id" ASC, transition."moved_at" ASC
+    `;
 
     const firstEntryByDeal = new Map<string, { dealId: string; movedAt: Date }>();
     for (const entry of history) {
@@ -4667,14 +4846,13 @@ ${sheets}
     if (!firstEntries.length) return [];
 
     const maxMovedAt = new Date(Math.max(...firstEntries.map((entry) => entry.movedAt.getTime())));
-    const previousEntries = await this.db.dealStageHistory.findMany({
-      where: {
-        dealId: { in: firstEntries.map((entry) => entry.dealId) },
-        toStageId: { in: stageIds },
-        movedAt: { lt: maxMovedAt },
-      },
-      select: { dealId: true, movedAt: true },
-    });
+    const previousEntries = await this.prisma.$queryRaw<Array<{ dealId: string; movedAt: Date }>>`
+      SELECT transition."deal_id" AS "dealId", transition."moved_at" AS "movedAt"
+      FROM "fact_stage_transition" transition
+      WHERE transition."deal_id" IN (${Prisma.join(firstEntries.map((entry) => entry.dealId))})
+        AND transition."to_stage_id" IN (${Prisma.join(stageIds)})
+        AND transition."moved_at" < ${maxMovedAt}
+    `;
     const repeatedDealIds = new Set<string>();
     for (const entry of previousEntries) {
       const current = firstEntryByDeal.get(entry.dealId);
@@ -4703,6 +4881,79 @@ ${sheets}
       orderBy: { updatedAt: 'desc' },
     });
     return deals.filter((deal) => this.matchesCustomFieldFilters(deal.customFields as any, filters.customFields));
+  }
+
+  private async findCurrentStageDealsFromFacts(filters: ReportFilters, role: UserRole) {
+    const where: Prisma.FactDealCurrentWhereInput = { deletedAt: null };
+    const visibleManagerIds = await this.visibleManagerIds(role, filters.groupIds);
+    const responsibleIds = filters.managerIds?.length
+      ? filters.managerIds.filter((id) => visibleManagerIds.includes(id))
+      : visibleManagerIds;
+
+    if (filters.pipelineIds?.length) where.pipelineId = { in: filters.pipelineIds };
+    if (filters.stageIds?.length || filters.excludeStageIds?.length) {
+      where.stageId = {};
+      if (filters.stageIds?.length) where.stageId.in = filters.stageIds;
+      if (filters.excludeStageIds?.length) where.stageId.notIn = filters.excludeStageIds;
+    }
+    where.responsibleId = { in: responsibleIds };
+    if (filters.lossReasonIds?.length) where.lossReasonId = { in: filters.lossReasonIds };
+    if (filters.amountFrom !== undefined || filters.amountTo !== undefined) {
+      where.amount = {};
+      if (filters.amountFrom !== undefined) where.amount.gte = filters.amountFrom;
+      if (filters.amountTo !== undefined) where.amount.lte = filters.amountTo;
+    }
+    if (filters.tagIncludes?.length) where.tags = { hasSome: filters.tagIncludes };
+
+    const rows = await this.prisma.factDealCurrent.findMany({
+      where,
+      orderBy: { updatedAt: 'desc' },
+    });
+
+    return rows
+      .filter((deal) => this.matchesCustomFieldFilters(deal.customFields as any, filters.customFields))
+      .map((deal) => this.factDealToReportDeal(deal));
+  }
+
+  private factDealToReportDeal(deal: Prisma.FactDealCurrentGetPayload<Record<string, never>>) {
+    return {
+      id: deal.dealId,
+      externalId: deal.dealExternalId,
+      title: deal.title,
+      amount: deal.amount,
+      currency: deal.currency,
+      source: deal.source,
+      tags: deal.tags,
+      customFields: deal.customFields,
+      createdAt: deal.createdAt,
+      updatedAt: deal.updatedAt,
+      closedAt: deal.closedAt,
+      expectedCloseAt: deal.expectedCloseAt,
+      pipelineId: deal.pipelineId,
+      stageId: deal.stageId,
+      responsibleId: deal.responsibleId,
+      lossReasonId: deal.lossReasonId,
+      pipeline: { id: deal.pipelineId, name: deal.pipelineName },
+      stage: {
+        id: deal.stageId,
+        name: deal.stageName,
+        isWon: deal.stageIsWon,
+        isLost: deal.stageIsLost,
+      },
+      lossReason: deal.lossReasonId || deal.lossReasonName
+        ? { id: deal.lossReasonId, name: deal.lossReasonName }
+        : null,
+      responsible: deal.responsibleId || deal.responsibleName || deal.groupId || deal.groupName
+        ? {
+          id: deal.responsibleId,
+          name: deal.responsibleName ?? 'Без менеджера',
+          groupId: deal.groupId,
+          isActive: true,
+          isVisible: true,
+          group: deal.groupId || deal.groupName ? { id: deal.groupId, name: deal.groupName } : null,
+        }
+        : null,
+    };
   }
 
   private dealReportSelect() {

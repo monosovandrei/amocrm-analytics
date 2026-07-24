@@ -9,6 +9,7 @@ import { PlatformModule } from './platform/platform.module';
 import { PlatformSchedulerService } from './platform/platform-scheduler.service';
 import { AmoModule } from './amo/amo.module';
 import { AmoSchedulerService } from './amo/amo-scheduler.service';
+import { WorkerRuntimeService } from './common/worker-runtime.service';
 
 @Module({
   imports: [
@@ -20,6 +21,6 @@ import { AmoSchedulerService } from './amo/amo-scheduler.service';
     PlatformModule,
     AmoModule,
   ],
-  providers: [AmoSchedulerService, PlatformSchedulerService, ReportsSchedulerService],
+  providers: [AmoSchedulerService, PlatformSchedulerService, ReportsSchedulerService, WorkerRuntimeService],
 })
 export class WorkerModule {}

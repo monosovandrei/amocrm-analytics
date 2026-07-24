@@ -5,10 +5,11 @@ import { AmoSyncService } from './amo-sync.service';
 import { AmoService } from './amo.service';
 import { AmoWebhookController } from './amo-webhook.controller';
 import { AuditModule } from '../audit/audit.module';
+import { FactMartsModule } from '../facts/fact-marts.module';
 import { PlatformModule } from '../platform/platform.module';
 
 @Module({
-  imports: [AuditModule, PlatformModule],
+  imports: [AuditModule, FactMartsModule, PlatformModule],
   controllers: [AmoController, AmoWebhookController],
   providers: [AmoClientFactory, AmoService, AmoSyncService],
   exports: [AmoService, AmoSyncService],

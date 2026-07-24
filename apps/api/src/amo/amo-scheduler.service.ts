@@ -278,10 +278,10 @@ export class AmoSchedulerService {
 
   private getRecentReconcileIntervalSeconds() {
     const rawInterval = this.config.get<string>('AMOCRM_RECENT_RECONCILE_INTERVAL_SECONDS');
-    if (!rawInterval) return 0;
+    if (!rawInterval) return 60;
 
     const parsed = Number(rawInterval);
-    return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
+    return Number.isFinite(parsed) ? Math.max(0, parsed) : 60;
   }
 
   private getLeadSlaReconcileIntervalSeconds() {

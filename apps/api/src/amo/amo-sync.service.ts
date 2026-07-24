@@ -7,6 +7,7 @@ import { AmoClient } from './amo-client';
 import { AmoService } from './amo.service';
 import { AmoSyncMaps } from './amo.types';
 import { AuditService } from '../audit/audit.service';
+import { FactMartsService } from '../facts/fact-marts.service';
 import { CrmEventNotificationsService } from '../platform/crm-event-notifications.service';
 import { PlatformService } from '../platform/platform.service';
 
@@ -33,6 +34,7 @@ export class AmoSyncService {
     private readonly audit: AuditService,
     private readonly crmEventNotifications: CrmEventNotificationsService,
     private readonly platform: PlatformService,
+    private readonly facts: FactMartsService,
     private readonly config: ConfigService,
   ) {}
 
@@ -431,6 +433,7 @@ export class AmoSyncService {
       await this.hydrateMetadataMaps(maps);
       await this.syncRecentDeals(client, maps, stats, updatedSince);
       await this.syncRecentStageEvents(client, maps, stats, updatedSince);
+      await this.refreshRecentFactMarts(stats);
 
       await this.updateConnectionConfig(connection.id, {
         recentReconcileAt: startedAt.toISOString(),
@@ -469,6 +472,7 @@ export class AmoSyncService {
       const maps = this.emptyMaps();
       await this.hydrateMetadataMaps(maps);
       await this.reconcileLeadSlaDeals(client, maps, stats);
+      await this.refreshRecentFactMarts(stats);
 
       await this.updateConnectionConfig(connection.id, {
         leadSlaReconcileAt: startedAt.toISOString(),
@@ -759,16 +763,23 @@ export class AmoSyncService {
 
   private getRecentReconcileLookbackMinutes() {
     const rawMinutes = this.config.get<string>('AMOCRM_RECENT_RECONCILE_LOOKBACK_MINUTES');
-    if (!rawMinutes) return 24 * 60;
+    if (!rawMinutes) return 10;
     const parsed = Number(rawMinutes);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : 24 * 60;
+    return Number.isFinite(parsed) && parsed > 0 ? Math.min(10, parsed) : 10;
   }
 
   private getRecentReconcileOverlapMinutes() {
     const rawMinutes = this.config.get<string>('AMOCRM_RECENT_RECONCILE_OVERLAP_MINUTES');
-    if (!rawMinutes) return 60;
+    if (!rawMinutes) return 2;
     const parsed = Number(rawMinutes);
-    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 60;
+    return Number.isFinite(parsed) && parsed >= 0 ? Math.min(5, parsed) : 2;
+  }
+
+  private getRecentFactRefreshMinutes() {
+    const rawMinutes = this.config.get<string>('FACT_MART_RECENT_REFRESH_MINUTES');
+    if (!rawMinutes) return 15;
+    const parsed = Number(rawMinutes);
+    return Number.isFinite(parsed) && parsed > 0 ? Math.min(30, parsed) : 15;
   }
 
   private getRecentReconcileMaxDeals() {
@@ -908,6 +919,8 @@ export class AmoSyncService {
         await this.syncOptional('entityLinks', stats, () => this.syncEntityLinks(client, stats));
         await this.recalculateStageProbabilities();
       }
+      await this.touchJob(jobId, 'fact_marts');
+      await this.refreshFactMartsForPullJob(isFullSync, stats);
       await this.touchJob(jobId, 'notifications');
       await this.processCrmNotifications(stats, notificationSince, client.domain);
 
@@ -1021,6 +1034,10 @@ export class AmoSyncService {
           { includeStateScans: false },
         );
       }
+      if (actionableGroups.length > 0) {
+        await this.touchJob(jobId, 'fact_marts');
+        await this.refreshRecentFactMarts(stats);
+      }
 
       const finishedAt = new Date();
       await this.prisma.syncJob.update({
@@ -1093,6 +1110,24 @@ export class AmoSyncService {
     this.compactHeapAfterHeavySync();
     stats.emailThreadStates = result.total;
     stats.pendingEmailThreadStates = result.pending;
+  }
+
+  private async refreshFactMartsForPullJob(isFullSync: boolean, stats: Record<string, number>) {
+    const counts = isFullSync
+      ? await this.facts.refreshAll()
+      : await this.facts.refreshRecentlyChanged(this.getRecentFactRefreshMinutes());
+    this.addFactStats(stats, counts);
+  }
+
+  private async refreshRecentFactMarts(stats: Record<string, number>) {
+    const counts = await this.facts.refreshRecentlyChanged(this.getRecentFactRefreshMinutes());
+    this.addFactStats(stats, counts);
+  }
+
+  private addFactStats(stats: Record<string, number>, counts: Record<string, number>) {
+    for (const [key, value] of Object.entries(counts)) {
+      stats[`fact_${key}`] = value;
+    }
   }
 
   private compactHeapAfterHeavySync() {

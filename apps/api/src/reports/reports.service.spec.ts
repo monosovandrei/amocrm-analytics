@@ -1239,13 +1239,24 @@ function createPrismaMock() {
       ],
     },
   ];
+  const factDeals = factDealCurrentRows();
+  const factIntervals = factDealStageIntervals();
   return {
     $transaction: jest.fn(function (this: any, callback: any) {
       return callback(this);
     }),
     $executeRawUnsafe: jest.fn(() => Promise.resolve(undefined)),
     $queryRawUnsafe: jest.fn(() => Promise.resolve([])),
-    $queryRaw: jest.fn(() => Promise.resolve([])),
+    $queryRaw: jest.fn((strings: any, ...values: any[]) => {
+      const sql = flattenSql(strings, values);
+      if (sql.text.includes('FROM "fact_deal_stage_interval"')) {
+        return Promise.resolve(mockFactIntervalQuery(sql, factIntervals));
+      }
+      if (sql.text.includes('FROM "fact_stage_transition"')) {
+        return Promise.resolve(mockFactTransitionQuery(sql));
+      }
+      return Promise.resolve([]);
+    }),
     amoConnection: {
       findFirst: jest.fn(() => Promise.resolve(null)),
     },
@@ -1307,6 +1318,15 @@ function createPrismaMock() {
         }));
       }),
     },
+    factDealCurrent: {
+      findMany: jest.fn(({ where, orderBy }: any = {}) => {
+        let rows = factDeals.filter((deal) => matchesFactDealWhere(deal, where ?? {}));
+        if (orderBy?.updatedAt === 'desc') {
+          rows = [...rows].sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime());
+        }
+        return Promise.resolve(rows);
+      }),
+    },
     dealStageHistory: {
       findMany: jest.fn(({ where, distinct, select, include, orderBy }: any = {}) => {
         let rows = history.filter((entry) => matchesHistoryWhere(entry, where ?? {}));
@@ -1359,6 +1379,178 @@ function createPrismaMock() {
   };
 }
 
+function factDealCurrentRows() {
+  return deals.map((deal) => ({
+    dealId: deal.id,
+    dealExternalId: deal.id,
+    pipelineId: deal.pipelineId,
+    pipelineName: deal.pipeline.name,
+    stageId: deal.stageId,
+    stageName: deal.stage.name,
+    stagePosition: 0,
+    stageColor: null,
+    stageIsWon: deal.stage.isWon,
+    stageIsLost: deal.stage.isLost,
+    responsibleId: deal.responsibleId,
+    responsibleName: deal.responsible?.name ?? null,
+    responsibleExternalId: null,
+    groupId: deal.responsible?.groupId ?? null,
+    groupName: deal.responsible?.group?.name ?? null,
+    contactId: null,
+    contactExternalId: null,
+    contactName: null,
+    contactEmail: null,
+    lossReasonId: deal.lossReasonId,
+    lossReasonName: (deal as any).lossReason?.name ?? null,
+    title: deal.title,
+    amount: deal.amount,
+    currency: 'EUR',
+    source: null,
+    tags: [],
+    customFields: deal.customFields,
+    closedAt: 'closedAt' in deal ? deal.closedAt ?? null : null,
+    expectedCloseAt: null,
+    createdAt: deal.createdAt,
+    updatedAt: deal.updatedAt,
+    deletedAt: deal.deletedAt,
+    factUpdatedAt: deal.updatedAt,
+  }));
+}
+
+function factDealStageIntervals() {
+  const stageById = new Map(Object.values(stages).map((stage) => [stage.id, stage]));
+  const result: any[] = [];
+  for (const deal of deals) {
+    const entries = history
+      .filter((entry) => entry.dealId === deal.id)
+      .sort((a, b) => a.movedAt.getTime() - b.movedAt.getTime());
+    if (!entries.length) {
+      const stage = stageById.get(deal.stageId)!;
+      result.push(factIntervalRow(deal, stage, deal.createdAt, null, true));
+      continue;
+    }
+    entries.forEach((entry, index) => {
+      const next = entries[index + 1] ?? null;
+      const stage = stageById.get(entry.toStageId)!;
+      result.push(factIntervalRow(deal, stage, entry.movedAt, next?.movedAt ?? null, !next));
+    });
+  }
+  return result;
+}
+
+function factIntervalRow(deal: any, stage: any, enteredAt: Date, exitedAt: Date | null, isCurrent: boolean) {
+  return {
+    deal_id: deal.id,
+    deal_external_id: deal.id,
+    title: deal.title,
+    created_at: deal.createdAt,
+    pipeline_id: stage.pipelineId,
+    stage_id: stage.id,
+    stage_is_won: stage.isWon,
+    stage_is_lost: stage.isLost,
+    responsible_id: deal.responsibleId,
+    responsible_name: deal.responsible?.name ?? null,
+    entered_at: enteredAt,
+    exited_at: exitedAt,
+    is_current: isCurrent,
+  };
+}
+
+function flattenSql(strings: any, values: any[] = []): { text: string; values: any[] } {
+  if (strings?.strings && strings?.values) return flattenSql(strings.strings, strings.values);
+  if (!Array.isArray(strings)) return { text: String(strings ?? ''), values };
+
+  let text = '';
+  const flatValues: any[] = [];
+  strings.forEach((part: string, index: number) => {
+    text += part;
+    if (index >= values.length) return;
+    const value = values[index];
+    if (value?.strings && value?.values) {
+      const nested = flattenSql(value.strings, value.values);
+      text += nested.text;
+      flatValues.push(...nested.values);
+    } else {
+      text += '?';
+      flatValues.push(value);
+    }
+  });
+  return { text, values: flatValues };
+}
+
+function mockFactIntervalQuery(sql: { text: string; values: any[] }, rows: any[]) {
+  const managerIds = sql.values.filter((value) => typeof value === 'string' && value.startsWith('manager-'));
+  const pipelineIds = sql.values.filter((value) => typeof value === 'string' && value.startsWith('pipe-'));
+  const stageIds = sql.values.filter((value) => typeof value === 'string' && value.startsWith('stage-'));
+  const dates = sql.values.filter((value) => value instanceof Date) as Date[];
+  const [from, to] = dates;
+
+  return rows.filter((row) => {
+    if (managerIds.length && !managerIds.includes(row.responsible_id)) return false;
+    if (pipelineIds.length && !pipelineIds.includes(row.pipeline_id)) return false;
+    if (sql.text.includes('"is_current" = true')) {
+      return row.is_current && !row.stage_is_won && !row.stage_is_lost;
+    }
+    if (!row.stage_is_won && !row.stage_is_lost) {
+      if (!row.exited_at) return false;
+      if (from && row.exited_at < from) return false;
+      if (to && row.exited_at > to) return false;
+      return true;
+    }
+    if (stageIds.length && !stageIds.includes(row.stage_id)) return false;
+    if (from && row.entered_at < from) return false;
+    if (to && row.entered_at > to) return false;
+    return true;
+  });
+}
+
+function mockFactTransitionQuery(sql: { text: string; values: any[] }) {
+  const leadingStageIds: string[] = [];
+  for (const value of sql.values) {
+    if (typeof value === 'string' && value.startsWith('stage-')) {
+      leadingStageIds.push(value);
+      continue;
+    }
+    if (leadingStageIds.length) break;
+  }
+  const allStageIds = sql.values.filter((value) => typeof value === 'string' && value.startsWith('stage-'));
+  const stageIds = leadingStageIds.length ? leadingStageIds : allStageIds;
+  const fromStageId = sql.text.includes('"from_stage_id" =')
+    ? allStageIds.find((stageId) => !stageIds.includes(stageId)) ?? null
+    : null;
+  const managerIds = sql.values.filter((value) => typeof value === 'string' && value.startsWith('manager-'));
+  const dealIds = sql.values.filter((value) => typeof value === 'string' && value.startsWith('deal-'));
+  const dates = sql.values.filter((value) => value instanceof Date) as Date[];
+  const [from, to] = dates;
+  const upperBoundOnly = /"moved_at"\s*<\s*\?/.test(sql.text);
+  const rows = history.filter((entry) => {
+    const deal = deals.find((item) => item.id === entry.dealId);
+    if (!deal) return false;
+    if (stageIds.length && !stageIds.includes(entry.toStageId)) return false;
+    if (fromStageId && entry.fromStageId !== fromStageId) return false;
+    if (dealIds.length && !dealIds.includes(entry.dealId)) return false;
+    if (managerIds.length && !managerIds.includes(deal.responsibleId)) return false;
+    if (upperBoundOnly && from && entry.movedAt >= from) return false;
+    if (!upperBoundOnly && from && entry.movedAt < from) return false;
+    if (!upperBoundOnly && to && entry.movedAt > to) return false;
+    return true;
+  });
+
+  if (sql.text.includes('AS "dealId"')) {
+    return rows.map((entry) => ({ dealId: entry.dealId, movedAt: entry.movedAt }));
+  }
+
+  return rows.map((entry) => {
+    const deal = deals.find((item) => item.id === entry.dealId)!;
+    return {
+      deal_id: entry.dealId,
+      responsible_id: deal.responsibleId,
+      custom_fields: deal.customFields,
+      moved_at: entry.movedAt,
+    };
+  });
+}
+
 function matchesCrmUserWhere(manager: (typeof managers)[keyof typeof managers], where: Where) {
   if (where.isActive !== undefined && manager.isActive !== where.isActive) return false;
   if (where.isVisible !== undefined && manager.isVisible !== where.isVisible) return false;
@@ -1400,6 +1592,17 @@ function matchesHistoryWhere(entry: (typeof history)[number], where: Where) {
 function matchesDealWhere(deal: (typeof deals)[number], where: Where) {
   if (where.deletedAt === null && deal.deletedAt !== null) return false;
   if (where.id && !matchesValue(deal.id, where.id)) return false;
+  if (where.pipelineId && !matchesValue(deal.pipelineId, where.pipelineId)) return false;
+  if (where.stageId && !matchesValue(deal.stageId, where.stageId)) return false;
+  if (where.responsibleId && !matchesValue(deal.responsibleId, where.responsibleId)) return false;
+  if (where.lossReasonId && !matchesValue(deal.lossReasonId, where.lossReasonId)) return false;
+  if (where.createdAt && !matchesDate(deal.createdAt, where.createdAt)) return false;
+  return true;
+}
+
+function matchesFactDealWhere(deal: ReturnType<typeof factDealCurrentRows>[number], where: Where) {
+  if (where.deletedAt === null && deal.deletedAt !== null) return false;
+  if (where.dealId && !matchesValue(deal.dealId, where.dealId)) return false;
   if (where.pipelineId && !matchesValue(deal.pipelineId, where.pipelineId)) return false;
   if (where.stageId && !matchesValue(deal.stageId, where.stageId)) return false;
   if (where.responsibleId && !matchesValue(deal.responsibleId, where.responsibleId)) return false;
