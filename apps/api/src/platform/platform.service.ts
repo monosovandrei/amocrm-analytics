@@ -1875,19 +1875,25 @@ export class PlatformService {
   }
 
   private async findDealsWithoutActiveTask(rule: QualityRule) {
-    const deals = await this.prisma.deal.findMany({
+    const deals = (await this.prisma.factDealCurrent.findMany({
       where: {
         deletedAt: null,
-        stage: { isWon: false, isLost: false },
+        stageIsWon: false,
+        stageIsLost: false,
       },
-      include: {
-        responsible: { include: { group: true } },
-        tasks: { where: { isCompleted: false } },
-      },
+      orderBy: { updatedAt: 'asc' },
       take: 1000,
-    });
+    })).map((deal) => ({ ...this.factDealToQualityDeal(deal), dealId: deal.dealId }));
+    const dealIds = deals.map((deal) => deal.dealId);
+    const activeTasks = dealIds.length
+      ? await this.prisma.task.findMany({
+          where: { dealId: { in: dealIds }, isCompleted: false },
+          select: { dealId: true },
+        })
+      : [];
+    const dealIdsWithTasks = new Set(activeTasks.map((task) => task.dealId).filter(Boolean));
     return deals
-      .filter((deal) => deal.tasks.length === 0)
+      .filter((deal) => !dealIdsWithTasks.has(deal.dealId))
       .map((deal) => this.dealViolation(rule, deal, `Нет следующей задачи: ${deal.title}`));
   }
 
@@ -1911,15 +1917,16 @@ export class PlatformService {
 
   private async findStaleOpenDeals(maxIdleDays: number) {
     const cutoff = new Date(Date.now() - Math.max(maxIdleDays, 1) * 86_400_000);
-    const deals = await this.prisma.deal.findMany({
+    const deals = (await this.prisma.factDealCurrent.findMany({
       where: {
         deletedAt: null,
         updatedAt: { lt: cutoff },
-        stage: { isWon: false, isLost: false },
+        stageIsWon: false,
+        stageIsLost: false,
       },
-      include: { responsible: { include: { group: true } } },
+      orderBy: { updatedAt: 'asc' },
       take: 1000,
-    });
+    })).map((deal) => this.factDealToQualityDeal(deal));
     return deals.map((deal) => ({
       ...this.dealViolation(null, deal, `Давно не было движения: ${deal.title}`),
       payload: { updatedAt: deal.updatedAt, maxIdleDays },
@@ -1927,15 +1934,16 @@ export class PlatformService {
   }
 
   private async findDealsWithoutResponsible() {
-    const deals = await this.prisma.deal.findMany({
+    const deals = (await this.prisma.factDealCurrent.findMany({
       where: {
         deletedAt: null,
         responsibleId: null,
-        stage: { isWon: false, isLost: false },
+        stageIsWon: false,
+        stageIsLost: false,
       },
-      include: { responsible: { include: { group: true } } },
+      orderBy: { updatedAt: 'asc' },
       take: 1000,
-    });
+    })).map((deal) => this.factDealToQualityDeal(deal));
     return deals.map((deal) => this.dealViolation(null, deal, `Нет ответственного: ${deal.title}`));
   }
 
@@ -1966,6 +1974,25 @@ export class PlatformService {
       groupName: deal.responsible?.group?.name ?? null,
       message,
       payload: { externalId: deal.externalId, amount: Number(deal.amount) },
+    };
+  }
+
+  private factDealToQualityDeal(deal: Prisma.FactDealCurrentGetPayload<Record<string, never>>) {
+    return {
+      id: deal.dealId,
+      externalId: deal.dealExternalId,
+      title: deal.title,
+      amount: deal.amount,
+      updatedAt: deal.updatedAt,
+      responsibleId: deal.responsibleId,
+      responsible: deal.responsibleId || deal.responsibleName || deal.groupId || deal.groupName
+        ? {
+            id: deal.responsibleId,
+            name: deal.responsibleName,
+            groupId: deal.groupId,
+            group: deal.groupName ? { name: deal.groupName } : null,
+          }
+        : null,
     };
   }
 
