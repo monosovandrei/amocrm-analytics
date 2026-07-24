@@ -25,7 +25,8 @@ export class AmoSchedulerService {
 
   @Interval(60_000)
   async tick() {
-    if (!this.runsSyncWorker()) return;
+    const pullSyncJobTypes = this.pullSyncJobTypesForRole();
+    if (pullSyncJobTypes.length === 0) return;
     if (this.pullSyncBusy) return;
     const connection = await this.prisma.amoConnection.findFirst({
       where: { status: { in: ['ACTIVE', 'ERROR', 'SYNCING'] } },
@@ -37,7 +38,7 @@ export class AmoSchedulerService {
     const queuedPullJob = await this.prisma.syncJob.findFirst({
       where: {
         connectionId: connection.id,
-        type: { not: SyncJobType.WEBHOOK },
+        type: { in: pullSyncJobTypes },
         status: 'QUEUED',
       },
       orderBy: { createdAt: 'asc' },
@@ -60,6 +61,7 @@ export class AmoSchedulerService {
 
     const lastSync = connection.lastIncrementalSyncAt ?? connection.lastFullSyncAt;
     const syncType = lastSync ? SyncJobType.INCREMENTAL : SyncJobType.FULL;
+    if (!pullSyncJobTypes.includes(syncType)) return;
     const due = !lastSync || Date.now() - lastSync.getTime() >= syncIntervalMinutes * 60_000;
     if (!due) return;
 
@@ -312,9 +314,17 @@ export class AmoSchedulerService {
     return process.env.WORKER_ROLE || 'all';
   }
 
+  private pullSyncJobTypesForRole(): SyncJobType[] {
+    const role = this.workerRole();
+    if (role === 'all') return [SyncJobType.FULL, SyncJobType.INCREMENTAL];
+    if (role === 'sync') return [SyncJobType.INCREMENTAL];
+    if (role === 'bootstrap') return [SyncJobType.FULL];
+    return [];
+  }
+
   private runsSyncWorker() {
     const role = this.workerRole();
-    return role === 'all' || role === 'sync' || role === 'bootstrap';
+    return role === 'all' || role === 'sync';
   }
 
   private runsNotificationWorker() {
