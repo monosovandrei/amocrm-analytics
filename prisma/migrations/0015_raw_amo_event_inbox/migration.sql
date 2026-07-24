@@ -65,8 +65,8 @@ SELECT
   we."receivedAt",
   we."processedAt",
   we."processedAt",
-  we."createdAt",
-  we."updatedAt"
+  we."receivedAt",
+  coalesce(we."processedAt", we."receivedAt")
 FROM "WebhookEvent" AS we
 WHERE we."processedAt" IS NULL OR we."receivedAt" >= now() - interval '1 day'
 ON CONFLICT ("dedupeKey") DO NOTHING;
