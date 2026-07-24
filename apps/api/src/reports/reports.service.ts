@@ -382,6 +382,7 @@ export class ReportsService {
 
   async processReportCacheRefreshJobs(limit = 1) {
     await this.ensureReportCacheTable();
+    await this.pruneInvalidReportCacheJobs();
     await this.requeueStaleReportCacheLocks();
     const jobs = await this.prisma.$queryRaw<Array<{ id: string; cache_key: string; report_config: ReportCacheConfig | null }>>`
       SELECT job.id, job.snapshot_cache_key AS cache_key, COALESCE(job.report_config, snapshot.report_config) AS report_config
@@ -503,6 +504,28 @@ export class ReportsService {
     }
 
     return { queued: staleRows.length };
+  }
+
+  private async pruneInvalidReportCacheJobs() {
+    await this.prisma.$executeRawUnsafe(`
+      WITH invalid_jobs AS (
+        DELETE FROM report_snapshot_job job
+        USING report_snapshot snapshot
+        WHERE job.snapshot_cache_key = snapshot.cache_key
+          AND job.status IN ('QUEUED', 'RUNNING')
+          AND COALESCE(job.report_config, snapshot.report_config) IS NULL
+        RETURNING job.snapshot_cache_key
+      )
+      UPDATE report_snapshot snapshot
+      SET refresh_status = 'IDLE', refreshing_at = NULL, refresh_error = NULL, updated_at = NOW()
+      WHERE snapshot.cache_key IN (SELECT snapshot_cache_key FROM invalid_jobs)
+        AND NOT EXISTS (
+          SELECT 1
+          FROM report_snapshot_job job
+          WHERE job.snapshot_cache_key = snapshot.cache_key
+            AND job.status IN ('QUEUED', 'RUNNING')
+        )
+    `);
   }
 
   private async requeueStaleReportCacheLocks() {
