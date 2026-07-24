@@ -51,22 +51,22 @@ INSERT INTO "raw_amo_event_inbox" (
   "updatedAt"
 )
 SELECT
-  "id",
-  "connectionId",
-  "id",
-  md5(concat_ws('|', "connectionId", "entity", "action", coalesce("externalId", ''), "payload"::text)),
-  "entity",
-  "action",
-  "externalId",
-  "payload",
-  CASE WHEN "processedAt" IS NULL THEN "status" ELSE 'applied' END,
-  CASE WHEN "processedAt" IS NULL THEN 0 ELSE 1 END,
-  "error",
-  "receivedAt",
-  "processedAt",
-  "processedAt",
-  "createdAt",
-  "updatedAt"
-FROM "WebhookEvent"
-WHERE "processedAt" IS NULL OR "receivedAt" >= now() - interval '1 day'
+  we."id",
+  we."connectionId",
+  we."id",
+  md5(concat_ws('|', we."connectionId", we."entity", we."action", coalesce(we."externalId", ''), we."payload"::text)),
+  we."entity",
+  we."action",
+  we."externalId",
+  we."payload",
+  CASE WHEN we."processedAt" IS NULL THEN we."status" ELSE 'applied' END,
+  CASE WHEN we."processedAt" IS NULL THEN 0 ELSE 1 END,
+  we."error",
+  we."receivedAt",
+  we."processedAt",
+  we."processedAt",
+  we."createdAt",
+  we."updatedAt"
+FROM "WebhookEvent" AS we
+WHERE we."processedAt" IS NULL OR we."receivedAt" >= now() - interval '1 day'
 ON CONFLICT ("dedupeKey") DO NOTHING;
