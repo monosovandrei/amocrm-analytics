@@ -321,7 +321,7 @@ export class AmoSyncService {
       const parsedWebhook = rawWebhookTimeout ? Number(rawWebhookTimeout) : NaN;
       return Number.isFinite(parsedWebhook) && parsedWebhook > 0
         ? parsedWebhook * 60_000
-        : 5 * 60_000;
+        : 60_000;
     }
 
     const rawTimeout = this.config.get<string>('AMOCRM_SYNC_JOB_TIMEOUT_MINUTES');
