@@ -796,6 +796,13 @@ export class AmoSyncService {
     return Number.isFinite(parsed) && parsed > 0 ? parsed : 1000;
   }
 
+  private getLeadSlaReconcileLimit() {
+    const rawLimit = this.config.get<string>('AMOCRM_LEAD_SLA_RECONCILE_LIMIT');
+    if (!rawLimit) return 50;
+    const parsed = Number(rawLimit);
+    return Number.isFinite(parsed) && parsed > 0 ? Math.min(100, parsed) : 50;
+  }
+
   private connectionConfig(connection: AmoConnection) {
     return this.configObject(connection.config);
   }
@@ -898,7 +905,6 @@ export class AmoSyncService {
       if (isFullSync) {
         await this.backfillLossReasonsFromRaw(stats);
       }
-      await this.reconcileLeadSlaDeals(client, maps, stats);
       await this.touchJob(jobId, 'notes');
       this.logger.log(`amoCRM sync job ${jobId}: syncing notes`);
       await this.syncOptional('notes', stats, () => this.syncNotes(client, stats, updatedSince));
@@ -2236,21 +2242,25 @@ export class AmoSyncService {
   }
 
   private async reconcileLeadSlaDeals(client: AmoClient, maps: AmoSyncMaps, stats: Record<string, number>) {
-    const candidates = await this.prisma.deal.findMany({
+    const candidates = await this.prisma.factDealCurrent.findMany({
       where: {
         deletedAt: null,
-        pipeline: { isArchived: false, name: { contains: '\u043f\u0440\u043e\u0434\u0430\u0436', mode: 'insensitive' } },
-        stage: { isWon: false, isLost: false, name: { contains: '\u043d\u0430\u0437\u043d\u0430\u0447\u0435\u043d', mode: 'insensitive' } },
+        pipelineName: { contains: '\u043f\u0440\u043e\u0434\u0430\u0436', mode: 'insensitive' },
+        stageIsWon: false,
+        stageIsLost: false,
+        stageName: { contains: '\u043d\u0430\u0437\u043d\u0430\u0447\u0435\u043d', mode: 'insensitive' },
       },
-      include: {
-        pipeline: true,
-        stage: true,
+      select: {
+        dealId: true,
+        dealExternalId: true,
+        pipelineName: true,
+        stageName: true,
       },
-      take: 1000,
+      take: this.getLeadSlaReconcileLimit(),
     });
 
     const slaCandidates = candidates.filter((deal) =>
-      this.isSalesPipelineName(deal.pipeline?.name) && this.isAssignedResponsibleStageName(deal.stage?.name),
+      this.isSalesPipelineName(deal.pipelineName) && this.isAssignedResponsibleStageName(deal.stageName),
     );
 
     let checked = 0;
@@ -2259,10 +2269,10 @@ export class AmoSyncService {
     for (const deal of slaCandidates) {
       checked += 1;
       try {
-        const lead = await client.get<any>(`/leads/${deal.externalId}`, { with: 'contacts,catalog_elements,loss_reason' });
+        const lead = await client.get<any>(`/leads/${deal.dealExternalId}`, { with: 'contacts,catalog_elements,loss_reason' });
         if (!lead) {
           await this.prisma.deal.update({
-            where: { id: deal.id },
+            where: { id: deal.dealId },
             data: { deletedAt: new Date(), updatedAt: new Date() },
           });
           removed += 1;
@@ -2274,12 +2284,12 @@ export class AmoSyncService {
       } catch (error: any) {
         if (String(error?.message ?? '').includes('amoCRM API 404')) {
           await this.prisma.deal.update({
-            where: { id: deal.id },
+            where: { id: deal.dealId },
             data: { deletedAt: new Date(), updatedAt: new Date() },
           });
           removed += 1;
         } else {
-          this.logger.warn(`Lead SLA reconcile skipped for ${deal.externalId}: ${error.message}`);
+          this.logger.warn(`Lead SLA reconcile skipped for ${deal.dealExternalId}: ${error.message}`);
         }
       }
     }

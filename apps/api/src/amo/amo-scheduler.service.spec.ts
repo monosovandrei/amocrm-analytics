@@ -13,7 +13,7 @@ describe('AmoSchedulerService worker roles', () => {
   });
 
   function service() {
-    return new AmoSchedulerService({} as any, {} as any, {} as any) as any;
+    return new AmoSchedulerService({} as any, {} as any, { get: jest.fn() } as any) as any;
   }
 
   it('keeps realtime sync work on the sync worker only', () => {
@@ -28,5 +28,9 @@ describe('AmoSchedulerService worker roles', () => {
 
     expect(service().pullSyncJobTypesForRole()).toEqual([SyncJobType.FULL]);
     expect(service().runsSyncWorker()).toBe(false);
+  });
+
+  it('does not run lead SLA fallback reconcile unless explicitly configured', () => {
+    expect(service().getLeadSlaReconcileIntervalSeconds()).toBe(0);
   });
 });
