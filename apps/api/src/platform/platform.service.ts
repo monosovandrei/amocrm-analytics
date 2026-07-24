@@ -86,8 +86,9 @@ type EmailThreadDraft = {
     contactId: string | null;
     pipeline: { name: string } | null;
     stage: { name: string } | null;
-    responsible: { name: string; externalId: string; group: { name: string } | null } | null;
+    responsible: { name: string; externalId: string | null; group: { name: string } | null } | null;
     contact: { externalId: string; name: string; email: string | null } | null;
+    contactExternalIds?: string[];
   };
   threadId: string;
   messages: EmailMessageItem[];
@@ -2113,27 +2114,54 @@ export class PlatformService {
   }
 
   private async buildEmailThreadDrafts(dealIds?: string[]) {
-    const dealWhere: Prisma.DealWhereInput = {
-      deletedAt: null,
-      stage: { isWon: false, isLost: false },
-    };
-    if (dealIds) dealWhere.id = { in: dealIds };
+    const where: Prisma.Sql[] = [
+      Prisma.sql`fact."deleted_at" IS NULL`,
+      Prisma.sql`fact."stage_is_won" = false`,
+      Prisma.sql`fact."stage_is_lost" = false`,
+    ];
+    if (dealIds?.length) where.push(Prisma.sql`fact."deal_id" IN (${Prisma.join(dealIds)})`);
 
-    const openDeals = await this.prisma.deal.findMany({
-      where: dealWhere,
-      select: {
-        id: true,
-        externalId: true,
-        title: true,
-        amount: true,
-        contactId: true,
-        pipeline: { select: { name: true } },
-        stage: { select: { name: true } },
-        responsible: { select: { name: true, externalId: true, group: { select: { name: true } } } },
-        contact: { select: { externalId: true, name: true, email: true } },
-        raw: true,
-      },
-    });
+    const openDealRows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      externalId: string;
+      title: string;
+      amount: Prisma.Decimal;
+      contactId: string | null;
+      pipelineName: string;
+      stageName: string;
+      responsibleName: string | null;
+      responsibleExternalId: string | null;
+      groupName: string | null;
+      contactExternalId: string | null;
+      contactName: string | null;
+      contactEmail: string | null;
+      embeddedContactExternalIds: string[];
+    }>>`
+      SELECT
+        fact."deal_id" AS "id",
+        fact."deal_external_id" AS "externalId",
+        fact."title",
+        fact."amount",
+        fact."contact_id" AS "contactId",
+        fact."pipeline_name" AS "pipelineName",
+        fact."stage_name" AS "stageName",
+        fact."responsible_name" AS "responsibleName",
+        fact."responsible_external_id" AS "responsibleExternalId",
+        fact."group_name" AS "groupName",
+        fact."contact_external_id" AS "contactExternalId",
+        fact."contact_name" AS "contactName",
+        fact."contact_email" AS "contactEmail",
+        COALESCE((
+          SELECT ARRAY_AGG(DISTINCT contact_item->>'id')
+          FROM jsonb_array_elements(COALESCE(source_deal."raw" #> '{_embedded,contacts}', '[]'::jsonb)) contact_item
+          WHERE contact_item->>'id' IS NOT NULL AND contact_item->>'id' <> ''
+        ), ARRAY[]::TEXT[]) AS "embeddedContactExternalIds"
+      FROM "fact_deal_current" fact
+      LEFT JOIN "Deal" source_deal ON source_deal."id" = fact."deal_id"
+      WHERE ${Prisma.join(where, ' AND ')}
+      ORDER BY fact."created_at" ASC
+    `;
+    const openDeals = openDealRows.map((deal) => this.factDealToEmailDraftDeal(deal));
     if (openDeals.length === 0) return [];
 
     const drafts = new Map<string, EmailThreadDraft>();
@@ -2192,28 +2220,13 @@ export class PlatformService {
           createdAt: true,
           text: true,
           raw: true,
-          deal: {
-            select: {
-              id: true,
-              externalId: true,
-              title: true,
-              amount: true,
-              contactId: true,
-              deletedAt: true,
-              pipeline: { select: { name: true } },
-              stage: { select: { name: true, isWon: true, isLost: true } },
-              responsible: { select: { name: true, externalId: true, group: { select: { name: true } } } },
-              contact: { select: { externalId: true, name: true, email: true } },
-            },
-          },
         },
       });
 
       for (const note of notes) {
         const targetDeals = new Map<string, EmailThreadDraft['deal']>();
-        if (note.deal && !note.deal.deletedAt && !note.deal.stage?.isWon && !note.deal.stage?.isLost) {
-          targetDeals.set(note.deal.id, note.deal);
-        }
+        const directDeal = note.dealId ? openDealsById.get(note.dealId) : null;
+        if (directDeal) targetDeals.set(directDeal.id, directDeal);
 
         const noteEntityId = this.emailNoteEntityId(note.raw);
         if (noteEntityId) {
@@ -2259,22 +2272,24 @@ export class PlatformService {
       }
     }
 
-    let eventCursor: { id: string } | undefined;
-    while (true) {
-      const mailEvents = await this.prisma.crmEvent.findMany({
-        where: { type: { in: ['incoming_mail', 'outgoing_mail'] } },
-        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
-        take: EMAIL_EVENT_SCAN_BATCH_SIZE,
-        ...(eventCursor ? { cursor: eventCursor, skip: 1 } : {}),
-        select: {
-          id: true,
-          externalId: true,
-          type: true,
-          createdAt: true,
-          raw: true,
-        },
-      });
-      if (!mailEvents.length) break;
+    for (const eventEntityIdChunk of this.chunks(noteEntityIds, EMAIL_EVENT_SCAN_BATCH_SIZE)) {
+      const mailEvents = await this.prisma.$queryRaw<Array<{
+        id: string;
+        externalId: string;
+        type: 'incoming_mail' | 'outgoing_mail';
+        createdAt: Date;
+        raw: Prisma.JsonValue;
+      }>>`
+        SELECT event."id", event."externalId", event."type", event."createdAt", event."raw"
+        FROM "CrmEvent" event
+        WHERE event."type" IN ('incoming_mail', 'outgoing_mail')
+          AND (
+            event."raw"->>'entity_id' IN (${Prisma.join(eventEntityIdChunk)})
+            OR event."raw" #>> '{_embedded,entity,id}' IN (${Prisma.join(eventEntityIdChunk)})
+          )
+        ORDER BY event."createdAt" ASC, event."id" ASC
+      `;
+      if (!mailEvents.length) continue;
 
       const eventNoteIds = [...new Set(mailEvents.map((event) => this.emailEventNoteId(event.raw)).filter(Boolean))] as string[];
       const eventNotes = eventNoteIds.length
@@ -2334,7 +2349,10 @@ export class PlatformService {
         }
       }
 
-      eventCursor = { id: mailEvents[mailEvents.length - 1].id };
+    }
+
+    for (const draft of drafts.values()) {
+      draft.messages.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
     }
 
     this.closeEmailDraftsByDealReplies(draftsByDealId);
@@ -2344,6 +2362,53 @@ export class PlatformService {
     }
 
     return [...drafts.values()];
+  }
+
+  private factDealToEmailDraftDeal(deal: {
+    id: string;
+    externalId: string;
+    title: string;
+    amount: unknown;
+    contactId: string | null;
+    pipelineName: string;
+    stageName: string;
+    responsibleName: string | null;
+    responsibleExternalId: string | null;
+    groupName: string | null;
+    contactExternalId: string | null;
+    contactName: string | null;
+    contactEmail: string | null;
+    embeddedContactExternalIds?: string[];
+  }): EmailThreadDraft['deal'] {
+    const contactExternalIds = [
+      deal.contactExternalId,
+      ...(deal.embeddedContactExternalIds ?? []),
+    ].filter((id): id is string => Boolean(id));
+
+    return {
+      id: deal.id,
+      externalId: deal.externalId,
+      title: deal.title,
+      amount: deal.amount,
+      contactId: deal.contactId,
+      pipeline: { name: deal.pipelineName },
+      stage: { name: deal.stageName },
+      responsible: deal.responsibleName || deal.responsibleExternalId || deal.groupName
+        ? {
+            name: deal.responsibleName ?? '\u0411\u0435\u0437 \u043c\u0435\u043d\u0435\u0434\u0436\u0435\u0440\u0430',
+            externalId: deal.responsibleExternalId,
+            group: deal.groupName ? { name: deal.groupName } : null,
+          }
+        : null,
+      contact: deal.contactExternalId || deal.contactName || deal.contactEmail
+        ? {
+            externalId: deal.contactExternalId ?? '',
+            name: deal.contactName ?? '',
+            email: deal.contactEmail,
+          }
+        : null,
+      contactExternalIds,
+    };
   }
 
   private closeEmailDraftsByDealReplies(draftsByDealId: Map<string, EmailThreadDraft[]>) {
@@ -2614,9 +2679,12 @@ export class PlatformService {
     return id == null ? null : String(id);
   }
 
-  private dealContactExternalIds(deal: { contact?: { externalId: string | null } | null; raw?: unknown }) {
+  private dealContactExternalIds(deal: { contact?: { externalId: string | null } | null; contactExternalIds?: string[]; raw?: unknown }) {
     const ids = new Set<string>();
     if (deal.contact?.externalId) ids.add(deal.contact.externalId);
+    for (const id of deal.contactExternalIds ?? []) {
+      if (id) ids.add(id);
+    }
 
     const contacts = (deal.raw as { _embedded?: { contacts?: Array<{ id?: unknown }> } } | null)?._embedded?.contacts;
     if (Array.isArray(contacts)) {

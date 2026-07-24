@@ -97,31 +97,7 @@ export class CrmEventNotificationsService {
     if (workField) eventTypes.push(`custom_field_${workField.externalId}_value_changed`);
 
     const [events, paidStages, users] = await Promise.all([
-      includeEventDriven ? this.prisma.crmEvent.findMany({
-        where: {
-          createdAt: { gte: since },
-          type: { in: eventTypes },
-        },
-        include: {
-          deal: {
-            select: {
-              id: true,
-              externalId: true,
-              title: true,
-              amount: true,
-              createdAt: true,
-              updatedAt: true,
-              stageId: true,
-              responsibleId: true,
-              responsible: { select: { id: true, name: true, group: { select: { name: true } } } },
-              pipeline: { select: { id: true, name: true } },
-              stage: { select: { id: true, name: true, isWon: true, isLost: true } },
-            },
-          },
-        },
-        orderBy: { createdAt: 'asc' },
-        take: 500,
-      }) : Promise.resolve([]),
+      includeEventDriven ? this.recentCrmEventsWithFactDeals(since, eventTypes) : Promise.resolve([]),
       includeEventDriven ? this.resolvePaymentStages() : Promise.resolve(new Map<string, StageWithPipeline>()),
       this.prisma.user.findMany({
         where: { isActive: true },
@@ -231,6 +207,61 @@ export class CrmEventNotificationsService {
     }
 
     return result;
+  }
+
+  private async recentCrmEventsWithFactDeals(since: Date, eventTypes: string[]) {
+    if (!eventTypes.length) return [];
+    const events = await this.prisma.$queryRaw<Array<{
+      id: string;
+      externalId: string;
+      dealId: string | null;
+      type: string;
+      valueBefore: Prisma.JsonValue | null;
+      valueAfter: Prisma.JsonValue | null;
+      createdAt: Date;
+      raw: Prisma.JsonValue;
+    }>>`
+      SELECT
+        event."id",
+        event."externalId",
+        event."dealId",
+        event."type",
+        event."valueBefore",
+        event."valueAfter",
+        event."createdAt",
+        event."raw"
+      FROM "CrmEvent" event
+      WHERE event."createdAt" >= ${since}
+        AND event."type" IN (${Prisma.join(eventTypes)})
+      ORDER BY event."createdAt" ASC
+      LIMIT 500
+    `;
+    if (!events.length) return [];
+
+    const localDealIds = [...new Set(events.map((event) => event.dealId).filter((id): id is string => Boolean(id)))];
+    const externalDealIds = [...new Set(
+      events
+        .filter((event) => event.type === 'lead_status_changed' || event.type.startsWith('custom_field_'))
+        .map((event) => this.eventEntityId(event))
+        .filter((id): id is string => Boolean(id)),
+    )];
+    const filters: Prisma.FactDealCurrentWhereInput[] = [];
+    if (localDealIds.length) filters.push({ dealId: { in: localDealIds } });
+    if (externalDealIds.length) filters.push({ dealExternalId: { in: externalDealIds } });
+
+    const factDeals = filters.length
+      ? await this.prisma.factDealCurrent.findMany({ where: { OR: filters } })
+      : [];
+    const dealById = new Map(factDeals.map((deal) => [deal.dealId, this.factDealToNotificationDeal(deal)]));
+    const dealByExternalId = new Map(factDeals.map((deal) => [deal.dealExternalId, this.factDealToNotificationDeal(deal)]));
+
+    return events.map((event) => {
+      const externalDealId = this.eventEntityId(event);
+      return {
+        ...event,
+        deal: (event.dealId ? dealById.get(event.dealId) : null) ?? (externalDealId ? dealByExternalId.get(externalDealId) : null) ?? null,
+      };
+    });
   }
 
   private async notifyPayment(event: any, stage: StageWithPipeline, _users: AppUser[], domain: string) {
