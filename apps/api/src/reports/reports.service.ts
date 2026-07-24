@@ -533,7 +533,7 @@ export class ReportsService {
       WITH stale_jobs AS (
         UPDATE report_snapshot_job
         SET status = 'QUEUED', started_at = NULL, error = NULL, updated_at = NOW()
-        WHERE status = 'RUNNING' AND started_at < NOW() - INTERVAL '10 minutes'
+        WHERE status = 'RUNNING' AND started_at < NOW() - INTERVAL '2 minutes'
         RETURNING snapshot_cache_key
       )
       UPDATE report_snapshot snapshot
