@@ -57,12 +57,12 @@ export class ReportsSchedulerService {
 
   private resolveRefreshBatchSize() {
     const value = Number(process.env.REPORT_CACHE_REFRESH_BATCH_SIZE);
-    return Number.isFinite(value) && value > 0 ? Math.floor(value) : 1;
+    return Number.isFinite(value) && value > 0 ? Math.floor(value) : 5;
   }
 
   private resolveRefreshIntervalMs() {
     const value = Number(process.env.REPORT_CACHE_REFRESH_INTERVAL_MS);
-    return Number.isFinite(value) && value >= 10_000 ? Math.floor(value) : 30_000;
+    return Number.isFinite(value) && value >= 10_000 ? Math.floor(value) : 10_000;
   }
 
   private runsWorkerRole(role: 'report' | 'export') {
