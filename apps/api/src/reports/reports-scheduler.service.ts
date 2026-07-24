@@ -57,7 +57,7 @@ export class ReportsSchedulerService {
 
   private resolveRefreshBatchSize() {
     const value = Number(process.env.REPORT_CACHE_REFRESH_BATCH_SIZE);
-    return Number.isFinite(value) && value > 0 ? Math.floor(value) : 5;
+    return Number.isFinite(value) && value > 0 ? Math.floor(value) : 2;
   }
 
   private resolveRefreshIntervalMs() {
