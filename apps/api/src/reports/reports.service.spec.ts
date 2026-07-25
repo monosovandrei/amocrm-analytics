@@ -370,6 +370,46 @@ describe('ReportsService data contract', () => {
     ).toBe(true);
   });
 
+  it('returns existing snapshot payload while a stale refresh is queued', async () => {
+    const payload = { summary: { deals: 12 } };
+    const db = {
+      $queryRaw: jest.fn(() => Promise.resolve([
+        {
+          cache_key: 'cache-1',
+          payload,
+          source_sync_at: new Date('2026-01-01T00:00:00.000Z'),
+          refresh_status: 'QUEUED',
+          refresh_error: null,
+          updated_at: new Date('2026-01-01T00:00:30.000Z'),
+        },
+      ])),
+      $executeRawUnsafe: jest.fn(() => Promise.resolve(1)),
+    };
+    const localService = new ReportsService(db as any, audit as any);
+    jest.spyOn(localService as any, 'ensureReportCacheTable').mockResolvedValue(undefined);
+    jest.spyOn(localService as any, 'latestReportSourceSyncAt').mockResolvedValue(new Date('2026-01-01T00:05:00.000Z'));
+    jest.spyOn(localService as any, 'reportCacheKey').mockReturnValue('cache-1');
+
+    const result = await localService.snapshots(
+      [
+        {
+          name: 'Queued cached report',
+          sourceType: 'CURRENT' as any,
+          filters: {},
+          config: { metric: 'contract', contract: { groupBy: 'none', metrics: [] } },
+        } as any,
+      ],
+      { id: 'user-1', role: 'ADMIN' as any },
+    );
+
+    expect(result.reports[0]).toMatchObject({
+      name: 'Queued cached report',
+      status: 'READY',
+      stale: true,
+      payload,
+    });
+  });
+
   it('computes count, stage transitions, field conditions, sums, conversion and durations in one contract', async () => {
     const result = await service.compute(
       {

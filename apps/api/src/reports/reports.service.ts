@@ -187,12 +187,20 @@ export class ReportsService {
       }
       const payload = row.payload as Record<string, any> | null;
       const placeholderPayload = payload?.type === 'pending';
+      const hasUsablePayload = Boolean(payload) && !placeholderPayload;
+      const status = hasUsablePayload
+        ? 'READY'
+        : row.refresh_status === 'ERROR'
+          ? 'ERROR'
+          : row.refresh_status === 'RUNNING' || row.refresh_status === 'QUEUED'
+            ? 'PENDING'
+            : 'READY';
 
       items.push({
         index: report.index,
         cacheKey: report.cacheKey,
         name: report.dto.name,
-        status: row.refresh_status === 'ERROR' ? 'ERROR' : row.refresh_status === 'RUNNING' || row.refresh_status === 'QUEUED' ? 'PENDING' : 'READY',
+        status,
         stale,
         payload: placeholderPayload ? null : row.payload,
         sourceSyncAt: row.source_sync_at,
