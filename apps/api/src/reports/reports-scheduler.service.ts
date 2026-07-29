@@ -38,12 +38,12 @@ export class ReportsSchedulerService {
     this.cacheRefreshBusy = true;
     this.nextCacheRefreshAt = now + this.resolveRefreshIntervalMs();
     try {
+      const refreshed = await this.reports.processReportCacheRefreshJobs(this.resolveRefreshBatchSize());
       const staleQueueBatchSize = this.resolveStaleQueueBatchSize();
       const stale =
-        staleQueueBatchSize > 0
+        refreshed.processed === 0 && staleQueueBatchSize > 0
           ? await this.reports.enqueueStaleReportCacheRefreshJobs(staleQueueBatchSize)
           : { queued: 0 };
-      const refreshed = await this.reports.processReportCacheRefreshJobs(this.resolveRefreshBatchSize());
       if (stale.queued || refreshed.processed) {
         this.logger.log(`Report cache refresh: queued=${stale.queued}, processed=${refreshed.processed}`);
       }
