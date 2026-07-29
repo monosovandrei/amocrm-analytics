@@ -644,7 +644,7 @@ export default function HomePage() {
   const [activeReportId, setActiveReportId] = useState<string | null>(null);
   const [preview, setPreview] = useState<Record<string, any> | null>(null);
   const [message, setMessage] = useState('');
-  const [refreshStamp, setRefreshStamp] = useState(0);
+  const [refreshStamp] = useState(0);
   const lastAmoSyncSeenRef = useRef<string | null>(null);
 
   const loadData = useCallback(async () => {
@@ -739,10 +739,7 @@ export default function HomePage() {
           nextConnection.lastFullSyncAt ??
           '',
         );
-        if (nextSyncAt && lastAmoSyncSeenRef.current && nextSyncAt !== lastAmoSyncSeenRef.current) {
-          lastAmoSyncSeenRef.current = nextSyncAt;
-          setRefreshStamp((value) => value + 1);
-        } else if (nextSyncAt) {
+        if (nextSyncAt) {
           lastAmoSyncSeenRef.current = nextSyncAt;
         }
       } catch {
@@ -1108,9 +1105,7 @@ function WorkspaceTab({
         setSnapshotError('');
 
         const shouldPollSnapshots = (response.reports ?? []).some(
-          (snapshot) =>
-            (snapshot.status === 'PENDING' && (!snapshot.payload || snapshot.payload.type === 'pending')) ||
-            snapshot.stale,
+          (snapshot) => snapshot.status === 'PENDING' && (!snapshot.payload || snapshot.payload.type === 'pending'),
         );
         if (shouldPollSnapshots) {
           pollTimer = window.setTimeout(() => setSnapshotPollStamp((value) => value + 1), 20_000);
