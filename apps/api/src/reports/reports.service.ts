@@ -97,6 +97,7 @@ const MISSING_LOSS_REASON_LABEL = 'Не указано';
 const DEFAULT_REPORT_FRESH_COMPUTE_CONCURRENCY = 2;
 const DEFAULT_WORKER_RECYCLE_RSS_MB = 850;
 const DEFAULT_REPORT_CACHE_STALE_TOLERANCE_SECONDS = 90;
+const DEFAULT_REPORT_SNAPSHOT_STALE_ENQUEUE_LIMIT = 4;
 const EXPORTS_DIR = process.env.REPORT_EXPORT_DIR || '/tmp/amocrm-analytics-exports';
 const MB = 1024 * 1024;
 
@@ -160,6 +161,8 @@ export class ReportsService {
         `
       : [];
     const rowsByKey = new Map(rows.map((row) => [row.cache_key, row]));
+    const stalePayloadRefreshLimit = this.reportSnapshotStaleEnqueueLimit();
+    let stalePayloadRefreshesQueued = 0;
 
     const items = [];
     for (const report of reports) {
@@ -182,12 +185,16 @@ export class ReportsService {
 
       await this.touchReportCacheAccess(report.cacheKey);
       const stale = this.cacheIsStale(row.source_sync_at, latestSyncAt);
-      if (stale) {
-        await this.enqueueReportCacheRefresh(report.cacheKey, report.dto, user);
-      }
       const payload = row.payload as Record<string, any> | null;
       const placeholderPayload = payload?.type === 'pending';
       const hasUsablePayload = Boolean(payload) && !placeholderPayload;
+      if (stale) {
+        const shouldRefreshNow = !hasUsablePayload || stalePayloadRefreshesQueued < stalePayloadRefreshLimit;
+        if (shouldRefreshNow) {
+          await this.enqueueReportCacheRefresh(report.cacheKey, report.dto, user);
+          if (hasUsablePayload) stalePayloadRefreshesQueued += 1;
+        }
+      }
       const status = hasUsablePayload
         ? 'READY'
         : row.refresh_status === 'ERROR'
@@ -577,6 +584,14 @@ export class ReportsService {
     const value = Number(raw);
     if (!Number.isFinite(value) || value < 0) return DEFAULT_REPORT_CACHE_STALE_TOLERANCE_SECONDS;
     return Math.min(120, Math.floor(value));
+  }
+
+  private reportSnapshotStaleEnqueueLimit() {
+    const raw = process.env.REPORT_SNAPSHOT_STALE_ENQUEUE_LIMIT;
+    if (raw === undefined || raw.trim() === '') return DEFAULT_REPORT_SNAPSHOT_STALE_ENQUEUE_LIMIT;
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value < 0) return DEFAULT_REPORT_SNAPSHOT_STALE_ENQUEUE_LIMIT;
+    return Math.floor(value);
   }
 
   private get db() {

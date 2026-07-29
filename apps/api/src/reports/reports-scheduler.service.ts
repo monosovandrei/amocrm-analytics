@@ -3,7 +3,7 @@ import { Interval } from '@nestjs/schedule';
 import { ReportsService } from './reports.service';
 
 const DEFAULT_STALE_QUEUE_BATCH_SIZE = 0;
-const DEFAULT_REFRESH_BATCH_SIZE = 4;
+const DEFAULT_REFRESH_BATCH_SIZE = 3;
 const DEFAULT_REFRESH_INTERVAL_MS = 10_000;
 
 @Injectable()
