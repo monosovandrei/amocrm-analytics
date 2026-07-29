@@ -27,10 +27,10 @@ describe('ReportsSchedulerService report cache refresh defaults', () => {
     return new ReportsSchedulerService({} as any) as any;
   }
 
-  it('enables a bounded stale report queue by default', () => {
+  it('disables proactive stale report queueing by default', () => {
     delete process.env.REPORT_CACHE_STALE_QUEUE_BATCH_SIZE;
 
-    expect(service().resolveStaleQueueBatchSize()).toBe(3);
+    expect(service().resolveStaleQueueBatchSize()).toBe(0);
   });
 
   it('allows proactive stale report refresh to be explicitly disabled', () => {
@@ -42,7 +42,7 @@ describe('ReportsSchedulerService report cache refresh defaults', () => {
   it('treats an empty stale queue batch size as unset', () => {
     process.env.REPORT_CACHE_STALE_QUEUE_BATCH_SIZE = '';
 
-    expect(service().resolveStaleQueueBatchSize()).toBe(3);
+    expect(service().resolveStaleQueueBatchSize()).toBe(0);
   });
 
   it('processes a full dashboard batch by default', () => {
@@ -66,7 +66,7 @@ describe('ReportsSchedulerService report cache refresh defaults', () => {
   });
 
   it('queues stale reports only when the active refresh queue is idle', async () => {
-    delete process.env.REPORT_CACHE_STALE_QUEUE_BATCH_SIZE;
+    process.env.REPORT_CACHE_STALE_QUEUE_BATCH_SIZE = '3';
     process.env.WORKER_ROLE = 'report';
     const reports = {
       processReportCacheRefreshJobs: jest.fn().mockResolvedValue({ processed: 0 }),
