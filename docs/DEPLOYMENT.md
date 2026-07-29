@@ -54,6 +54,7 @@
 - `REPORT_CACHE_REFRESH_BATCH_SIZE=3`
 - `REPORT_CACHE_REFRESH_INTERVAL_MS=10000`
 - `REPORT_SNAPSHOT_STALE_ENQUEUE_LIMIT=4`
+- `REPORT_SNAPSHOT_STALE_REQUEUE_COOLDOWN_SECONDS=300`
 
 На production регулярный polling отключен. Данные сначала загружаются полным слепком, затем обновляются через amoCRM webhooks. Положительное значение `AMOCRM_SYNC_INTERVAL_MINUTES` использовать только локально или для временной диагностики.
 

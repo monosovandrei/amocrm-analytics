@@ -69,6 +69,7 @@ cp .env.example .env
 - `REPORT_CACHE_REFRESH_BATCH_SIZE` - сколько отчётов report-worker пересчитывает за тик; для production рекомендуется `3`.
 - `REPORT_CACHE_REFRESH_INTERVAL_MS` - пауза между тиками report-worker; для production рекомендуется `10000`.
 - `REPORT_SNAPSHOT_STALE_ENQUEUE_LIMIT` - сколько уже закэшированных stale-отчётов один запрос страницы может поставить на пересчёт; для production рекомендуется `4`.
+- `REPORT_SNAPSHOT_STALE_REQUEUE_COOLDOWN_SECONDS` - минимальная пауза перед повторной постановкой уже пересчитанного stale-отчёта; для production рекомендуется `300`.
 - `WEB_ORIGIN` - разрешенный origin фронтенда для CORS.
 - `VITE_API_URL` - публичный URL API для web-приложения.
 - `TELEGRAM_BOT_TOKEN` - токен Telegram-бота для уведомлений.

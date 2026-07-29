@@ -492,6 +492,52 @@ describe('ReportsService data contract', () => {
     }
   });
 
+  it('does not requeue recently refreshed stale payloads', async () => {
+    const original = process.env.REPORT_SNAPSHOT_STALE_REQUEUE_COOLDOWN_SECONDS;
+    try {
+      process.env.REPORT_SNAPSHOT_STALE_REQUEUE_COOLDOWN_SECONDS = '300';
+      const db = {
+        $queryRaw: jest.fn(() => Promise.resolve([
+          {
+            cache_key: 'R1',
+            payload: { summary: { deals: 1 } },
+            source_sync_at: new Date('2026-01-01T00:00:00.000Z'),
+            refresh_status: 'IDLE',
+            refresh_error: null,
+            updated_at: new Date(),
+          },
+        ])),
+        $executeRawUnsafe: jest.fn(() => Promise.resolve(1)),
+      };
+      const localService = new ReportsService(db as any, audit as any);
+      jest.spyOn(localService as any, 'ensureReportCacheTable').mockResolvedValue(undefined);
+      jest.spyOn(localService as any, 'latestReportSourceSyncAt').mockResolvedValue(new Date('2026-01-01T00:05:00.000Z'));
+      jest.spyOn(localService as any, 'reportCacheKey').mockReturnValue('R1');
+      const enqueueSpy = jest.spyOn(localService as any, 'enqueueReportCacheRefresh').mockResolvedValue(undefined);
+
+      const result = await localService.snapshots(
+        [
+          {
+            name: 'R1',
+            sourceType: 'CURRENT' as any,
+            filters: {},
+            config: { metric: 'contract', contract: { groupBy: 'none', metrics: [] } },
+          } as any,
+        ],
+        { id: 'user-1', role: 'ADMIN' as any },
+      );
+
+      expect(result.reports[0]).toMatchObject({ name: 'R1', status: 'READY', stale: true });
+      expect(enqueueSpy).not.toHaveBeenCalled();
+    } finally {
+      if (original === undefined) {
+        delete process.env.REPORT_SNAPSHOT_STALE_REQUEUE_COOLDOWN_SECONDS;
+      } else {
+        process.env.REPORT_SNAPSHOT_STALE_REQUEUE_COOLDOWN_SECONDS = original;
+      }
+    }
+  });
+
   it('computes count, stage transitions, field conditions, sums, conversion and durations in one contract', async () => {
     const result = await service.compute(
       {

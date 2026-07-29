@@ -98,6 +98,7 @@ const DEFAULT_REPORT_FRESH_COMPUTE_CONCURRENCY = 2;
 const DEFAULT_WORKER_RECYCLE_RSS_MB = 850;
 const DEFAULT_REPORT_CACHE_STALE_TOLERANCE_SECONDS = 90;
 const DEFAULT_REPORT_SNAPSHOT_STALE_ENQUEUE_LIMIT = 4;
+const DEFAULT_REPORT_SNAPSHOT_STALE_REQUEUE_COOLDOWN_SECONDS = 300;
 const EXPORTS_DIR = process.env.REPORT_EXPORT_DIR || '/tmp/amocrm-analytics-exports';
 const MB = 1024 * 1024;
 
@@ -189,7 +190,12 @@ export class ReportsService {
       const placeholderPayload = payload?.type === 'pending';
       const hasUsablePayload = Boolean(payload) && !placeholderPayload;
       if (stale) {
-        const shouldRefreshNow = !hasUsablePayload || stalePayloadRefreshesQueued < stalePayloadRefreshLimit;
+        const recentlyRefreshed = hasUsablePayload && this.reportSnapshotRecentlyRefreshed(row.updated_at);
+        const alreadyRefreshing = row.refresh_status === 'QUEUED' || row.refresh_status === 'RUNNING';
+        const shouldRefreshNow =
+          !alreadyRefreshing &&
+          !recentlyRefreshed &&
+          (!hasUsablePayload || stalePayloadRefreshesQueued < stalePayloadRefreshLimit);
         if (shouldRefreshNow) {
           await this.enqueueReportCacheRefresh(report.cacheKey, report.dto, user);
           if (hasUsablePayload) stalePayloadRefreshesQueued += 1;
@@ -591,6 +597,20 @@ export class ReportsService {
     if (raw === undefined || raw.trim() === '') return DEFAULT_REPORT_SNAPSHOT_STALE_ENQUEUE_LIMIT;
     const value = Number(raw);
     if (!Number.isFinite(value) || value < 0) return DEFAULT_REPORT_SNAPSHOT_STALE_ENQUEUE_LIMIT;
+    return Math.floor(value);
+  }
+
+  private reportSnapshotRecentlyRefreshed(updatedAt: Date | null) {
+    if (!updatedAt) return false;
+    const cooldownMs = this.reportSnapshotStaleRequeueCooldownSeconds() * 1000;
+    return Date.now() - updatedAt.getTime() < cooldownMs;
+  }
+
+  private reportSnapshotStaleRequeueCooldownSeconds() {
+    const raw = process.env.REPORT_SNAPSHOT_STALE_REQUEUE_COOLDOWN_SECONDS;
+    if (raw === undefined || raw.trim() === '') return DEFAULT_REPORT_SNAPSHOT_STALE_REQUEUE_COOLDOWN_SECONDS;
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value < 0) return DEFAULT_REPORT_SNAPSHOT_STALE_REQUEUE_COOLDOWN_SECONDS;
     return Math.floor(value);
   }
 
