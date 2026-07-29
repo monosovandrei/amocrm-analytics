@@ -62,8 +62,12 @@ cp .env.example .env
 - `WEBHOOK_BASE_URL` - внешний API URL без завершающего slash, например `https://analytics.example.ru/api/v1`.
 - `AMOCRM_SYNC_INTERVAL_MINUTES` - `0` для production; регулярный polling отключен. Положительное значение использовать только локально или для ручной диагностики.
 - `AMOCRM_SYNC_JOB_TIMEOUT_MINUTES` - через сколько минут обычная job без heartbeat считается зависшей; для production рекомендуется `30`.
-- `AMOCRM_WEBHOOK_SYNC_JOB_TIMEOUT_MINUTES` - через сколько минут realtime webhook job без heartbeat считается зависшей; для production рекомендуется `5`.
+- `AMOCRM_WEBHOOK_SYNC_JOB_TIMEOUT_MINUTES` - через сколько минут realtime webhook job без heartbeat считается зависшей; для production рекомендуется `1`.
 - `AMOCRM_FULL_SYNC_JOB_TIMEOUT_MINUTES` - timeout полной исторической синхронизации; для production рекомендуется `360` или больше.
+- `REPORT_CACHE_STALE_TOLERANCE_SECONDS` - окно, внутри которого кэш отчёта считается достаточно свежим; для production рекомендуется `90`.
+- `REPORT_CACHE_STALE_QUEUE_BATCH_SIZE` - сколько stale-отчётов report-worker ставит в очередь за тик; для production рекомендуется `3`.
+- `REPORT_CACHE_REFRESH_BATCH_SIZE` - сколько отчётов report-worker пересчитывает за тик; для production рекомендуется `2`.
+- `REPORT_CACHE_REFRESH_INTERVAL_MS` - пауза между тиками report-worker; для production рекомендуется `10000`.
 - `WEB_ORIGIN` - разрешенный origin фронтенда для CORS.
 - `VITE_API_URL` - публичный URL API для web-приложения.
 - `TELEGRAM_BOT_TOKEN` - токен Telegram-бота для уведомлений.

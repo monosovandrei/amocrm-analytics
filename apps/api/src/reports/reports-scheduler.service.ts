@@ -2,6 +2,10 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Interval } from '@nestjs/schedule';
 import { ReportsService } from './reports.service';
 
+const DEFAULT_STALE_QUEUE_BATCH_SIZE = 3;
+const DEFAULT_REFRESH_BATCH_SIZE = 2;
+const DEFAULT_REFRESH_INTERVAL_MS = 10_000;
+
 @Injectable()
 export class ReportsSchedulerService {
   private readonly logger = new Logger(ReportsSchedulerService.name);
@@ -52,17 +56,17 @@ export class ReportsSchedulerService {
 
   private resolveStaleQueueBatchSize() {
     const value = Number(process.env.REPORT_CACHE_STALE_QUEUE_BATCH_SIZE);
-    return Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
+    return Number.isFinite(value) && value >= 0 ? Math.floor(value) : DEFAULT_STALE_QUEUE_BATCH_SIZE;
   }
 
   private resolveRefreshBatchSize() {
     const value = Number(process.env.REPORT_CACHE_REFRESH_BATCH_SIZE);
-    return Number.isFinite(value) && value > 0 ? Math.floor(value) : 2;
+    return Number.isFinite(value) && value > 0 ? Math.floor(value) : DEFAULT_REFRESH_BATCH_SIZE;
   }
 
   private resolveRefreshIntervalMs() {
     const value = Number(process.env.REPORT_CACHE_REFRESH_INTERVAL_MS);
-    return Number.isFinite(value) && value >= 10_000 ? Math.floor(value) : 10_000;
+    return Number.isFinite(value) && value >= 10_000 ? Math.floor(value) : DEFAULT_REFRESH_INTERVAL_MS;
   }
 
   private runsWorkerRole(role: 'report' | 'export') {

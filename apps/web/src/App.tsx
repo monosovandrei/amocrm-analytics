@@ -1107,10 +1107,12 @@ function WorkspaceTab({
         setSnapshotByTemplateId(nextSnapshots);
         setSnapshotError('');
 
-        const hasPendingWithoutPayload = (response.reports ?? []).some(
-          (snapshot) => snapshot.status === 'PENDING' && (!snapshot.payload || snapshot.payload.type === 'pending'),
+        const shouldPollSnapshots = (response.reports ?? []).some(
+          (snapshot) =>
+            (snapshot.status === 'PENDING' && (!snapshot.payload || snapshot.payload.type === 'pending')) ||
+            snapshot.stale,
         );
-        if (hasPendingWithoutPayload) {
+        if (shouldPollSnapshots) {
           pollTimer = window.setTimeout(() => setSnapshotPollStamp((value) => value + 1), 20_000);
         }
       } catch (err) {
