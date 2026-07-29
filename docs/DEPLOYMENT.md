@@ -51,7 +51,7 @@
 - `AMOCRM_FULL_SYNC_JOB_TIMEOUT_MINUTES=360`
 - `REPORT_CACHE_STALE_TOLERANCE_SECONDS=90`
 - `REPORT_CACHE_STALE_QUEUE_BATCH_SIZE=0`
-- `REPORT_CACHE_REFRESH_BATCH_SIZE=8`
+- `REPORT_CACHE_REFRESH_BATCH_SIZE=4`
 - `REPORT_CACHE_REFRESH_INTERVAL_MS=10000`
 
 На production регулярный polling отключен. Данные сначала загружаются полным слепком, затем обновляются через amoCRM webhooks. Положительное значение `AMOCRM_SYNC_INTERVAL_MINUTES` использовать только локально или для временной диагностики.

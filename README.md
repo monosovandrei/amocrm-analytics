@@ -66,7 +66,7 @@ cp .env.example .env
 - `AMOCRM_FULL_SYNC_JOB_TIMEOUT_MINUTES` - timeout полной исторической синхронизации; для production рекомендуется `360` или больше.
 - `REPORT_CACHE_STALE_TOLERANCE_SECONDS` - окно, внутри которого кэш отчёта считается достаточно свежим; для production рекомендуется `90`.
 - `REPORT_CACHE_STALE_QUEUE_BATCH_SIZE` - сколько stale-отчётов report-worker ставит в очередь за тик; для production рекомендуется `0`, чтобы не гонять весь кэш в фоне.
-- `REPORT_CACHE_REFRESH_BATCH_SIZE` - сколько отчётов report-worker пересчитывает за тик; для production рекомендуется `8`.
+- `REPORT_CACHE_REFRESH_BATCH_SIZE` - сколько отчётов report-worker пересчитывает за тик; для production рекомендуется `4`.
 - `REPORT_CACHE_REFRESH_INTERVAL_MS` - пауза между тиками report-worker; для production рекомендуется `10000`.
 - `WEB_ORIGIN` - разрешенный origin фронтенда для CORS.
 - `VITE_API_URL` - публичный URL API для web-приложения.
