@@ -55,17 +55,23 @@ export class ReportsSchedulerService {
   }
 
   private resolveStaleQueueBatchSize() {
-    const value = Number(process.env.REPORT_CACHE_STALE_QUEUE_BATCH_SIZE);
+    const raw = process.env.REPORT_CACHE_STALE_QUEUE_BATCH_SIZE;
+    if (raw === undefined || raw.trim() === '') return DEFAULT_STALE_QUEUE_BATCH_SIZE;
+    const value = Number(raw);
     return Number.isFinite(value) && value >= 0 ? Math.floor(value) : DEFAULT_STALE_QUEUE_BATCH_SIZE;
   }
 
   private resolveRefreshBatchSize() {
-    const value = Number(process.env.REPORT_CACHE_REFRESH_BATCH_SIZE);
+    const raw = process.env.REPORT_CACHE_REFRESH_BATCH_SIZE;
+    if (raw === undefined || raw.trim() === '') return DEFAULT_REFRESH_BATCH_SIZE;
+    const value = Number(raw);
     return Number.isFinite(value) && value > 0 ? Math.floor(value) : DEFAULT_REFRESH_BATCH_SIZE;
   }
 
   private resolveRefreshIntervalMs() {
-    const value = Number(process.env.REPORT_CACHE_REFRESH_INTERVAL_MS);
+    const raw = process.env.REPORT_CACHE_REFRESH_INTERVAL_MS;
+    if (raw === undefined || raw.trim() === '') return DEFAULT_REFRESH_INTERVAL_MS;
+    const value = Number(raw);
     return Number.isFinite(value) && value >= 10_000 ? Math.floor(value) : DEFAULT_REFRESH_INTERVAL_MS;
   }
 

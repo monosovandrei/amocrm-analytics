@@ -26,4 +26,10 @@ describe('ReportsSchedulerService report cache refresh defaults', () => {
 
     expect(service().resolveStaleQueueBatchSize()).toBe(0);
   });
+
+  it('treats an empty stale queue batch size as unset', () => {
+    process.env.REPORT_CACHE_STALE_QUEUE_BATCH_SIZE = '';
+
+    expect(service().resolveStaleQueueBatchSize()).toBe(3);
+  });
 });

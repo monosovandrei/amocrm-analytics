@@ -325,6 +325,22 @@ describe('ReportsService data contract', () => {
     expect(localService.cacheIsStale(cachedSyncAt, latestSyncAt)).toBe(false);
   });
 
+  it('uses the default report cache freshness tolerance when env is empty', () => {
+    const original = process.env.REPORT_CACHE_STALE_TOLERANCE_SECONDS;
+    try {
+      process.env.REPORT_CACHE_STALE_TOLERANCE_SECONDS = '';
+      const localService = new ReportsService({} as any, audit as any) as any;
+
+      expect(localService.reportCacheStaleToleranceSeconds()).toBe(90);
+    } finally {
+      if (original === undefined) {
+        delete process.env.REPORT_CACHE_STALE_TOLERANCE_SECONDS;
+      } else {
+        process.env.REPORT_CACHE_STALE_TOLERANCE_SECONDS = original;
+      }
+    }
+  });
+
   it('does not queue proactive stale report caches when the batch size is disabled', async () => {
     const db = { $executeRawUnsafe: jest.fn(() => Promise.resolve(3)) };
     const localService = new ReportsService(db as any, audit as any);

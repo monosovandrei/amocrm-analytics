@@ -572,7 +572,9 @@ export class ReportsService {
   }
 
   private reportCacheStaleToleranceSeconds() {
-    const value = Number(process.env.REPORT_CACHE_STALE_TOLERANCE_SECONDS);
+    const raw = process.env.REPORT_CACHE_STALE_TOLERANCE_SECONDS;
+    if (raw === undefined || raw.trim() === '') return DEFAULT_REPORT_CACHE_STALE_TOLERANCE_SECONDS;
+    const value = Number(raw);
     if (!Number.isFinite(value) || value < 0) return DEFAULT_REPORT_CACHE_STALE_TOLERANCE_SECONDS;
     return Math.min(120, Math.floor(value));
   }
