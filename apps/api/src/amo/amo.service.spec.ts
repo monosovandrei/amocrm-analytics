@@ -127,11 +127,13 @@ describe('AmoService webhook parsing', () => {
       },
     ]);
     const rawInboxCreateMany = jest.fn().mockResolvedValue({});
+    const executeRaw = jest.fn().mockResolvedValue(0);
     const prisma = {
       $transaction: jest.fn((callback: any) =>
         callback({
           webhookEvent: { createManyAndReturn: webhookCreateManyAndReturn },
           rawAmoEventInbox: { createMany: rawInboxCreateMany },
+          $executeRaw: executeRaw,
         }),
       ),
     };
@@ -177,5 +179,6 @@ describe('AmoService webhook parsing', () => {
       })],
       skipDuplicates: true,
     });
+    expect(executeRaw).toHaveBeenCalled();
   });
 });

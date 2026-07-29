@@ -564,10 +564,10 @@ export class AmoSyncService {
       lastAppliedRawAmoEvent,
       oldestPendingRawAmoEvent,
     ] = await Promise.all([
-      this.prisma.webhookEvent.count({
+      this.prisma.rawAmoEventInbox.count({
         where: {
           connectionId: connection.id,
-          processedAt: null,
+          appliedAt: null,
           status: { in: ['received', 'error'] },
         },
       }),
@@ -604,10 +604,10 @@ export class AmoSyncService {
         orderBy: { processedAt: 'desc' },
         select: { processedAt: true, receivedAt: true, status: true },
       }),
-      this.prisma.webhookEvent.findFirst({
+      this.prisma.rawAmoEventInbox.findFirst({
         where: {
           connectionId: connection.id,
-          processedAt: null,
+          appliedAt: null,
           status: { in: ['received', 'error'] },
         },
         orderBy: { receivedAt: 'asc' },
@@ -655,13 +655,18 @@ export class AmoSyncService {
 
     const connectionConfig = this.connectionConfig(connection);
     const syncMode = this.getConfiguredSyncIntervalMinutes() > 0 ? 'POLLING' : 'WEBHOOK';
-    const hasReceivedWebhooks = Boolean(lastWebhook);
+    const hasReceivedWebhooks = Boolean(lastWebhook || lastRawAmoEvent);
     const lastSuccessfulSyncAt = lastSuccessJob?.finishedAt ?? connection.lastIncrementalSyncAt ?? connection.lastFullSyncAt;
     const recentReconcileAt = this.parseConfigDate(connectionConfig.recentReconcileAt);
     const recentReconcileErrorAt = this.parseConfigDate(connectionConfig.recentReconcileErrorAt);
     const recentReconcileError =
       typeof connectionConfig.recentReconcileError === 'string' ? connectionConfig.recentReconcileError : null;
-    const lastDataUpdateAt = this.latestDate(lastProcessedWebhook?.processedAt, recentReconcileAt, lastSuccessfulSyncAt);
+    const lastDataUpdateAt = this.latestDate(
+      lastAppliedRawAmoEvent?.appliedAt,
+      lastProcessedWebhook?.processedAt,
+      recentReconcileAt,
+      lastSuccessfulSyncAt,
+    );
     const webhookSubscriptionEnsuredAt = this.parseConfigDate(connectionConfig.webhookEnsuredAt);
     const webhookSubscriptionErrorAt = this.parseConfigDate(connectionConfig.webhookEnsureErrorAt);
     const webhookSubscriptionError =

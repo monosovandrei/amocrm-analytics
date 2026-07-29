@@ -215,6 +215,20 @@ export class AmoService {
         })),
         skipDuplicates: true,
       });
+
+      const webhookEventIds = webhookEvents.map((event) => event.id);
+      if (webhookEventIds.length > 0) {
+        await tx.$executeRaw`
+          UPDATE "WebhookEvent" event
+          SET "status" = 'processed', "processedAt" = NOW(), "error" = NULL
+          WHERE event."id" IN (${Prisma.join(webhookEventIds)})
+            AND NOT EXISTS (
+              SELECT 1
+              FROM "raw_amo_event_inbox" raw
+              WHERE raw."webhookEventId" = event."id"
+            )
+        `;
+      }
     });
   }
 

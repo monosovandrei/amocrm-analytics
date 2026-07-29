@@ -2,12 +2,18 @@ import { ReportsSchedulerService } from './reports-scheduler.service';
 
 describe('ReportsSchedulerService report cache refresh defaults', () => {
   const originalStaleQueueBatchSize = process.env.REPORT_CACHE_STALE_QUEUE_BATCH_SIZE;
+  const originalRefreshBatchSize = process.env.REPORT_CACHE_REFRESH_BATCH_SIZE;
 
   afterEach(() => {
     if (originalStaleQueueBatchSize === undefined) {
       delete process.env.REPORT_CACHE_STALE_QUEUE_BATCH_SIZE;
     } else {
       process.env.REPORT_CACHE_STALE_QUEUE_BATCH_SIZE = originalStaleQueueBatchSize;
+    }
+    if (originalRefreshBatchSize === undefined) {
+      delete process.env.REPORT_CACHE_REFRESH_BATCH_SIZE;
+    } else {
+      process.env.REPORT_CACHE_REFRESH_BATCH_SIZE = originalRefreshBatchSize;
     }
   });
 
@@ -31,5 +37,11 @@ describe('ReportsSchedulerService report cache refresh defaults', () => {
     process.env.REPORT_CACHE_STALE_QUEUE_BATCH_SIZE = '';
 
     expect(service().resolveStaleQueueBatchSize()).toBe(3);
+  });
+
+  it('processes a full dashboard batch by default', () => {
+    delete process.env.REPORT_CACHE_REFRESH_BATCH_SIZE;
+
+    expect(service().resolveRefreshBatchSize()).toBe(8);
   });
 });
