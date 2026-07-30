@@ -369,6 +369,7 @@ const periodPresetLabels: Record<PeriodPreset, string> = {
 const workspacePeriodPresets: PeriodPreset[] = ['today', 'yesterday', 'this_week', 'this_month'];
 type DashboardReportSnapshot = {
   cacheKey: string;
+  clientCacheKey?: string;
   name: string;
   status: 'READY' | 'PENDING' | 'ERROR';
   stale: boolean;
@@ -1099,7 +1100,7 @@ function WorkspaceTab({
         const nextSnapshots: Record<string, DashboardReportSnapshot> = {};
         for (const snapshot of response.reports ?? []) {
           const source = dashboardQueries[snapshot.index];
-          if (source) nextSnapshots[source.templateId] = snapshot;
+          if (source) nextSnapshots[source.templateId] = { ...snapshot, clientCacheKey: reportWidgetCacheKey(source.query) };
         }
         setSnapshotByTemplateId(nextSnapshots);
         setSnapshotError('');
@@ -1423,7 +1424,7 @@ function ReportWidget({
   }, [cacheKey]);
 
   useEffect(() => {
-    const currentSnapshot = snapshot?.cacheKey === cacheKey ? snapshot : null;
+    const currentSnapshot = snapshot?.clientCacheKey === cacheKey ? snapshot : null;
     if (!currentSnapshot) {
       if (snapshotError && !hasLoadedRef.current) {
         setError(snapshotError);
