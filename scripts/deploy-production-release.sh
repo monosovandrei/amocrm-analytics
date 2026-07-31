@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BRANCH="${BRANCH:-codex/platform-architecture-foundation}"
+BRANCH="${BRANCH:-main}"
 WORKTREE="${WORKTREE:-/opt/analytics-worktree}"
 LIVE_LINK="${LIVE_LINK:-/opt/analytics}"
 RELEASES_DIR="${RELEASES_DIR:-/opt/analytics-releases}"
