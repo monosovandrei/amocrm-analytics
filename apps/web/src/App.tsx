@@ -367,6 +367,7 @@ const periodPresetLabels: Record<PeriodPreset, string> = {
 };
 
 const workspacePeriodPresets: PeriodPreset[] = ['today', 'yesterday', 'this_week', 'this_month'];
+const dashboardSnapshotRequestConcurrency = 4;
 type DashboardReportSnapshot = {
   cacheKey: string;
   clientCacheKey?: string;
@@ -381,6 +382,10 @@ type DashboardReportSnapshot = {
 type DashboardReportSnapshotsResponse = {
   latestSourceSyncAt?: string | null;
   reports: Array<DashboardReportSnapshot & { index: number }>;
+};
+type DashboardQuery = {
+  templateId: string;
+  query: Record<string, any>;
 };
 
 const relativeUnitLabels: Record<RelativeUnit, string> = {
@@ -1065,7 +1070,7 @@ function WorkspaceTab({
   const csmTemplates = reportTemplates.filter((template) => dashboardSectionKey(template) === 'csm');
   const forecastTemplates = reportTemplates.filter((template) => dashboardSectionKey(template) === 'forecast');
   const [snapshotByTemplateId, setSnapshotByTemplateId] = useState<Record<string, DashboardReportSnapshot>>({});
-  const [snapshotError, setSnapshotError] = useState('');
+  const [snapshotErrorByTemplateId, setSnapshotErrorByTemplateId] = useState<Record<string, string>>({});
   const [snapshotPollStamp, setSnapshotPollStamp] = useState(0);
   const dashboardQueries = useMemo(
     () =>
@@ -1083,38 +1088,60 @@ function WorkspaceTab({
   useEffect(() => {
     if (dashboardQueries.length === 0) {
       setSnapshotByTemplateId({});
-      setSnapshotError('');
+      setSnapshotErrorByTemplateId({});
       return;
     }
 
     let cancelled = false;
     let pollTimer: number | undefined;
     async function loadSnapshots() {
-      try {
-        const response = await api<DashboardReportSnapshotsResponse>('/reports/snapshots', {
-          method: 'POST',
-          body: JSON.stringify({ reports: dashboardQueries.map((item) => item.query) }),
-        });
-        if (cancelled) return;
+      setSnapshotByTemplateId({});
+      setSnapshotErrorByTemplateId({});
 
-        const nextSnapshots: Record<string, DashboardReportSnapshot> = {};
-        for (const snapshot of response.reports ?? []) {
-          const source = dashboardQueries[snapshot.index];
-          if (source) nextSnapshots[source.templateId] = { ...snapshot, clientCacheKey: reportWidgetCacheKey(source.query) };
-        }
-        setSnapshotByTemplateId(nextSnapshots);
-        setSnapshotError('');
+      const loaded = await mapWithConcurrency(
+        dashboardQueries,
+        dashboardSnapshotRequestConcurrency,
+        async (item): Promise<{ item: DashboardQuery; snapshot?: DashboardReportSnapshot; error?: string }> => {
+          try {
+            const response = await api<DashboardReportSnapshotsResponse>('/reports/snapshots', {
+              method: 'POST',
+              body: JSON.stringify({ reports: [item.query] }),
+            });
+            const snapshot = response.reports?.[0];
+            return {
+              item,
+              snapshot: snapshot ? { ...snapshot, clientCacheKey: reportWidgetCacheKey(item.query) } : undefined,
+            };
+          } catch (err) {
+            return {
+              item,
+              error: err instanceof Error ? err.message : 'Не удалось загрузить отчёт',
+            };
+          }
+        },
+      );
+      if (cancelled) return;
 
-        const shouldPollSnapshots = (response.reports ?? []).some(
-          (snapshot) => snapshot.status === 'PENDING' && (!snapshot.payload || snapshot.payload.type === 'pending'),
-        );
-        if (shouldPollSnapshots) {
-          pollTimer = window.setTimeout(() => setSnapshotPollStamp((value) => value + 1), 20_000);
+      const nextSnapshots: Record<string, DashboardReportSnapshot> = {};
+      const nextErrors: Record<string, string> = {};
+      let shouldPollSnapshots = false;
+
+      for (const item of loaded) {
+        if (item.snapshot) {
+          nextSnapshots[item.item.templateId] = item.snapshot;
+          if (item.snapshot.status === 'PENDING' && (!item.snapshot.payload || item.snapshot.payload.type === 'pending')) {
+            shouldPollSnapshots = true;
+          }
+        } else {
+          nextErrors[item.item.templateId] = item.error || 'Не удалось загрузить отчёт';
         }
-      } catch (err) {
-        if (!cancelled) {
-          setSnapshotError(err instanceof Error ? err.message : 'Не удалось загрузить отчёты');
-        }
+      }
+
+      setSnapshotByTemplateId(nextSnapshots);
+      setSnapshotErrorByTemplateId(nextErrors);
+
+      if (shouldPollSnapshots) {
+        pollTimer = window.setTimeout(() => setSnapshotPollStamp((value) => value + 1), 20_000);
       }
     }
 
@@ -1132,7 +1159,7 @@ function WorkspaceTab({
       filters={filters}
       refreshStamp={refreshStamp}
       snapshot={snapshotByTemplateId[template.id]}
-      snapshotError={snapshotError}
+      snapshotError={snapshotErrorByTemplateId[template.id]}
       template={template}
     />
   );
@@ -1509,6 +1536,23 @@ function writeReportWidgetCache(cacheKey: string, result: Record<string, any>) {
   } catch {
     // Cache is best-effort. Reports still work without it.
   }
+}
+
+async function mapWithConcurrency<T, R>(items: T[], concurrency: number, worker: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = [];
+  let cursor = 0;
+
+  async function runNext() {
+    while (cursor < items.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await worker(items[index]);
+    }
+  }
+
+  const runners = Array.from({ length: Math.min(concurrency, items.length) }, () => runNext());
+  await Promise.all(runners);
+  return results;
 }
 
 function stableStringify(value: unknown): string {
