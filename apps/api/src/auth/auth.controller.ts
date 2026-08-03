@@ -1,5 +1,5 @@
 import { Body, Controller, Get, Post, Request, UseGuards } from '@nestjs/common';
-import { Throttle } from '@nestjs/throttler';
+import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import { UserRole } from '../generated/prisma';
 import { Roles } from '../common/decorators/roles.decorator';
 import { AuthService } from './auth.service';
@@ -13,6 +13,7 @@ export class AuthController {
   constructor(private readonly auth: AuthService) {}
 
   @Post('login')
+  @UseGuards(ThrottlerGuard)
   @Throttle({ default: { ttl: 60_000, limit: 5 } })
   login(@Body() dto: LoginDto, @Request() req: any) {
     return this.auth.login(dto, req.ip);
