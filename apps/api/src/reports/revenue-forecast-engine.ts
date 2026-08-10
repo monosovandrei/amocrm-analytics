@@ -15,7 +15,7 @@ import {
 } from './revenue-forecast-model';
 
 const DAY_MS = 86_400_000;
-const MODEL_VERSION = 'revenue-v2.0';
+const MODEL_VERSION = 'revenue-v2.1';
 
 type ForecastDeal = {
   id: string;
