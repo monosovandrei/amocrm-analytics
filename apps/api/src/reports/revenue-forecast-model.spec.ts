@@ -101,6 +101,34 @@ describe('revenue forecast model', () => {
     expect(beforeDelivery.probability).toBeLessThan(afterDelivery.probability);
   });
 
+  it('conditions an overdue delivery on the delay already observed', () => {
+    const observations = [-6, 0, 2, 20, 30].map((errorDays) => ({
+      observedAt: now,
+      errorDays,
+      featureKeys: [],
+    }));
+    const unconditional = scoreDeliveryProbability(observations, 25, {
+      now,
+      priorProbability: 0.5,
+      priorWeight: 1,
+    });
+    const overdue = scoreDeliveryProbability(observations, 25, {
+      now,
+      minimumErrorDays: 10,
+      priorProbability: 0.5,
+      priorWeight: 1,
+    });
+
+    expect(overdue.sampleSize).toBe(2);
+    expect(overdue.probability).toBeLessThan(unconditional.probability);
+    expect(scoreDeliveryProbability(observations, 10, {
+      now,
+      minimumErrorDays: 10,
+      priorProbability: 0.5,
+      priorWeight: 1,
+    }).probability).toBe(0);
+  });
+
   it('extracts stable commercial and configuration features', () => {
     const features = buildForecastFeatureSet({
       managerId: 'manager-1',

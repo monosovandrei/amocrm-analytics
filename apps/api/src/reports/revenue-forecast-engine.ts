@@ -192,16 +192,20 @@ export class RevenueForecastEngine {
       let predictedShipAt = this.stagePredictedDate(stageEpisodes, elapsedStageDays, input.now, features);
 
       if (deliveryAt) {
+        const minimumErrorDays = moscowCalendarDayDiff(deliveryAt, input.now);
         const maximumErrorDays = moscowCalendarDayDiff(deliveryAt, input.monthTo);
         estimate = scoreDeliveryProbability(deliveryObservations, maximumErrorDays, {
           now: input.now,
           currentFeatures: features,
           priorProbability: stageEstimate.probability,
           priorWeight: Math.max(4, Math.min(12, stageEstimate.sampleWeight)),
+          minimumErrorDays,
         });
         probabilitySource = 'delivery_model';
-        const medianError = weightedDurationQuantile(deliveryErrors, 0.5, input.now, features.keys);
-        predictedShipAt = addDays(deliveryAt, medianError ?? 0);
+        const conditionalErrors = deliveryErrors.filter((item) => item.durationDays > minimumErrorDays);
+        const medianError = weightedDurationQuantile(conditionalErrors, 0.5, input.now, features.keys);
+        const deliveryPrediction = addDays(deliveryAt, medianError ?? Math.max(0, minimumErrorDays));
+        predictedShipAt = deliveryPrediction > input.now ? deliveryPrediction : input.now;
       }
 
       const prediction = buildPrediction({

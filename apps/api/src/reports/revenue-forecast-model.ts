@@ -179,10 +179,13 @@ export function scoreDurationProbability(
 export function scoreDeliveryProbability(
   observations: ForecastDeliveryObservation[],
   maximumErrorDays: number,
-  options: Omit<ScoreOptions, 'horizonDays' | 'elapsedDays'>,
+  options: Omit<ScoreOptions, 'horizonDays' | 'elapsedDays'> & { minimumErrorDays?: number },
 ) {
+  const minimumErrorDays = options.minimumErrorDays ?? Number.NEGATIVE_INFINITY;
+  if (maximumErrorDays <= minimumErrorDays) return emptyEstimate(0);
+  const eligible = observations.filter((item) => item.errorDays > minimumErrorDays);
   return scoreWeightedBinary(
-    observations.map((item) => ({
+    eligible.map((item) => ({
       value: item.errorDays <= maximumErrorDays,
       weight: recencyWeight(item.observedAt, options.now, options.halfLifeDays ?? 90),
       featureKeys: new Set(item.featureKeys),
