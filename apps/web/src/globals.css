@@ -1553,7 +1553,7 @@ button:disabled {
 
 .revenue-forecast-summary {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 10px;
 }
 
@@ -1598,6 +1598,21 @@ button:disabled {
   color: #b45309;
   font-size: 12px;
   font-weight: 700;
+}
+
+.revenue-forecast-model-meta {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  color: var(--pb-text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.revenue-forecast-model-meta strong {
+  color: var(--pb-text-primary);
+  font-weight: 850;
 }
 
 .revenue-forecast-section {
@@ -2618,6 +2633,10 @@ button:disabled {
   }
 
   .dashboard-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .revenue-forecast-summary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 

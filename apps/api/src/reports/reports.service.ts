@@ -27,6 +27,12 @@ import {
   ReportConfig,
   ReportFilters,
 } from './report-types';
+import {
+  ForecastPaymentGroup,
+  RevenueForecastEngine,
+  RevenueForecastEngineResult,
+  RevenueForecastPrediction,
+} from './revenue-forecast-engine';
 
 type XlsxValue = string | number | boolean | null | undefined;
 type XlsxSheet = { name: string; rows: XlsxValue[][] };
@@ -123,6 +129,7 @@ export class ReportsService {
   private readonly freshComputeConcurrency = this.resolveFreshComputeConcurrency();
   private activeFreshComputes = 0;
   private reportCacheReady?: Promise<void>;
+  private forecastSnapshotReady?: Promise<void>;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -3994,9 +4001,7 @@ ${sheets}
     const now = new Date();
     const monthFrom = this.startOfMoscowMonth(now);
     const monthTo = this.endOfMoscowMonth(now);
-    const recentShippingRange = { gte: this.addDays(now, -30), lte: now };
     const profitRate = 0.32;
-    const warnings: string[] = [];
 
     if (!refs.ready) {
       return {
@@ -4008,111 +4013,6 @@ ${sheets}
         summary: { revenue: 0, profit: null, count: 0 },
       };
     }
-
-    const shippingStageIds = refs.assemblyStages.map((stage) => stage.id);
-    const shippingCycle = await this.computeStageGroupToTargetCycle(
-      refs.assemblyPipeline!.id,
-      shippingStageIds,
-      refs.shippingDoneStage!.id,
-      recentShippingRange,
-    );
-    if (shippingCycle.avgDays == null) {
-      warnings.push('Нет сделок, отгруженных за последние 30 дней. Цикл отгрузки рассчитан как 0 дней.');
-    }
-
-    const shippingDays = shippingCycle.avgDays ?? 0;
-    const salesWonStageIds = refs.salesWonStages.map((stage) => stage.id);
-    const invoiceSpeed = await this.computeStageToSuccessSpeed(refs.salesPipeline!.id, [refs.invoiceStage!.id], salesWonStageIds);
-    const quoteSpeed = await this.computeStageToSuccessSpeed(
-      refs.salesPipeline!.id,
-      refs.quoteStages.map((stage) => stage.id),
-      salesWonStageIds,
-    );
-    const salesSuccessStageIdsByPipelineId = { [refs.salesPipeline!.id]: salesWonStageIds };
-    const invoiceProbability = await this.computeStageSuccessProbabilityModel({
-      pipelineIds: [refs.salesPipeline!.id],
-      stageIds: [refs.invoiceStage!.id],
-      successStageIdsByPipelineId: salesSuccessStageIdsByPipelineId,
-      defaultProbability: 0.9,
-    });
-    const quoteProbability = await this.computeStageSuccessProbabilityModel({
-      pipelineIds: [refs.salesPipeline!.id],
-      stageIds: refs.quoteStages.map((stage) => stage.id),
-      successStageIdsByPipelineId: salesSuccessStageIdsByPipelineId,
-      defaultProbability: 0.3,
-    });
-    const repeatSuccessStageIds = refs.repeatPipelines.flatMap((item) => item.wonStages.map((stage) => stage.id));
-    const repeatSpeeds = await Promise.all(
-      refs.repeatPipelines.map(async (pipeline) => {
-        return {
-          ...pipeline,
-          invoiceSpeed: pipeline.invoiceStage
-            ? await this.computeStageToSuccessSpeed(pipeline.id, [pipeline.invoiceStage.id], repeatSuccessStageIds)
-            : null,
-          quoteSpeed: pipeline.quoteStages.length
-            ? await this.computeStageToSuccessSpeed(
-                pipeline.id,
-                pipeline.quoteStages.map((stage) => stage.id),
-                repeatSuccessStageIds,
-              )
-            : null,
-          invoiceProbability: pipeline.invoiceStage
-            ? await this.computeStageSuccessProbabilityModel({
-                pipelineIds: [pipeline.id],
-                stageIds: [pipeline.invoiceStage.id],
-                successStageIdsByPipelineId: { [pipeline.id]: repeatSuccessStageIds },
-                defaultProbability: 0.9,
-              })
-            : null,
-          quoteProbability: pipeline.quoteStages.length
-            ? await this.computeStageSuccessProbabilityModel({
-                pipelineIds: [pipeline.id],
-                stageIds: pipeline.quoteStages.map((stage) => stage.id),
-                successStageIdsByPipelineId: { [pipeline.id]: repeatSuccessStageIds },
-                defaultProbability: 0.3,
-              })
-            : null,
-        };
-      }),
-    );
-
-    const buckets = this.createRevenueForecastBuckets();
-    const addDeal = (
-      bucketKey: RevenueForecastBucketKey,
-      deal: any,
-      probability: number | StageSuccessProbability,
-      source: string,
-      predictedShipAt: Date | null,
-      closeDays: number | null,
-      shippingRemainingDays: number | null,
-    ) => {
-      const probabilityValue = typeof probability === 'number' ? probability : probability.probability;
-      const probabilitySource = typeof probability === 'number' ? 'fixed' : probability.source;
-      const probabilitySample = typeof probability === 'number' ? null : probability.personalSample || probability.teamSample;
-      const revenue = Number(deal.amount ?? 0) * probabilityValue;
-      const profit = revenue * profitRate;
-      const bucket = buckets[bucketKey];
-      bucket.count += 1;
-      bucket.revenue += revenue;
-      bucket.profit = (bucket.profit ?? 0) + profit;
-      bucket.deals.push({
-        dealId: deal.id,
-        dealExternalId: deal.externalId,
-        title: deal.title,
-        manager: deal.responsible?.name ?? 'Без менеджера',
-        stage: deal.stage?.name ?? '',
-        source,
-        probabilityPercent: Math.round(probabilityValue * 100),
-        probabilitySource,
-        probabilitySample,
-        amount: Number(deal.amount ?? 0),
-        revenue: Math.round(revenue),
-        profit: Math.round(profit),
-        closeDays,
-        shippingRemainingDays,
-        predictedShipAt: predictedShipAt?.toISOString() ?? null,
-      });
-    };
 
     const alreadyShippedEntries = await this.prisma.factStageTransition.findMany({
       where: {
@@ -4134,96 +4034,136 @@ ${sheets}
         alreadyShippedByDeal.set(deal.id, { deal, shippedAt: entry.movedAt });
       }
     }
-    for (const { deal, shippedAt } of alreadyShippedByDeal.values()) {
-      addDeal(this.revenueForecastShippedBucket(deal, refs), deal, 1, 'Отгружено', shippedAt, null, 0);
-    }
 
     const assemblyDeals = (await this.findCurrentStageDealsFromFacts(this.fixedPipelineFilters(filters, refs.assemblyPipeline!.id, undefined, { ignoreTeam: true }), role))
       .filter((deal) => !this.isBusinessWonStage(deal.stage) && !this.isBusinessLostStage(deal.stage));
-    const assemblyEntryByDeal = await this.firstStageEntryByDeal(assemblyDeals.map((deal) => deal.id), shippingStageIds);
-    for (const deal of assemblyDeals) {
-      const enteredAt = assemblyEntryByDeal.get(deal.id) ?? deal.createdAt;
-      const elapsedDays = this.absoluteDurationDays(enteredAt, now) ?? 0;
-      const remainingDays = Math.max(shippingDays - elapsedDays, 0);
-      const predictedShipAt = this.addDays(now, remainingDays);
-      addDeal(this.revenueForecastShippingBucket(deal, refs, predictedShipAt <= monthTo), deal, 1, 'Сборка', predictedShipAt, null, remainingDays);
-    }
-
     const invoiceDeals = await this.findCurrentStageDealsFromFacts(
       this.fixedPipelineFilters(filters, refs.salesPipeline!.id, [refs.invoiceStage!.id]),
       role,
     );
-    for (const deal of invoiceDeals) {
-      const closeDays = invoiceSpeed.average(deal.stageId, deal.responsibleId);
-      const predictedShipAt = closeDays == null ? null : this.addDays(now, closeDays + shippingDays);
-      addDeal(
-        predictedShipAt && predictedShipAt <= monthTo ? 'salesInvoiceThisMonth' : 'salesNotThisMonth',
-        deal,
-        invoiceProbability.probability(deal.stageId, deal.responsibleId),
-        'Счёт отправлен',
-        predictedShipAt,
-        closeDays,
-        shippingDays,
-      );
-    }
-
     const quoteDeals = await this.findCurrentStageDealsFromFacts(
       this.fixedPipelineFilters(filters, refs.salesPipeline!.id, refs.quoteStages.map((stage) => stage.id)),
       role,
     );
-    for (const deal of quoteDeals) {
-      const closeDays = quoteSpeed.average(deal.stageId, deal.responsibleId);
-      const predictedShipAt = closeDays == null ? null : this.addDays(now, closeDays + shippingDays);
-      addDeal(
-        predictedShipAt && predictedShipAt <= monthTo ? 'salesQuoteThisMonth' : 'salesNotThisMonth',
-        deal,
-        quoteProbability.probability(deal.stageId, deal.responsibleId),
-        deal.stage?.name ?? 'КП / возражения',
-        predictedShipAt,
-        closeDays,
-        shippingDays,
-      );
+    const repeatDealGroups: Array<{
+      pipeline: typeof refs.repeatPipelines[number];
+      invoiceDeals: any[];
+      quoteDeals: any[];
+    }> = [];
+    for (const pipeline of refs.repeatPipelines) {
+      const repeatInvoiceDeals = pipeline.invoiceStage
+        ? await this.findCurrentStageDealsFromFacts(this.fixedPipelineFilters(filters, pipeline.id, [pipeline.invoiceStage.id]), role)
+        : [];
+      const repeatQuoteDeals = pipeline.quoteStages.length
+        ? await this.findCurrentStageDealsFromFacts(this.fixedPipelineFilters(filters, pipeline.id, pipeline.quoteStages.map((stage) => stage.id)), role)
+        : [];
+      repeatDealGroups.push({ pipeline, invoiceDeals: repeatInvoiceDeals, quoteDeals: repeatQuoteDeals });
     }
 
-    for (const pipeline of repeatSpeeds) {
-      if (pipeline.invoiceStage && pipeline.invoiceSpeed && pipeline.invoiceProbability) {
-        const deals = await this.findCurrentStageDealsFromFacts(
-          this.fixedPipelineFilters(filters, pipeline.id, [pipeline.invoiceStage.id]),
-          role,
-        );
-        for (const deal of deals) {
-          const closeDays = pipeline.invoiceSpeed.average(deal.stageId, deal.responsibleId);
-          const predictedShipAt = closeDays == null ? null : this.addDays(now, closeDays + shippingDays);
-          addDeal(
-            predictedShipAt && predictedShipAt <= monthTo ? 'repeatInvoiceThisMonth' : 'repeatNotThisMonth',
-            deal,
-            pipeline.invoiceProbability.probability(deal.stageId, deal.responsibleId),
-            `${pipeline.name}: счет отправлен`,
-            predictedShipAt,
-            closeDays,
-            shippingDays,
-          );
-        }
-      }
+    const paymentGroups: ForecastPaymentGroup[] = [
+      {
+        key: 'sales',
+        pipelineId: refs.salesPipeline!.id,
+        stageIds: [refs.invoiceStage!.id, ...refs.quoteStages.map((stage) => stage.id)],
+        successStageIds: refs.salesWonStages.map((stage) => stage.id),
+        lossStageIds: refs.salesLossStages.map((stage) => stage.id),
+        deals: [...invoiceDeals, ...quoteDeals],
+      },
+      ...repeatDealGroups.map(({ pipeline, invoiceDeals: repeatInvoices, quoteDeals: repeatQuotes }) => ({
+        key: `repeat:${pipeline.id}`,
+        pipelineId: pipeline.id,
+        stageIds: [pipeline.invoiceStage?.id, ...pipeline.quoteStages.map((stage) => stage.id)].filter(Boolean) as string[],
+        successStageIds: pipeline.wonStages.map((stage) => stage.id),
+        lossStageIds: pipeline.lossStages.map((stage) => stage.id),
+        deals: [...repeatInvoices, ...repeatQuotes],
+      })),
+    ];
 
-      if (pipeline.quoteStages.length && pipeline.quoteSpeed && pipeline.quoteProbability) {
-        const deals = await this.findCurrentStageDealsFromFacts(
-          this.fixedPipelineFilters(filters, pipeline.id, pipeline.quoteStages.map((stage) => stage.id)),
-          role,
-        );
-        for (const deal of deals) {
-          const closeDays = pipeline.quoteSpeed.average(deal.stageId, deal.responsibleId);
-          const predictedShipAt = closeDays == null ? null : this.addDays(now, closeDays + shippingDays);
-          addDeal(
-            predictedShipAt && predictedShipAt <= monthTo ? 'repeatQuoteThisMonth' : 'repeatNotThisMonth',
-            deal,
-            pipeline.quoteProbability.probability(deal.stageId, deal.responsibleId),
-            `${pipeline.name}: ${deal.stage?.name ?? 'предложение'}`,
-            predictedShipAt,
-            closeDays,
-            shippingDays,
-          );
-        }
+    const stagePositions = new Map(refs.assemblyStages.map((stage) => [stage.id, stage.position]));
+    const engineResult = await new RevenueForecastEngine(this.prisma).compute({
+      now,
+      monthTo,
+      assemblyDeals,
+      assemblyStageIds: refs.assemblyStages.map((stage) => stage.id),
+      assemblyStartStageId: refs.assemblyStartStage!.id,
+      itemsInTransitPosition: refs.itemsInTransitStage!.position,
+      stagePositions,
+      shippingDoneStageId: refs.shippingDoneStage!.id,
+      shippingLossStageIds: refs.assemblyLossStages.map((stage) => stage.id),
+      paymentGroups,
+    });
+
+    const buckets = this.createRevenueForecastBuckets();
+    const openForecastDeals: Array<{ amount: number; probability: number }> = [];
+    const addDeal = (
+      bucketKey: RevenueForecastBucketKey,
+      deal: any,
+      source: string,
+      prediction: RevenueForecastPrediction | null,
+      shippedAt?: Date,
+    ) => {
+      const probability = prediction?.probability ?? 1;
+      const amount = Number(deal.amount ?? 0);
+      const revenue = amount * probability;
+      const profit = revenue * profitRate;
+      const bucket = buckets[bucketKey];
+      bucket.count += 1;
+      bucket.revenue += revenue;
+      bucket.profit = (bucket.profit ?? 0) + profit;
+      if (prediction) openForecastDeals.push({ amount, probability });
+      bucket.deals.push({
+        dealId: deal.id,
+        dealExternalId: deal.externalId,
+        title: deal.title,
+        manager: deal.responsible?.name ?? 'Без менеджера',
+        stage: deal.stage?.name ?? '',
+        source,
+        probabilityPercent: prediction?.probabilityPercent ?? 100,
+        probabilitySource: prediction?.probabilitySource ?? 'actual',
+        probabilitySample: prediction?.probabilitySample ?? null,
+        confidencePercent: prediction?.confidencePercent ?? 100,
+        baseProbabilityPercent: prediction?.baseProbabilityPercent ?? 100,
+        paymentProbabilityPercent: prediction?.paymentProbabilityPercent ?? null,
+        shippingProbabilityPercent: prediction?.shippingProbabilityPercent ?? 100,
+        deliveryAt: prediction?.deliveryAt?.toISOString() ?? null,
+        drivers: prediction?.drivers ?? [],
+        featureSummary: prediction?.featureSummary ?? null,
+        amount,
+        revenue: Math.round(revenue),
+        profit: Math.round(profit),
+        elapsedStageDays: prediction?.elapsedStageDays ?? null,
+        predictedShipAt: prediction?.predictedShipAt?.toISOString() ?? shippedAt?.toISOString() ?? null,
+      });
+    };
+
+    for (const { deal, shippedAt } of alreadyShippedByDeal.values()) {
+      addDeal(this.revenueForecastShippedBucket(deal, refs), deal, 'Фактически отгружено', null, shippedAt);
+    }
+    for (const deal of assemblyDeals) {
+      const prediction = engineResult.predictions.get(deal.id)!;
+      addDeal(
+        this.revenueForecastShippingBucket(deal, refs, prediction.probability >= 0.5),
+        deal,
+        prediction.deliveryAt ? 'Сборка: Delivery + история этапа' : 'Сборка: история этапа',
+        prediction,
+      );
+    }
+    for (const deal of invoiceDeals) {
+      const prediction = engineResult.predictions.get(deal.id)!;
+      addDeal(prediction.probability >= 0.5 ? 'salesInvoiceThisMonth' : 'salesNotThisMonth', deal, 'Счёт: оплата × отгрузка', prediction);
+    }
+    for (const deal of quoteDeals) {
+      const prediction = engineResult.predictions.get(deal.id)!;
+      addDeal(prediction.probability >= 0.5 ? 'salesQuoteThisMonth' : 'salesNotThisMonth', deal, `${deal.stage?.name ?? 'КП'}: оплата × отгрузка`, prediction);
+    }
+    for (const { pipeline, invoiceDeals: repeatInvoices, quoteDeals: repeatQuotes } of repeatDealGroups) {
+      for (const deal of repeatInvoices) {
+        const prediction = engineResult.predictions.get(deal.id)!;
+        addDeal(prediction.probability >= 0.5 ? 'repeatInvoiceThisMonth' : 'repeatNotThisMonth', deal, `${pipeline.name}: счёт × отгрузка`, prediction);
+      }
+      for (const deal of repeatQuotes) {
+        const prediction = engineResult.predictions.get(deal.id)!;
+        addDeal(prediction.probability >= 0.5 ? 'repeatQuoteThisMonth' : 'repeatNotThisMonth', deal, `${pipeline.name}: КП × отгрузка`, prediction);
       }
     }
 
@@ -4233,20 +4173,27 @@ ${sheets}
       profit: Math.round(bucket.profit ?? 0),
       deals: bucket.deals.sort((a: any, b: any) => String(a.predictedShipAt ?? '').localeCompare(String(b.predictedShipAt ?? ''))),
     }));
-    const inMonthRows = rows.filter((row) => !['salesNotThisMonth', 'repeatNotThisMonth'].includes(row.id));
-    const summaryProfit = rows.reduce((sum, row) => sum + Number(row.profit ?? 0), 0);
-
-    return {
+    const expectedRevenue = rows.reduce((sum, row) => sum + row.revenue, 0);
+    const expectedProfit = rows.reduce((sum, row) => sum + Number(row.profit ?? 0), 0);
+    const actualRevenue = [...alreadyShippedByDeal.values()].reduce((sum, item) => sum + Number(item.deal.amount ?? 0), 0);
+    const forecastVariance = openForecastDeals.reduce(
+      (sum, item) => sum + (item.amount ** 2) * item.probability * (1 - item.probability),
+      0,
+    );
+    const riskDeviation = Math.sqrt(forecastVariance) * 1.15;
+    const committedRevenue = actualRevenue + openForecastDeals
+      .filter((item) => item.probability >= 0.8)
+      .reduce((sum, item) => sum + item.amount * item.probability, 0);
+    const report = {
       type: 'revenueProfitForecast',
       ready: true,
+      modelVersion: engineResult.modelVersion,
       month: {
         to: monthTo.toISOString(),
         daysLeft: Number((this.absoluteDurationDays(now, monthTo) ?? 0).toFixed(1)),
       },
-      shippingCycle: {
-        ...shippingCycle,
-        basis: 'Сделки, отгруженные за последние 30 дней',
-      },
+      shippingCycle: engineResult.shippingCycle,
+      deliveryCalibration: engineResult.deliveryCalibration,
       profit: {
         available: true,
         basis: '32% от суммы сделки',
@@ -4255,24 +4202,158 @@ ${sheets}
         fieldName: null,
       },
       assumptions: [
-        'Сборка считается с вероятностью 100%.',
-        'Счета, КП и возражения взвешиваются по персональной исторической конверсии менеджера.',
-        'Конверсии считаются по переходам за последние 30 дней.',
-        'Если у менеджера мало данных, берётся конверсия команды, затем базовые 90% для счёта и 30% для КП.',
-        'База и Закрепленные Компании считаются как Повторные продажи.',
-        'Уже отгруженные сделки показываются отдельной строкой с вероятностью 100%.',
+        'Открытые сделки взвешиваются по вероятности фактической отгрузки до конца меся.',
+        'Для счетов и КП совместно считаются вероятность оплаты по дням и вероятность успеть отгрузить после оплаты.',
+        'Открытые и зависшие сделки остаются в знаменателе; старые данные получают меньший вес.',
+        'Delivery калибруется по разнице между указанной датой и фактической отгрузкой.',
+        'Малые выборки менеджера, страны, домена, тега и конфигурации сглаживаются статистикой отдела.',
       ],
-      warnings,
+      warnings: [...refs.warnings, ...engineResult.warnings],
       summary: {
-        count: inMonthRows.reduce((sum, row) => sum + row.count, 0),
-        revenue: Math.round(inMonthRows.reduce((sum, row) => sum + row.revenue, 0)),
-        profit: Math.round(inMonthRows.reduce((sum, row) => sum + Number(row.profit ?? 0), 0)),
-        allRevenue: Math.round(rows.reduce((sum, row) => sum + row.revenue, 0)),
-        allProfit: Math.round(summaryProfit),
+        count: alreadyShippedByDeal.size + openForecastDeals.length,
+        revenue: Math.round(expectedRevenue),
+        profit: Math.round(expectedProfit),
+        actualRevenue: Math.round(actualRevenue),
+        committedRevenue: Math.round(committedRevenue),
+        lowRevenue: Math.round(Math.max(actualRevenue, expectedRevenue - 1.28 * riskDeviation)),
+        highRevenue: Math.round(expectedRevenue + 1.28 * riskDeviation),
+        pipelineAmount: Math.round(actualRevenue + openForecastDeals.reduce((sum, item) => sum + item.amount, 0)),
       },
       rows,
       totals: this.createRevenueForecastTotalRows(rows),
     };
+    await this.saveRevenueForecastSnapshot(engineResult, report, now, monthTo);
+    return report;
+  }
+
+  private async ensureRevenueForecastSnapshotSchema() {
+    this.forecastSnapshotReady ??= (async () => {
+      await this.prisma.$executeRawUnsafe(`
+        CREATE TABLE IF NOT EXISTS forecast_model_run (
+          run_id TEXT PRIMARY KEY,
+          model_version TEXT NOT NULL,
+          forecast_at TIMESTAMPTZ NOT NULL,
+          forecast_month DATE NOT NULL,
+          expected_revenue NUMERIC NOT NULL,
+          actual_revenue NUMERIC NOT NULL,
+          summary JSONB NOT NULL,
+          diagnostics JSONB NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await this.prisma.$executeRawUnsafe(`
+        CREATE TABLE IF NOT EXISTS forecast_deal_snapshot (
+          run_id TEXT NOT NULL REFERENCES forecast_model_run(run_id) ON DELETE CASCADE,
+          deal_id TEXT NOT NULL,
+          deal_external_id TEXT NOT NULL,
+          stage_id TEXT NOT NULL,
+          amount NUMERIC NOT NULL,
+          feature_keys JSONB NOT NULL,
+          prediction JSONB NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (run_id, deal_id)
+        )
+      `);
+      await this.prisma.$executeRawUnsafe(`
+        CREATE INDEX IF NOT EXISTS forecast_model_run_forecast_at_idx
+        ON forecast_model_run (forecast_at DESC)
+      `);
+      await this.prisma.$executeRawUnsafe(`
+        CREATE INDEX IF NOT EXISTS forecast_deal_snapshot_deal_idx
+        ON forecast_deal_snapshot (deal_id, created_at DESC)
+      `);
+    })();
+    return this.forecastSnapshotReady;
+  }
+
+  private async saveRevenueForecastSnapshot(
+    engineResult: RevenueForecastEngineResult,
+    report: Record<string, any>,
+    now: Date,
+    monthTo: Date,
+  ) {
+    await this.ensureRevenueForecastSnapshotSchema();
+    const hourSlot = Math.floor(now.getTime() / 3_600_000);
+    const dealScope = createHash('sha256')
+      .update(engineResult.snapshotRows.map((row) => row.dealId).sort().join('|'))
+      .digest('hex')
+      .slice(0, 12);
+    const runId = createHash('sha256')
+      .update(`${engineResult.modelVersion}:${hourSlot}:${dealScope}`)
+      .digest('hex');
+    const summary = report.summary ?? {};
+    const diagnostics = {
+      shippingCycle: engineResult.shippingCycle,
+      deliveryCalibration: engineResult.deliveryCalibration,
+      warnings: engineResult.warnings,
+    };
+    await this.prisma.$executeRawUnsafe(
+      `
+        INSERT INTO forecast_model_run (
+          run_id, model_version, forecast_at, forecast_month,
+          expected_revenue, actual_revenue, summary, diagnostics
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb)
+        ON CONFLICT (run_id) DO UPDATE SET
+          forecast_at = EXCLUDED.forecast_at,
+          expected_revenue = EXCLUDED.expected_revenue,
+          actual_revenue = EXCLUDED.actual_revenue,
+          summary = EXCLUDED.summary,
+          diagnostics = EXCLUDED.diagnostics
+      `,
+      runId,
+      engineResult.modelVersion,
+      now,
+      monthTo,
+      Number(summary.revenue ?? 0),
+      Number(summary.actualRevenue ?? 0),
+      JSON.stringify(summary),
+      JSON.stringify(diagnostics),
+    );
+    const rows = engineResult.snapshotRows.map((row) => ({
+      deal_id: row.dealId,
+      deal_external_id: row.dealExternalId,
+      stage_id: row.stageId,
+      amount: row.amount,
+      feature_keys: row.featureKeys,
+      prediction: row.prediction,
+    }));
+    if (rows.length) {
+      await this.prisma.$executeRawUnsafe(
+        `
+          INSERT INTO forecast_deal_snapshot (
+            run_id, deal_id, deal_external_id, stage_id, amount, feature_keys, prediction
+          )
+          SELECT
+            $1,
+            item.deal_id,
+            item.deal_external_id,
+            item.stage_id,
+            item.amount,
+            item.feature_keys,
+            item.prediction
+          FROM jsonb_to_recordset($2::jsonb) AS item(
+            deal_id TEXT,
+            deal_external_id TEXT,
+            stage_id TEXT,
+            amount NUMERIC,
+            feature_keys JSONB,
+            prediction JSONB
+          )
+          ON CONFLICT (run_id, deal_id) DO UPDATE SET
+            stage_id = EXCLUDED.stage_id,
+            amount = EXCLUDED.amount,
+            feature_keys = EXCLUDED.feature_keys,
+            prediction = EXCLUDED.prediction
+        `,
+        runId,
+        JSON.stringify(rows),
+      );
+    }
+    await this.prisma.$executeRawUnsafe(`
+      DELETE FROM forecast_model_run
+      WHERE forecast_at < NOW() - INTERVAL '400 days'
+    `);
   }
 
   private async computeForecast(filters: ReportFilters) {
@@ -4431,11 +4512,25 @@ ${sheets}
     const quoteStages = quoteLikeStages(salesStages);
     const salesWonStages = this.businessWonStages(salesStages);
     const salesWonStage = salesWonStages[0] ?? null;
+    const salesLossStages = salesStages.filter((stage) => this.isBusinessLostStage(stage));
     const shippingDoneStage =
       assemblyStages.find((stage) => this.normalizeStageName(stage.name).includes('отгруж')) ??
       assemblyStages.find((stage) => this.isBusinessWonStage(stage)) ??
       null;
     const openAssemblyStages = assemblyStages.filter((stage) => !this.isBusinessWonStage(stage) && !this.isBusinessLostStage(stage));
+    const assemblyLossStages = assemblyStages.filter((stage) => this.isBusinessLostStage(stage));
+    const assemblyStartStage =
+      openAssemblyStages.find((stage) => this.normalizeStageName(stage.name).includes('paid')) ??
+      openAssemblyStages.find((stage) => this.normalizeStageName(stage.name).includes('оплач')) ??
+      openAssemblyStages[0] ??
+      null;
+    const itemsInTransitStage =
+      openAssemblyStages.find((stage) => {
+        const name = this.normalizeStageName(stage.name);
+        return name.includes('items') && name.includes('transit');
+      }) ??
+      openAssemblyStages.find((stage) => stage.position >= 50) ??
+      null;
     const repeatPipelines: Array<{
       id: string;
       name: string;
@@ -4443,6 +4538,7 @@ ${sheets}
       quoteStages: Array<{ id: string; name: string; isWon?: boolean; isLost?: boolean }>;
       wonStage: { id: string; name: string; isWon?: boolean; isLost?: boolean };
       wonStages: Array<{ id: string; name: string; isWon?: boolean; isLost?: boolean }>;
+      lossStages: Array<{ id: string; name: string; isWon?: boolean; isLost?: boolean }>;
     }> = [];
     for (const pipeline of [basePipeline, assignedCompaniesPipeline]) {
       if (!pipeline) continue;
@@ -4450,6 +4546,11 @@ ${sheets}
       const wonStages = this.businessWonStages(stages);
       const wonStage = wonStages[0] ?? null;
       if (!wonStage) continue;
+      const lossStages = stages.filter((stage) => (
+        this.isBusinessLostStage(stage) ||
+        (this.normalizeStageName(pipeline.name) === this.normalizeStageName('База') &&
+          this.normalizeStageName(stage.name).includes('свободная база'))
+      ));
       repeatPipelines.push({
         id: pipeline.id,
         name: pipeline.name,
@@ -4457,6 +4558,7 @@ ${sheets}
         quoteStages: quoteLikeStages(stages),
         wonStage,
         wonStages,
+        lossStages,
       });
     }
 
@@ -4469,6 +4571,8 @@ ${sheets}
       quoteStages.length ? '' : 'Не найдены этапы КП/возражения.',
       salesWonStage ? '' : 'Не найден успешный этап продаж.',
       shippingDoneStage ? '' : 'Не найден этап отгружено в сборке.',
+      assemblyStartStage ? '' : 'Не найден стартовый этап PAID! в Сборке.',
+      itemsInTransitStage ? '' : 'Не найден этап Items in transit в Сборке.',
       ...repeatPipelines.flatMap((pipeline) => [
         pipeline.invoiceStage ? '' : `Не найден этап Счёт отправлен в воронке ${pipeline.name}.`,
         pipeline.quoteStages.length ? '' : `Не найден этап предложения/КП в воронке ${pipeline.name}.`,
@@ -4482,10 +4586,14 @@ ${sheets}
       assemblyPipeline,
       salesWonStage,
       salesWonStages,
+      salesLossStages,
       invoiceStage,
       quoteStages,
       repeatPipelines,
       shippingDoneStage,
+      assemblyStartStage,
+      itemsInTransitStage,
+      assemblyLossStages,
       assemblyStages: openAssemblyStages,
       csmGroup,
     };
@@ -4641,7 +4749,7 @@ ${sheets}
       },
       salesShippingThisMonth: {
         id: 'salesShippingThisMonth',
-        label: 'Продажи: в отгрузке',
+        label: 'Продажи: в отгрузке, вероятность от 50%',
         count: 0,
         revenue: 0,
         profit: null as number | null,
@@ -4649,7 +4757,7 @@ ${sheets}
       },
       salesInvoiceThisMonth: {
         id: 'salesInvoiceThisMonth',
-        label: 'Продажи: счета, которые успеют купить и отгрузиться',
+        label: 'Продажи: счета, вероятность отгрузки от 50%',
         count: 0,
         revenue: 0,
         profit: null as number | null,
@@ -4657,7 +4765,7 @@ ${sheets}
       },
       salesQuoteThisMonth: {
         id: 'salesQuoteThisMonth',
-        label: 'Продажи: КП, которые успеют купить и отгрузиться',
+        label: 'Продажи: КП, вероятность отгрузки от 50%',
         count: 0,
         revenue: 0,
         profit: null as number | null,
@@ -4665,7 +4773,7 @@ ${sheets}
       },
       salesNotThisMonth: {
         id: 'salesNotThisMonth',
-        label: 'Продажи: не успеют отгрузиться',
+        label: 'Продажи: низкая вероятность отгрузки',
         count: 0,
         revenue: 0,
         profit: null as number | null,
@@ -4681,7 +4789,7 @@ ${sheets}
       },
       repeatShippingThisMonth: {
         id: 'repeatShippingThisMonth',
-        label: 'Повторные продажи: в отгрузке',
+        label: 'Повторные продажи: в отгрузке, вероятность от 50%',
         count: 0,
         revenue: 0,
         profit: null as number | null,
@@ -4689,7 +4797,7 @@ ${sheets}
       },
       repeatInvoiceThisMonth: {
         id: 'repeatInvoiceThisMonth',
-        label: 'Повторные продажи: счета, которые успеют купить и отгрузиться',
+        label: 'Повторные продажи: счета, вероятность отгрузки от 50%',
         count: 0,
         revenue: 0,
         profit: null as number | null,
@@ -4697,7 +4805,7 @@ ${sheets}
       },
       repeatQuoteThisMonth: {
         id: 'repeatQuoteThisMonth',
-        label: 'Повторные продажи: КП, которые успеют купить и отгрузиться',
+        label: 'Повторные продажи: КП, вероятность отгрузки от 50%',
         count: 0,
         revenue: 0,
         profit: null as number | null,
@@ -4705,7 +4813,7 @@ ${sheets}
       },
       repeatNotThisMonth: {
         id: 'repeatNotThisMonth',
-        label: 'Повторные продажи: не успеют отгрузиться',
+        label: 'Повторные продажи: низкая вероятность отгрузки',
         count: 0,
         revenue: 0,
         profit: null as number | null,
@@ -4740,10 +4848,10 @@ ${sheets}
 
     return [
       combine('totalShippedThisMonth', 'Уже отгружено', ['salesShippedThisMonth', 'repeatShippedThisMonth']),
-      combine('totalShippingThisMonth', 'В отгрузке', ['salesShippingThisMonth', 'repeatShippingThisMonth']),
-      combine('totalInvoiceThisMonth', 'Счета, которые успеют купить и отгрузиться', ['salesInvoiceThisMonth', 'repeatInvoiceThisMonth']),
-      combine('totalQuoteThisMonth', 'КП, которые успеют купить и отгрузиться', ['salesQuoteThisMonth', 'repeatQuoteThisMonth']),
-      combine('totalNotThisMonth', 'Не успеют отгрузиться', ['salesNotThisMonth', 'repeatNotThisMonth']),
+      combine('totalShippingThisMonth', 'В отгрузке, вероятность от 50%', ['salesShippingThisMonth', 'repeatShippingThisMonth']),
+      combine('totalInvoiceThisMonth', 'Счета, вероятность отгрузки от 50%', ['salesInvoiceThisMonth', 'repeatInvoiceThisMonth']),
+      combine('totalQuoteThisMonth', 'КП, вероятность отгрузки от 50%', ['salesQuoteThisMonth', 'repeatQuoteThisMonth']),
+      combine('totalNotThisMonth', 'Низкая вероятность отгрузки', ['salesNotThisMonth', 'repeatNotThisMonth']),
     ];
   }
 

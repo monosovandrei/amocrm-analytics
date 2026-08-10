@@ -6042,6 +6042,11 @@ type RevenueForecastDeal = {
   stage: string;
   source: string;
   probabilityPercent: number;
+  confidencePercent?: number;
+  paymentProbabilityPercent?: number | null;
+  shippingProbabilityPercent?: number;
+  deliveryAt?: string | null;
+  drivers?: Array<{ label: string; direction: 'up' | 'down'; impactPoints: number }>;
   amount: number;
   revenue: number;
   profit: number | null;
@@ -6065,22 +6070,22 @@ const revenueForecastTotalGroups = [
   },
   {
     id: 'totalShippingThisMonth',
-    label: 'В отгрузке',
+    label: 'В отгрузке, вероятность от 50%',
     rowIds: ['salesShippingThisMonth', 'repeatShippingThisMonth'],
   },
   {
     id: 'totalInvoiceThisMonth',
-    label: 'Счета, которые успеют купить и отгрузиться',
+    label: 'Счета, вероятность отгрузки от 50%',
     rowIds: ['salesInvoiceThisMonth', 'repeatInvoiceThisMonth'],
   },
   {
     id: 'totalQuoteThisMonth',
-    label: 'КП, которые успеют купить и отгрузиться',
+    label: 'КП, вероятность отгрузки от 50%',
     rowIds: ['salesQuoteThisMonth', 'repeatQuoteThisMonth'],
   },
   {
     id: 'totalNotThisMonth',
-    label: 'Не успеют отгрузиться',
+    label: 'Низкая вероятность отгрузки',
     rowIds: ['salesNotThisMonth', 'repeatNotThisMonth'],
   },
 ];
@@ -6108,6 +6113,7 @@ function RevenueProfitForecastReport({ amoDomain, result }: { amoDomain: string;
   const totalRows = apiTotalRows.length > 0 ? apiTotalRows : buildRevenueForecastTotalRows(rows);
   const summary = result.summary ?? {};
   const shippingCycle = result.shippingCycle ?? {};
+  const deliveryCalibration = result.deliveryCalibration ?? {};
   const profitAvailable = Boolean(result.profit?.available);
   const profitBasis = String(result.profit?.basis ?? '32% от суммы сделки');
   const warnings = (result.warnings ?? []) as string[];
@@ -6141,20 +6147,31 @@ function RevenueProfitForecastReport({ amoDomain, result }: { amoDomain: string;
 
       <div className="revenue-forecast-summary">
         <div className="revenue-forecast-card">
-          <span>До конца месяца</span>
+          <span>Ожидаемая выручка</span>
           <strong className="mono-num">{formatMoney(summary.revenue)}</strong>
-          <small>{formatNumber(summary.count ?? 0)} сделок</small>
+          <small>{formatMoney(summary.lowRevenue)}–{formatMoney(summary.highRevenue)}</small>
+        </div>
+        <div className="revenue-forecast-card">
+          <span>Уже отгружено</span>
+          <strong className="mono-num">{formatMoney(summary.actualRevenue)}</strong>
+          <small>{formatNumber(summary.count ?? 0)} сделок в расчёте</small>
+        </div>
+        <div className="revenue-forecast-card">
+          <span>Высокая уверенность</span>
+          <strong className="mono-num">{formatMoney(summary.committedRevenue)}</strong>
+          <small>Факт + сделки с вероятностью от 80%</small>
         </div>
         <div className="revenue-forecast-card">
           <span>Прибыль</span>
           <strong className="mono-num">{profitAvailable ? formatMoney(summary.profit) : 'не настроено'}</strong>
           <small>{profitAvailable ? profitBasis : 'не настроено'}</small>
         </div>
-        <div className="revenue-forecast-card">
-          <span>Цикл отгрузки</span>
-          <strong className="mono-num">{formatDurationFromDays(shippingCycle.avgDays)}</strong>
-          <small>{formatNumber(shippingCycle.sampleSize ?? 0)} сделок за последние 30 дней</small>
-        </div>
+      </div>
+
+      <div className="revenue-forecast-model-meta">
+        <span>Медианный цикл: <strong>{formatDurationFromDays(shippingCycle.medianDays)}</strong></span>
+        <span>Delivery: <strong>{formatNumber(deliveryCalibration.fieldCoverage?.percent ?? 0)}%</strong></span>
+        <span>Калибровка: <strong>{formatNumber(deliveryCalibration.sampleSize ?? 0)} отгрузок</strong></span>
       </div>
 
       {warnings.length > 0 && (
@@ -6204,7 +6221,7 @@ function RevenueForecastTable({
             <tr>
               <th>Сценарий</th>
               <th>Сделок</th>
-              <th>Выручка</th>
+              <th>Взвешенная выручка</th>
               <th>Прибыль</th>
               <th>Сделки в расчёте</th>
             </tr>
@@ -6239,7 +6256,17 @@ function RevenueForecastTable({
                                 )}
                                 <small>
                                   {deal.manager} · {deal.stage} · {deal.probabilityPercent}%
+                                  {deal.confidencePercent !== undefined ? ` · уверенность ${deal.confidencePercent}%` : ''}
                                 </small>
+                                {(deal.paymentProbabilityPercent !== null && deal.paymentProbabilityPercent !== undefined) && (
+                                  <small>Оплата {deal.paymentProbabilityPercent}% · отгрузка {deal.shippingProbabilityPercent ?? 0}%</small>
+                                )}
+                                {deal.deliveryAt && <small>Delivery: {formatMoscowDateTime(deal.deliveryAt)}</small>}
+                                {Boolean(deal.drivers?.length) && (
+                                  <small title={deal.drivers!.map((driver) => `${driver.label}: ${driver.direction === 'up' ? '+' : '-'}${driver.impactPoints} п.п.`).join('; ')}>
+                                    Влияет: {deal.drivers!.map((driver) => driver.label).join(', ')}
+                                  </small>
+                                )}
                               </div>
                               <div className="mono-num text-right">
                                 <strong>{formatMoney(deal.revenue)}</strong>
