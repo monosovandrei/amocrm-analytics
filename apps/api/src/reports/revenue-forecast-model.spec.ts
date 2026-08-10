@@ -1,6 +1,7 @@
 import {
   buildDeadlineProbabilityCurve,
   buildForecastFeatureSet,
+  combineEstimateReliability,
   scoreBinaryProbability,
   scoreDeadlineProbability,
   scoreDeliveryProbability,
@@ -179,6 +180,23 @@ describe('revenue forecast model', () => {
       priorProbability: 0.5,
       priorWeight: 1,
     }).probability).toBe(0);
+  });
+
+  it('keeps cohort reliability when Delivery has no comparable observations', () => {
+    const cohort = scoreBinaryProbability(
+      Array.from({ length: 20 }, (_, index) => ({ observedAt: now, value: index < 15, featureKeys: [] })),
+      { now, priorProbability: 0.5, priorWeight: 2 },
+    );
+    const delivery = scoreDeliveryProbability([], 10, {
+      now,
+      priorProbability: cohort.probability,
+      priorWeight: 12,
+    });
+    const combined = combineEstimateReliability(delivery, cohort, 12);
+
+    expect(delivery.confidence).toBe(0);
+    expect(combined.confidence).toBeCloseTo(cohort.confidence);
+    expect(combined.probability).toBe(delivery.probability);
   });
 
   it('extracts stable commercial and configuration features', () => {

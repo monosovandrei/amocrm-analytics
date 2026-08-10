@@ -218,6 +218,23 @@ export function scoreBinaryProbability(
   );
 }
 
+export function combineEstimateReliability(
+  estimate: ForecastProbabilityEstimate,
+  prior: ForecastProbabilityEstimate,
+  priorWeight: number,
+) {
+  const safePriorWeight = Math.max(1, priorWeight);
+  const totalWeight = estimate.sampleWeight + safePriorWeight;
+  return {
+    ...estimate,
+    confidence: clamp(
+      (estimate.confidence * estimate.sampleWeight + prior.confidence * safePriorWeight) / totalWeight,
+      0,
+      0.95,
+    ),
+  };
+}
+
 export function weightedDurationQuantile(
   observations: ForecastDurationObservation[],
   quantile: number,

@@ -10,6 +10,7 @@ import {
   ForecastProbabilityEstimate,
   buildDeadlineProbabilityCurve,
   buildForecastFeatureSet,
+  combineEstimateReliability,
   scoreBinaryProbability,
   scoreDeadlineProbability,
   scoreDeliveryProbability,
@@ -230,13 +231,15 @@ export class RevenueForecastEngine {
       if (deliveryAt) {
         const minimumErrorDays = moscowCalendarDayDiff(deliveryAt, input.now);
         const maximumErrorDays = moscowCalendarDayDiff(deliveryAt, input.monthTo);
-        estimate = scoreDeliveryProbability(deliveryObservations, maximumErrorDays, {
+        const deliveryPriorWeight = Math.max(4, Math.min(12, stageEstimate.sampleWeight));
+        const deliveryEstimate = scoreDeliveryProbability(deliveryObservations, maximumErrorDays, {
           now: input.now,
           currentFeatures: features,
           priorProbability: stageEstimate.probability,
-          priorWeight: Math.max(4, Math.min(12, stageEstimate.sampleWeight)),
+          priorWeight: deliveryPriorWeight,
           minimumErrorDays,
         });
+        estimate = combineEstimateReliability(deliveryEstimate, stageEstimate, deliveryPriorWeight);
         probabilitySource = 'delivery_model';
         const conditionalErrors = deliveryErrors.filter((item) => item.durationDays > minimumErrorDays);
         const medianError = weightedDurationQuantile(conditionalErrors, 0.5, input.now, features.keys);
