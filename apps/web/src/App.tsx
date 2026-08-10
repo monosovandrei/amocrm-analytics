@@ -6259,7 +6259,9 @@ function RevenueForecastTable({
                                 )}
                                 <small>
                                   {deal.manager} · {deal.stage} · {deal.probabilityPercent}%
-                                  {deal.reliabilityPercent !== undefined ? ` · надёжность оценки ${deal.reliabilityPercent}%` : ''}
+                                  {deal.reliabilityPercent !== undefined
+                                    ? ` · надёжность оценки: ${deal.reliabilityPercent > 0 ? `${deal.reliabilityPercent}%` : 'нет данных'}`
+                                    : ''}
                                 </small>
                                 {(deal.paymentProbabilityPercent !== null && deal.paymentProbabilityPercent !== undefined) && (
                                   <small>Оплата {deal.paymentProbabilityPercent}% · отгрузка {deal.shippingProbabilityPercent ?? 0}%</small>
