@@ -308,7 +308,9 @@ export class RevenueForecastEngine {
           previousPaymentProbability = paymentProbability;
         }
 
-        const finalPaymentEstimate = paymentCurve[paymentCurve.length - 1] ?? broadEstimate;
+        const finalPaymentEstimate = paymentCurve.length
+          ? combineEstimateReliability(paymentCurve[paymentCurve.length - 1], broadEstimate, 8)
+          : broadEstimate;
         const predictedPaymentDay = probabilityMedianDay(paymentCurve);
         const predictedShipAt = predictedPaymentDay === null
           ? null
