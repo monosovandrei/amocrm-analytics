@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { Prisma } from '../generated/prisma';
 import { PrismaService } from '../prisma/prisma.service';
 import {
+  ForecastBinaryObservation,
   ForecastDeadlineEpisode,
   ForecastDeliveryObservation,
   ForecastDurationObservation,
@@ -9,13 +10,15 @@ import {
   ForecastProbabilityEstimate,
   buildDeadlineProbabilityCurve,
   buildForecastFeatureSet,
+  scoreBinaryProbability,
   scoreDeadlineProbability,
   scoreDeliveryProbability,
   weightedDurationQuantile,
 } from './revenue-forecast-model';
 
 const DAY_MS = 86_400_000;
-const MODEL_VERSION = 'revenue-v2.2';
+const MODEL_VERSION = 'revenue-v2.3';
+const ASSEMBLY_COHORT_MONTHS = 6;
 
 type ForecastDeal = {
   id: string;
@@ -44,9 +47,9 @@ export type RevenueForecastPrediction = {
   probability: number;
   probabilityPercent: number;
   baseProbabilityPercent: number;
-  confidencePercent: number;
+  reliabilityPercent: number;
   probabilitySample: number;
-  probabilitySource: 'deadline_model' | 'delivery_model' | 'stage_model';
+  probabilitySource: 'cohort_model' | 'deadline_model' | 'delivery_model' | 'stage_model';
   predictedShipAt: Date | null;
   paymentProbabilityPercent: number | null;
   shippingProbabilityPercent: number;
@@ -69,6 +72,12 @@ export type RevenueForecastEngineResult = {
   deliveryCalibration: {
     sampleSize: number;
     medianErrorDays: number | null;
+  };
+  assemblyCohort: {
+    monthCount: number;
+    sampleSize: number;
+    shipped: number;
+    shipmentRatePercent: number | null;
   };
   warnings: string[];
   snapshotRows: Array<{
@@ -128,6 +137,12 @@ type StageEpisodeBundle = {
   latestEntryByDealStage: Map<string, Date>;
 };
 
+type AssemblyCohortBundle = {
+  observations: ForecastBinaryObservation[];
+  monthCount: number;
+  shipped: number;
+};
+
 export class RevenueForecastEngine {
   private readonly featureContexts = new Map<string, FeatureContext>();
   private fieldIds!: ForecastFieldIds;
@@ -168,8 +183,14 @@ export class RevenueForecastEngine {
       durationDays: item.errorDays,
       featureKeys: item.featureKeys,
     }));
-    this.retainFeatureContexts(currentDealIds);
     const daysLeft = Math.max(0, durationDays(input.now, input.monthTo));
+    const assemblyCohort = await this.buildAssemblyMonthlyCohort({
+      stageIds: input.assemblyStageIds,
+      shippingDoneStageId: input.shippingDoneStageId,
+      now: input.now,
+      daysLeft,
+    });
+    this.retainFeatureContexts(currentDealIds);
 
     for (const deal of input.assemblyDeals) {
       const context = this.featureContexts.get(deal.id) ?? fallbackFeatureContext(deal);
@@ -177,17 +198,33 @@ export class RevenueForecastEngine {
       const stageEpisodes = shippingBundle.byStageId.get(deal.stageId) ?? [];
       const enteredAt = shippingBundle.latestEntryByDealStage.get(dealStageKey(deal.id, deal.stageId)) ?? deal.createdAt;
       const elapsedStageDays = durationDays(enteredAt, input.now);
-      const stageEstimate = scoreDeadlineProbability(stageEpisodes, {
-        now: input.now,
-        horizonDays: daysLeft,
-        elapsedDays: elapsedStageDays,
-        currentFeatures: features,
-        priorProbability: conservativeStagePrior(input.stagePositions.get(deal.stageId) ?? 0),
-        priorWeight: 8,
-      });
+      const cohortFeatures = assemblyCohortFeatures(
+        features,
+        deal.stageId,
+        deal.stage?.name ?? '',
+        elapsedStageDays,
+      );
+      const stageEstimate = assemblyCohort.observations.length
+        ? scoreBinaryProbability(assemblyCohort.observations, {
+            now: input.now,
+            currentFeatures: cohortFeatures,
+            priorProbability: 0.5,
+            priorWeight: 4,
+            halfLifeDays: 180,
+          })
+        : scoreDeadlineProbability(stageEpisodes, {
+            now: input.now,
+            horizonDays: daysLeft,
+            elapsedDays: elapsedStageDays,
+            currentFeatures: features,
+            priorProbability: conservativeStagePrior(input.stagePositions.get(deal.stageId) ?? 0),
+            priorWeight: 8,
+          });
       const deliveryAt = context.deliveryAt;
       let estimate = stageEstimate;
-      let probabilitySource: RevenueForecastPrediction['probabilitySource'] = 'stage_model';
+      let probabilitySource: RevenueForecastPrediction['probabilitySource'] = assemblyCohort.observations.length
+        ? 'cohort_model'
+        : 'stage_model';
       let predictedShipAt = this.stagePredictedDate(stageEpisodes, elapsedStageDays, input.now, features);
 
       if (deliveryAt) {
@@ -327,9 +364,97 @@ export class RevenueForecastEngine {
         sampleSize: deliveryObservations.length,
         medianErrorDays: weightedDurationQuantile(deliveryErrors, 0.5, input.now),
       },
+      assemblyCohort: {
+        monthCount: assemblyCohort.monthCount,
+        sampleSize: assemblyCohort.observations.length,
+        shipped: assemblyCohort.shipped,
+        shipmentRatePercent: assemblyCohort.observations.length
+          ? Math.round((assemblyCohort.shipped / assemblyCohort.observations.length) * 1000) / 10
+          : null,
+      },
       warnings,
       snapshotRows,
     };
+  }
+
+  private async buildAssemblyMonthlyCohort(options: {
+    stageIds: string[];
+    shippingDoneStageId: string;
+    now: Date;
+    daysLeft: number;
+  }): Promise<AssemblyCohortBundle> {
+    const windows = historicalAssemblyCohortWindows(options.now, options.daysLeft, ASSEMBLY_COHORT_MONTHS);
+    if (!windows.length || !options.stageIds.length) return { observations: [], monthCount: 0, shipped: 0 };
+
+    const earliestCutoff = windows[0].cutoffAt;
+    const latestCutoff = windows[windows.length - 1].cutoffAt;
+    const latestMonthEnd = windows[windows.length - 1].monthEnd;
+    const intervals = await this.db.factDealStageInterval.findMany({
+      where: {
+        stageId: { in: options.stageIds },
+        enteredAt: { lte: latestCutoff },
+        OR: [{ exitedAt: null }, { exitedAt: { gt: earliestCutoff } }],
+      },
+      select: {
+        dealId: true,
+        stageId: true,
+        stageName: true,
+        enteredAt: true,
+        exitedAt: true,
+      },
+    });
+    const dealIds = [...new Set(intervals.map((interval) => interval.dealId))];
+    if (!dealIds.length) return { observations: [], monthCount: 0, shipped: 0 };
+
+    const shipments = await this.db.factStageTransition.findMany({
+      where: {
+        dealId: { in: dealIds },
+        toStageId: options.shippingDoneStageId,
+        movedAt: { gt: earliestCutoff, lte: latestMonthEnd },
+      },
+      orderBy: [{ dealId: 'asc' }, { movedAt: 'asc' }],
+      select: { dealId: true, movedAt: true },
+    });
+    await this.loadFeatureContexts(dealIds);
+    const shipmentsByDeal = groupBy(shipments, (shipment) => shipment.dealId);
+    const observations: ForecastBinaryObservation[] = [];
+    const sampledMonths = new Set<number>();
+    let shipped = 0;
+
+    for (const window of windows) {
+      const activeByDeal = new Map<string, typeof intervals[number]>();
+      for (const interval of intervals) {
+        if (interval.enteredAt > window.cutoffAt) continue;
+        if (interval.exitedAt && interval.exitedAt <= window.cutoffAt) continue;
+        const current = activeByDeal.get(interval.dealId);
+        if (!current || current.enteredAt < interval.enteredAt) activeByDeal.set(interval.dealId, interval);
+      }
+      if (!activeByDeal.size) continue;
+      sampledMonths.add(window.monthEnd.getTime());
+
+      for (const interval of activeByDeal.values()) {
+        const didShip = (shipmentsByDeal.get(interval.dealId) ?? []).some((shipment) => (
+          shipment.movedAt > window.cutoffAt && shipment.movedAt <= window.monthEnd
+        ));
+        if (didShip) shipped += 1;
+        const context = this.featureContexts.get(interval.dealId);
+        const baseFeatures = context?.features ?? buildForecastFeatureSet({});
+        const elapsedDays = durationDays(interval.enteredAt, window.cutoffAt);
+        const features = assemblyCohortFeatures(
+          baseFeatures,
+          interval.stageId,
+          interval.stageName,
+          elapsedDays,
+        );
+        observations.push({
+          observedAt: window.monthEnd,
+          value: didShip,
+          featureKeys: features.keys,
+        });
+      }
+    }
+
+    return { observations, monthCount: sampledMonths.size, shipped };
   }
 
   private async buildStageEpisodes(options: {
@@ -566,7 +691,7 @@ function buildPrediction(input: {
     probability,
     probabilityPercent: Math.round(probability * 100),
     baseProbabilityPercent: Math.round(input.estimate.baseProbability * 100),
-    confidencePercent: Math.round(input.estimate.confidence * 100),
+    reliabilityPercent: Math.round(input.estimate.confidence * 100),
     probabilitySample: input.estimate.sampleSize,
     probabilitySource: input.probabilitySource,
     predictedShipAt: input.predictedShipAt,
@@ -604,6 +729,54 @@ function conservativeStagePrior(position: number) {
   if (position >= 70) return 0.35;
   if (position >= 50) return 0.25;
   return 0.15;
+}
+
+function historicalAssemblyCohortWindows(now: Date, daysLeft: number, monthCount: number) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Moscow',
+    year: 'numeric',
+    month: '2-digit',
+  }).formatToParts(now);
+  const year = Number(parts.find((part) => part.type === 'year')?.value);
+  const month = Number(parts.find((part) => part.type === 'month')?.value);
+  return Array.from({ length: monthCount }, (_, index) => {
+    const monthsBack = monthCount - index;
+    const monthEnd = new Date(Date.UTC(year, month - monthsBack, 0, 20, 59, 59, 999));
+    const monthStart = new Date(Date.UTC(year, month - monthsBack - 1, 0, 21, 0, 0, 0));
+    const requestedCutoff = addDays(monthEnd, -daysLeft);
+    return {
+      monthEnd,
+      cutoffAt: requestedCutoff < monthStart ? monthStart : requestedCutoff,
+    };
+  });
+}
+
+function assemblyCohortFeatures(
+  features: ForecastFeatureSet,
+  stageId: string,
+  stageName: string,
+  elapsedDays: number,
+): ForecastFeatureSet {
+  const elapsed = assemblyElapsedBucket(elapsedDays);
+  const stageKey = `assembly_stage:${stageId}`;
+  const elapsedKey = `assembly_elapsed:${elapsed.key}`;
+  return {
+    ...features,
+    keys: [...new Set([...features.keys, stageKey, elapsedKey])],
+    labels: {
+      ...features.labels,
+      [stageKey]: stageName ? `история этапа ${stageName}` : 'история этапа сборки',
+      [elapsedKey]: `на этапе ${elapsed.label}`,
+    },
+  };
+}
+
+function assemblyElapsedBucket(days: number) {
+  if (days < 3) return { key: '0-3', label: 'до 3 дней' };
+  if (days < 7) return { key: '3-7', label: '3–7 дней' };
+  if (days < 14) return { key: '7-14', label: '7–14 дней' };
+  if (days < 30) return { key: '14-30', label: '14–30 дней' };
+  return { key: '30+', label: 'более 30 дней' };
 }
 
 function fallbackFeatureContext(deal: ForecastDeal): FeatureContext {

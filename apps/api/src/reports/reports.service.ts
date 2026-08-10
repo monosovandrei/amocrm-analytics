@@ -4121,7 +4121,7 @@ ${sheets}
         probabilityPercent: prediction?.probabilityPercent ?? 100,
         probabilitySource: prediction?.probabilitySource ?? 'actual',
         probabilitySample: prediction?.probabilitySample ?? null,
-        confidencePercent: prediction?.confidencePercent ?? 100,
+        reliabilityPercent: prediction?.reliabilityPercent ?? 100,
         baseProbabilityPercent: prediction?.baseProbabilityPercent ?? 100,
         paymentProbabilityPercent: prediction?.paymentProbabilityPercent ?? null,
         shippingProbabilityPercent: prediction?.shippingProbabilityPercent ?? 100,
@@ -4194,6 +4194,7 @@ ${sheets}
       },
       shippingCycle: engineResult.shippingCycle,
       deliveryCalibration: engineResult.deliveryCalibration,
+      assemblyCohort: engineResult.assemblyCohort,
       profit: {
         available: true,
         basis: '32% от суммы сделки',
@@ -4202,7 +4203,8 @@ ${sheets}
         fieldName: null,
       },
       assumptions: [
-        'Открытые сделки взвешиваются по вероятности фактической отгрузки до конца меся.',
+        'Для сделок в Сборке базовая вероятность считается по фактической отгрузке исторических когорт на аналогичный остаток дней до конца месяца.',
+        'Открытые сделки взвешиваются по вероятности фактической отгрузки до конца месяца.',
         'Для счетов и КП совместно считаются вероятность оплаты по дням и вероятность успеть отгрузить после оплаты.',
         'Открытые и зависшие сделки остаются в знаменателе; старые данные получают меньший вес.',
         'Delivery калибруется по разнице между указанной датой и фактической отгрузкой.',
@@ -4285,6 +4287,7 @@ ${sheets}
     const diagnostics = {
       shippingCycle: engineResult.shippingCycle,
       deliveryCalibration: engineResult.deliveryCalibration,
+      assemblyCohort: engineResult.assemblyCohort,
       warnings: engineResult.warnings,
     };
     await this.prisma.$executeRawUnsafe(

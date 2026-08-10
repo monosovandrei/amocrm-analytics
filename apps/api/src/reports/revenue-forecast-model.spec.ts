@@ -1,6 +1,7 @@
 import {
   buildDeadlineProbabilityCurve,
   buildForecastFeatureSet,
+  scoreBinaryProbability,
   scoreDeadlineProbability,
   scoreDeliveryProbability,
   weightedDurationQuantile,
@@ -99,6 +100,57 @@ describe('revenue forecast model', () => {
     });
 
     expect(beforeDelivery.probability).toBeLessThan(afterDelivery.probability);
+  });
+
+  it('uses the observed month-end cohort as the base probability', () => {
+    const observations = Array.from({ length: 20 }, (_, index) => ({
+      observedAt: new Date(`2026-07-${String(10 + (index % 10)).padStart(2, '0')}T09:00:00.000Z`),
+      value: index < 15,
+      featureKeys: [],
+    }));
+
+    const result = scoreBinaryProbability(observations, {
+      now,
+      priorProbability: 0.5,
+      priorWeight: 2,
+    });
+
+    expect(result.sampleSize).toBe(20);
+    expect(result.probability).toBeGreaterThan(0.65);
+    expect(result.probability).toBeLessThan(0.8);
+  });
+
+  it('adjusts the cohort using the current assembly stage without discarding the broad sample', () => {
+    const observations = Array.from({ length: 20 }, (_, index) => ({
+      observedAt: now,
+      value: index < 9 || (index >= 10 && index < 12),
+      featureKeys: [index < 10 ? 'assembly_stage:fast' : 'assembly_stage:slow'],
+    }));
+    const baseline = scoreBinaryProbability(observations, {
+      now,
+      priorProbability: 0.5,
+      priorWeight: 2,
+    });
+    const stageAdjusted = scoreBinaryProbability(observations, {
+      now,
+      priorProbability: 0.5,
+      priorWeight: 2,
+      currentFeatures: {
+        keys: ['assembly_stage:fast'],
+        labels: { 'assembly_stage:fast': 'история этапа Fast' },
+        summary: {
+          condition: 'unknown',
+          serverBase: null,
+          quantity: null,
+          complexity: 'low',
+          country: null,
+          emailKind: 'unknown',
+        },
+      },
+    });
+
+    expect(stageAdjusted.sampleSize).toBe(baseline.sampleSize);
+    expect(stageAdjusted.probability).toBeGreaterThan(baseline.probability);
   });
 
   it('conditions an overdue delivery on the delay already observed', () => {

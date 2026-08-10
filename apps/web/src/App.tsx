@@ -6042,7 +6042,7 @@ type RevenueForecastDeal = {
   stage: string;
   source: string;
   probabilityPercent: number;
-  confidencePercent?: number;
+  reliabilityPercent?: number;
   paymentProbabilityPercent?: number | null;
   shippingProbabilityPercent?: number;
   deliveryAt?: string | null;
@@ -6114,6 +6114,7 @@ function RevenueProfitForecastReport({ amoDomain, result }: { amoDomain: string;
   const summary = result.summary ?? {};
   const shippingCycle = result.shippingCycle ?? {};
   const deliveryCalibration = result.deliveryCalibration ?? {};
+  const assemblyCohort = result.assemblyCohort ?? {};
   const profitAvailable = Boolean(result.profit?.available);
   const profitBasis = String(result.profit?.basis ?? '32% от суммы сделки');
   const warnings = (result.warnings ?? []) as string[];
@@ -6157,7 +6158,7 @@ function RevenueProfitForecastReport({ amoDomain, result }: { amoDomain: string;
           <small>{formatNumber(summary.count ?? 0)} сделок в расчёте</small>
         </div>
         <div className="revenue-forecast-card">
-          <span>Высокая уверенность</span>
+          <span>Высокая вероятность</span>
           <strong className="mono-num">{formatMoney(summary.committedRevenue)}</strong>
           <small>Факт + сделки с вероятностью от 80%</small>
         </div>
@@ -6170,6 +6171,9 @@ function RevenueProfitForecastReport({ amoDomain, result }: { amoDomain: string;
 
       <div className="revenue-forecast-model-meta">
         <span>Медианный цикл: <strong>{formatDurationFromDays(shippingCycle.medianDays)}</strong></span>
+        {Number(assemblyCohort.sampleSize ?? 0) > 0 && (
+          <span>Историческая когорта: <strong>{formatNumber(assemblyCohort.shipmentRatePercent ?? 0)}% из {formatNumber(assemblyCohort.sampleSize)} наблюдений</strong></span>
+        )}
         <span>Калибровка: <strong>{formatNumber(deliveryCalibration.sampleSize ?? 0)} отгрузок</strong></span>
       </div>
 
@@ -6255,7 +6259,7 @@ function RevenueForecastTable({
                                 )}
                                 <small>
                                   {deal.manager} · {deal.stage} · {deal.probabilityPercent}%
-                                  {deal.confidencePercent !== undefined ? ` · уверенность ${deal.confidencePercent}%` : ''}
+                                  {deal.reliabilityPercent !== undefined ? ` · надёжность оценки ${deal.reliabilityPercent}%` : ''}
                                 </small>
                                 {(deal.paymentProbabilityPercent !== null && deal.paymentProbabilityPercent !== undefined) && (
                                   <small>Оплата {deal.paymentProbabilityPercent}% · отгрузка {deal.shippingProbabilityPercent ?? 0}%</small>

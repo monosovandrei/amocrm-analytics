@@ -21,6 +21,12 @@ export type ForecastDeliveryObservation = {
   featureKeys: string[];
 };
 
+export type ForecastBinaryObservation = {
+  observedAt: Date;
+  value: boolean;
+  featureKeys: string[];
+};
+
 export type ForecastFeatureSet = {
   keys: string[];
   labels: Record<string, string>;
@@ -97,6 +103,8 @@ const DRIVER_LABELS: Record<string, string> = {
   phone: 'код страны телефона',
   express: 'Express',
   tag: 'теги сделки',
+  assembly_stage: 'история этапа сборки',
+  assembly_elapsed: 'время на текущем этапе',
 };
 
 const FAMILY_WEIGHTS: Record<string, number> = {
@@ -113,6 +121,8 @@ const FAMILY_WEIGHTS: Record<string, number> = {
   phone: 0.2,
   express: 0.4,
   tag: 0.2,
+  assembly_stage: 1,
+  assembly_elapsed: 0.75,
 };
 
 export function scoreDeadlineProbability(
@@ -191,6 +201,20 @@ export function scoreDeliveryProbability(
       featureKeys: new Set(item.featureKeys),
     })),
     { ...options, horizonDays: Math.max(1, maximumErrorDays) },
+  );
+}
+
+export function scoreBinaryProbability(
+  observations: ForecastBinaryObservation[],
+  options: Omit<ScoreOptions, 'horizonDays' | 'elapsedDays'>,
+) {
+  return scoreWeightedBinary(
+    observations.map((item) => ({
+      value: item.value,
+      weight: recencyWeight(item.observedAt, options.now, options.halfLifeDays ?? 180),
+      featureKeys: new Set(item.featureKeys),
+    })),
+    { ...options, horizonDays: 1 },
   );
 }
 
