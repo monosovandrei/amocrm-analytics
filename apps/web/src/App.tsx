@@ -6170,7 +6170,6 @@ function RevenueProfitForecastReport({ amoDomain, result }: { amoDomain: string;
 
       <div className="revenue-forecast-model-meta">
         <span>Медианный цикл: <strong>{formatDurationFromDays(shippingCycle.medianDays)}</strong></span>
-        <span>Delivery: <strong>{formatNumber(deliveryCalibration.fieldCoverage?.percent ?? 0)}%</strong></span>
         <span>Калибровка: <strong>{formatNumber(deliveryCalibration.sampleSize ?? 0)} отгрузок</strong></span>
       </div>
 

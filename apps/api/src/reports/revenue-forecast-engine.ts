@@ -15,7 +15,7 @@ import {
 } from './revenue-forecast-model';
 
 const DAY_MS = 86_400_000;
-const MODEL_VERSION = 'revenue-v2.1';
+const MODEL_VERSION = 'revenue-v2.2';
 
 type ForecastDeal = {
   id: string;
@@ -69,7 +69,6 @@ export type RevenueForecastEngineResult = {
   deliveryCalibration: {
     sampleSize: number;
     medianErrorDays: number | null;
-    fieldCoverage: { eligible: number; filled: number; percent: number | null };
   };
   warnings: string[];
   snapshotRows: Array<{
@@ -295,19 +294,6 @@ export class RevenueForecastEngine {
       }
     }
 
-    const eligibleDeliveryDeals = input.assemblyDeals.filter((deal) => (
-      (input.stagePositions.get(deal.stageId) ?? 0) >= input.itemsInTransitPosition
-    ));
-    const filledDeliveryDeals = eligibleDeliveryDeals.filter((deal) => {
-      const context = this.featureContexts.get(deal.id);
-      return Boolean(context?.deliveryAt);
-    });
-    if (eligibleDeliveryDeals.length > filledDeliveryDeals.length) {
-      warnings.push(
-        `Delivery заполнен у ${filledDeliveryDeals.length} из ${eligibleDeliveryDeals.length} сделок от Items in transit. ` +
-        'Сделки без даты рассчитаны по истории этапа и отмечены как риск.',
-      );
-    }
     if (deliveryObservations.length < 30) {
       warnings.push('История Delivery пока мала: дата дополнительно сглаживается историей текущего этапа.');
     }
@@ -340,13 +326,6 @@ export class RevenueForecastEngine {
       deliveryCalibration: {
         sampleSize: deliveryObservations.length,
         medianErrorDays: weightedDurationQuantile(deliveryErrors, 0.5, input.now),
-        fieldCoverage: {
-          eligible: eligibleDeliveryDeals.length,
-          filled: filledDeliveryDeals.length,
-          percent: eligibleDeliveryDeals.length
-            ? Math.round((filledDeliveryDeals.length / eligibleDeliveryDeals.length) * 1000) / 10
-            : null,
-        },
       },
       warnings,
       snapshotRows,
