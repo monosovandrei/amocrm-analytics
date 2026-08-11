@@ -807,27 +807,30 @@ describe('ReportsService data contract', () => {
     expect(weightedTotal.formula).not.toContain('Счета x 90%');
   });
 
-  it('removes assembly metrics from CSM in sales weighted funnel', async () => {
+  it('does not publish retired built-in reports', async () => {
     const prisma = createPrismaMock() as any;
-    prisma.crmGroup.findMany.mockResolvedValue([
-      { id: 'group-sales', name: 'Sales' },
-      { id: 'group-csm', name: 'CSM' },
-    ]);
     const localService = new ReportsService(prisma, audit as any);
+    const retiredNames = [
+      'Sales: циклы сделки',
+      'CSM в продажах: шаги и конверсии за месяц',
+      'CSM в продажах: взвешенная воронка',
+      'CSM в продажах: скорость взятия сделок',
+      'CSM в продажах: текущие сделки по этапам',
+      'CSM в продажах: причины отказа',
+      'CSM: время на этапах - База',
+      'CSM: время на этапах - Закрепленные компании',
+    ];
 
-    const salesTemplates = await (localService as any).buildSalesReportTemplates();
-    const templates = await (localService as any).buildCsmInSalesReportTemplates(salesTemplates);
-    const template = templates.find((item: any) => item.config?.builtinKey === 'csm_sales_weighted_funnel');
-    const metrics = template.config.contract.metrics;
-    const weightedTotal = metrics.find((metric: any) => metric.id === 'weighted_total');
+    const templates = await localService.listTemplates({ id: 'admin-1', role: 'ADMIN' as any });
+    const names = templates.map((template: any) => template.name);
 
-    expect(metrics.map((metric: any) => metric.id)).not.toEqual(expect.arrayContaining([
-      'count_assembly',
-      'sum_assembly',
-      'weighted_assembly',
-    ]));
-    expect(weightedTotal.formula).toBe('[КП презентовано x конверсия] + [Есть возражения x конверсия] + [Счета x конверсия]');
-    expect(template.config.description).toBe('Взвешенная сумма по КП и счетам по менеджерам CSM в воронке Продажи');
+    expect(names).not.toEqual(expect.arrayContaining(retiredNames));
+    expect(prisma.reportTemplate.deleteMany).toHaveBeenCalledWith({
+      where: {
+        userId: null,
+        name: { in: retiredNames },
+      },
+    });
   });
 
   it('keeps already shipped forecast buckets separate for sales and repeat sales', () => {
@@ -1512,6 +1515,19 @@ function createPrismaMock() {
         const index = templates.findIndex((template) => template.id === where.id);
         const [template] = templates.splice(index, 1);
         return Promise.resolve(template);
+      }),
+      deleteMany: jest.fn(({ where }: any = {}) => {
+        let count = 0;
+        for (let index = templates.length - 1; index >= 0; index -= 1) {
+          const template = templates[index];
+          if (where?.userId !== undefined && template.userId !== where.userId) continue;
+          if (where?.name?.in && !where.name.in.includes(template.name)) continue;
+          if (typeof where?.name === 'string' && template.name !== where.name) continue;
+          if (where?.id?.not && template.id === where.id.not) continue;
+          templates.splice(index, 1);
+          count += 1;
+        }
+        return Promise.resolve({ count });
       }),
       findUnique: jest.fn(({ where }: any) => Promise.resolve(templates.find((template) => template.id === where.id) ?? null)),
       findFirst: jest.fn(({ where }: any = {}) =>

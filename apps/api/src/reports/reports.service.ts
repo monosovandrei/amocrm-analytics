@@ -42,6 +42,16 @@ type BuiltinReportTemplate = {
   sourceType: ReportSourceType;
   config: ReportConfig;
 };
+const RETIRED_BUILTIN_REPORT_NAMES = [
+  'Sales: циклы сделки',
+  'CSM в продажах: шаги и конверсии за месяц',
+  'CSM в продажах: взвешенная воронка',
+  'CSM в продажах: скорость взятия сделок',
+  'CSM в продажах: текущие сделки по этапам',
+  'CSM в продажах: причины отказа',
+  'CSM: время на этапах - База',
+  'CSM: время на этапах - Закрепленные компании',
+] as const;
 type ContractDealSample = {
   dealId: string;
   dealExternalId?: string | null;
@@ -780,10 +790,16 @@ export class ReportsService {
   }
 
   private async ensureBuiltinReportTemplates() {
+    await this.db.reportTemplate.deleteMany({
+      where: {
+        userId: null,
+        name: { in: [...RETIRED_BUILTIN_REPORT_NAMES] },
+      },
+    });
+
     const salesTemplates = await this.buildSalesReportTemplates();
     const templates = [
       ...salesTemplates,
-      ...(await this.buildCsmInSalesReportTemplates(salesTemplates)),
       ...(await this.buildCsmReportTemplates()),
       this.buildRevenueForecastReportTemplate(),
     ];
@@ -1038,19 +1054,6 @@ export class ReportsService {
         }),
       },
       {
-        name: 'Sales: циклы сделки',
-        position: 3,
-        sourceType: 'EVENT',
-        config: baseConfig('sales_deal_cycle', 3, {
-          metric: 'deal_cycle',
-          display: 'cycle',
-          description: 'Циклы сделки по менеджерам Sales',
-          conditionLabel: 'Выход из этапа за выбранный период: вход в этап -> выход из этапа',
-          filters: salesFilters,
-          size: 'lg',
-        }),
-      },
-      {
         name: 'Sales: текущие сделки по этапам',
         position: 4,
         sourceType: 'CURRENT',
@@ -1077,99 +1080,6 @@ export class ReportsService {
         }),
       },
     ];
-  }
-
-  private async buildCsmInSalesReportTemplates(salesTemplates: BuiltinReportTemplate[]): Promise<BuiltinReportTemplate[]> {
-    const [refs, csmGroup] = await Promise.all([
-      this.resolveSalesRefs(),
-      this.findCrmGroupByName('CSM'),
-    ]);
-    if (!refs || !csmGroup || salesTemplates.length === 0) return [];
-
-    const namesBySalesKey = new Map<string, string>([
-      ['sales_funnel_steps', 'CSM в продажах: шаги и конверсии за месяц'],
-      ['sales_weighted_funnel', 'CSM в продажах: взвешенная воронка'],
-      ['sales_assigned_stage_speed', 'CSM в продажах: скорость взятия сделок'],
-      ['sales_stage_age', 'CSM в продажах: текущие сделки по этапам'],
-      ['sales_loss_reasons', 'CSM в продажах: причины отказа'],
-    ]);
-    const descriptionsBySalesKey = new Map<string, Pick<ReportConfig, 'description' | 'conditionLabel'>>([
-      ['sales_funnel_steps', {
-        description: 'Полученные лиды, КП, счета, оплаты и конверсии по менеджерам CSM в воронке Продажи',
-        conditionLabel: 'Воронка Продажи: полученные лиды, КП, счета, оплаты и конверсии по менеджерам CSM',
-      }],
-      ['sales_weighted_funnel', {
-        description: 'Взвешенная сумма по КП и счетам по менеджерам CSM в воронке Продажи',
-      }],
-      ['sales_assigned_stage_speed', {
-        description: 'Среднее время взятия сделок менеджерами CSM в воронке Продажи',
-        conditionLabel: 'Воронка Продажи: от назначения ответственного и задачи на него до выхода из этапа',
-      }],
-      ['sales_stage_age', {
-        description: 'Сколько текущие открытые сделки находятся в этапах воронки Продажи по менеджерам CSM',
-        conditionLabel: 'Воронка Продажи: открытые сделки сейчас, вход в текущий этап -> текущее время',
-      }],
-      ['sales_loss_reasons', {
-        description: 'Сделки CSM, отправленные в отказ в воронке Продажи за выбранный период, по причинам отказа',
-        conditionLabel: 'Воронка Продажи: вход в отказ за выбранный период, по менеджерам CSM',
-      }],
-    ]);
-
-    return salesTemplates
-      .filter((template) => namesBySalesKey.has(template.config.builtinKey ?? ''))
-      .map((template, index) => {
-        const salesKey = template.config.builtinKey ?? '';
-        const csmSalesKey = salesKey.replace(/^sales_/, 'csm_sales_');
-        const config: ReportConfig = {
-          ...this.buildCsmInSalesConfig(template.config, salesKey),
-          ...(descriptionsBySalesKey.get(salesKey) ?? {}),
-          builtinKey: csmSalesKey,
-          dashboardSection: 'csmSales',
-          pinned: true,
-          order: index,
-          lockPipelineFilter: true,
-          lockTeamFilter: true,
-          filters: {
-            ...(template.config.filters ?? {}),
-            pipelineIds: [refs.salesPipeline.id],
-            groupIds: [csmGroup.id],
-          },
-        };
-
-        return {
-          name: namesBySalesKey.get(salesKey)!,
-          position: 10 + index,
-          sourceType: template.sourceType,
-          config,
-        };
-      });
-  }
-
-  private cloneReportConfig(config: ReportConfig): ReportConfig {
-    return JSON.parse(JSON.stringify(config)) as ReportConfig;
-  }
-
-  private buildCsmInSalesConfig(config: ReportConfig, salesKey: string): ReportConfig {
-    const cloned = this.cloneReportConfig(config);
-    if (salesKey !== 'sales_weighted_funnel') return cloned;
-
-    const assemblyMetricIds = new Set(['count_assembly', 'sum_assembly', 'weighted_assembly']);
-    const metrics = (cloned.contract?.metrics ?? []).filter((metric) => !assemblyMetricIds.has(metric.id));
-    const weightedTotalParts = metrics
-      .filter((metric) => metric.id.startsWith('weighted_') && metric.id !== 'weighted_total')
-      .map((metric) => `[${metric.label}]`);
-
-    return {
-      ...cloned,
-      contract: {
-        ...(cloned.contract ?? {}),
-        metrics: metrics.map((metric) => (
-          metric.id === 'weighted_total'
-            ? { ...metric, formula: weightedTotalParts.join(' + ') }
-            : metric
-        )),
-      },
-    };
   }
 
   private buildRevenueForecastReportTemplate(): BuiltinReportTemplate {
@@ -1407,32 +1317,6 @@ export class ReportsService {
         }),
       },
       {
-        name: 'CSM: время на этапах - База',
-        position: 102,
-        sourceType: 'CURRENT',
-        config: baseConfig('csm_base_deal_cycle', 102, {
-          metric: 'deal_cycle',
-          display: 'cycle',
-          description: 'Среднее время нахождения сделок на этапах воронки База',
-          conditionLabel: 'База: сделки, вышедшие из этапов за выбранный период',
-          filters: { pipelineIds: [refs.basePipeline.id], groupIds: [refs.csmGroup.id] },
-          size: 'lg',
-        }),
-      },
-      {
-        name: 'CSM: время на этапах - Закрепленные компании',
-        position: 103,
-        sourceType: 'CURRENT',
-        config: baseConfig('csm_assigned_deal_cycle', 103, {
-          metric: 'deal_cycle',
-          display: 'cycle',
-          description: 'Среднее время нахождения сделок на этапах воронки Закрепленные компании',
-          conditionLabel: 'Закрепленные компании: сделки, вышедшие из этапов за выбранный период',
-          filters: { pipelineIds: [refs.assignedPipeline.id], groupIds: [refs.csmGroup.id] },
-          size: 'lg',
-        }),
-      },
-      {
         name: 'CSM: текущие сделки на этапах - База',
         position: 104,
         sourceType: 'CURRENT',
@@ -1470,7 +1354,6 @@ export class ReportsService {
 
     await this.ensureSalesLossReasonsReportTemplate(salesGroup?.id, salesPipeline?.id);
     await this.applyTeamScopeToTemplates('Sales:', salesGroup?.id, salesPipeline ? [salesPipeline.id] : undefined, true);
-    await this.applyTeamScopeToTemplates('CSM в продажах:', csmGroup?.id, salesPipeline ? [salesPipeline.id] : undefined, true);
     await this.applyTeamScopeToTemplates('CSM:', csmGroup?.id, undefined, true);
     await this.applySalesAssignedStageSpeedMode();
     await this.applySalesLeadsReceivedMetric();
