@@ -54,6 +54,8 @@ const RETIRED_BUILTIN_REPORT_NAMES = [
 ] as const;
 type ContractDealSample = {
   dealId: string;
+  occurrenceId?: string | null;
+  occurredAt?: string | null;
   dealExternalId?: string | null;
   dealTitle: string;
   amount: number | null;
@@ -1119,6 +1121,7 @@ export class ReportsService {
       display: 'number',
       pipelineId,
       stageIds,
+      stageEntryMode: 'event',
     });
     const conversion = (id: string, label: string, fromMetricId: string, toMetricId: string): DataContractMetric => ({
       id,
@@ -2194,6 +2197,9 @@ ${sheets}
     if (metric.type === 'stage_reached') {
       const stageIds = metric.stageIds?.filter(Boolean) ?? [];
       if (stageIds.length === 0) return [];
+      if (metric.stageEntryMode === 'event') {
+        return applyMetricFilters(await this.findStageEventDeals(stageIds, filters, role, metric.fromStageId));
+      }
       const dealIds = await this.findDealIdsFromHistoryMany(stageIds, filters, role, metric.fromStageId);
       return applyMetricFilters(await this.findDealsByIds(dealIds));
     }
@@ -2698,8 +2704,9 @@ ${sheets}
     deal: any,
     metric: DataContractMetric,
   ) {
-    if (bucket.dealIds.has(deal.id)) return;
-    bucket.dealIds.add(deal.id);
+    const bucketId = deal.__contractOccurrenceId ?? deal.id;
+    if (bucket.dealIds.has(bucketId)) return;
+    bucket.dealIds.add(bucketId);
     bucket.count += 1;
     bucket.samples.push(this.contractDealSample(deal));
     if (metric.type === 'weighted_stage_sum') {
@@ -2752,6 +2759,8 @@ ${sheets}
   private contractDealSample(deal: any): ContractDealSample {
     return {
       dealId: deal.id,
+      occurrenceId: deal.__contractOccurrenceId ?? null,
+      occurredAt: deal.__contractOccurredAt instanceof Date ? deal.__contractOccurredAt.toISOString() : null,
       dealExternalId: deal.externalId ?? null,
       dealTitle: deal.title,
       amount: Number.isFinite(Number(deal.amount)) ? Number(deal.amount) : null,
@@ -2766,10 +2775,11 @@ ${sheets}
   private contractDealSamples(samples: ContractDealSample[] = []) {
     const unique = new Map<string, ContractDealSample>();
     for (const sample of samples) {
-      if (!unique.has(sample.dealId)) unique.set(sample.dealId, sample);
+      const sampleId = sample.occurrenceId ?? sample.dealId;
+      if (!unique.has(sampleId)) unique.set(sampleId, sample);
     }
     return [...unique.values()].sort((a, b) => {
-      const byDate = Date.parse(b.updatedAt ?? '') - Date.parse(a.updatedAt ?? '');
+      const byDate = Date.parse(b.occurredAt ?? b.updatedAt ?? '') - Date.parse(a.occurredAt ?? a.updatedAt ?? '');
       if (Number.isFinite(byDate) && byDate !== 0) return byDate;
       return a.dealTitle.localeCompare(b.dealTitle, 'ru');
     });
@@ -4965,6 +4975,125 @@ ${sheets}
     role: UserRole,
   ) {
     return this.findDealIdsFromHistoryMany([stageFilter.toStageId], filters, role, stageFilter.fromStageId);
+  }
+
+  private async findStageEventDeals(
+    stageIds: string[],
+    filters: ReportFilters,
+    role: UserRole,
+    fromStageId?: string,
+  ) {
+    const targetStages = await this.prisma.pipelineStage.findMany({
+      where: { id: { in: stageIds } },
+      select: {
+        externalId: true,
+        pipeline: { select: { externalId: true } },
+      },
+    });
+    if (!targetStages.length) return [];
+
+    const managerIds = await this.visibleManagerIds(role, filters.groupIds);
+    const allowedManagerIds = filters.managerIds?.length
+      ? filters.managerIds.filter((id) => managerIds.includes(id))
+      : managerIds;
+    if (!allowedManagerIds.length) return [];
+
+    const afterStatusId = Prisma.sql`COALESCE(
+      event."valueAfter"->0->'lead_status'->>'id',
+      event."valueAfter"->0->'status'->>'id',
+      event."valueAfter"->'lead_status'->>'id',
+      event."valueAfter"->'status'->>'id',
+      event."valueAfter"->>'id'
+    )`;
+    const afterPipelineId = Prisma.sql`COALESCE(
+      event."valueAfter"->0->'lead_status'->>'pipeline_id',
+      event."valueAfter"->0->'status'->>'pipeline_id',
+      event."valueAfter"->'lead_status'->>'pipeline_id',
+      event."valueAfter"->'status'->>'pipeline_id',
+      event."valueAfter"->>'pipeline_id'
+    )`;
+    const stageConditions = targetStages.map((stage) => Prisma.sql`(
+      ${afterStatusId} = ${stage.externalId}
+      AND ${afterPipelineId} = ${stage.pipeline.externalId}
+    )`);
+    const range = this.dateRange(filters);
+    const where: Prisma.Sql[] = [
+      Prisma.sql`event."type" = 'lead_status_changed'`,
+      Prisma.sql`event."dealId" IS NOT NULL`,
+      Prisma.sql`deal."deleted_at" IS NULL`,
+      Prisma.sql`deal."responsible_id" IN (${Prisma.join(allowedManagerIds)})`,
+      Prisma.sql`(${Prisma.join(stageConditions, ' OR ')})`,
+    ];
+    if (range?.gte) where.push(Prisma.sql`event."createdAt" >= ${range.gte}`);
+    if (range?.lte) where.push(Prisma.sql`event."createdAt" <= ${range.lte}`);
+    if (filters.lossReasonIds?.length) {
+      where.push(Prisma.sql`deal."loss_reason_id" IN (${Prisma.join(filters.lossReasonIds)})`);
+    }
+    if (filters.amountFrom !== undefined) where.push(Prisma.sql`deal."amount" >= ${filters.amountFrom}`);
+    if (filters.amountTo !== undefined) where.push(Prisma.sql`deal."amount" <= ${filters.amountTo}`);
+    if (filters.tagIncludes?.length) {
+      where.push(Prisma.sql`deal."tags" && ARRAY[${Prisma.join(filters.tagIncludes)}]::TEXT[]`);
+    }
+    for (const customFilter of filters.customFields ?? []) {
+      const condition = this.factCustomFieldCondition(customFilter);
+      if (condition) where.push(condition);
+    }
+
+    if (fromStageId) {
+      const sourceStage = await this.prisma.pipelineStage.findUnique({
+        where: { id: fromStageId },
+        select: {
+          externalId: true,
+          pipeline: { select: { externalId: true } },
+        },
+      });
+      if (!sourceStage) return [];
+      const beforeStatusId = Prisma.sql`COALESCE(
+        event."valueBefore"->0->'lead_status'->>'id',
+        event."valueBefore"->0->'status'->>'id',
+        event."valueBefore"->'lead_status'->>'id',
+        event."valueBefore"->'status'->>'id',
+        event."valueBefore"->>'id'
+      )`;
+      const beforePipelineId = Prisma.sql`COALESCE(
+        event."valueBefore"->0->'lead_status'->>'pipeline_id',
+        event."valueBefore"->0->'status'->>'pipeline_id',
+        event."valueBefore"->'lead_status'->>'pipeline_id',
+        event."valueBefore"->'status'->>'pipeline_id',
+        event."valueBefore"->>'pipeline_id'
+      )`;
+      where.push(Prisma.sql`${beforeStatusId} = ${sourceStage.externalId}`);
+      where.push(Prisma.sql`${beforePipelineId} = ${sourceStage.pipeline.externalId}`);
+    }
+
+    const occurrences = await this.prisma.$queryRaw<Array<{
+      occurrenceId: string;
+      dealId: string;
+      occurredAt: Date;
+    }>>`
+      SELECT
+        event."id" AS "occurrenceId",
+        event."dealId" AS "dealId",
+        event."createdAt" AS "occurredAt"
+      FROM "CrmEvent" event
+      JOIN "fact_deal_current" deal ON deal."deal_id" = event."dealId"
+      WHERE ${Prisma.join(where, ' AND ')}
+      ORDER BY event."createdAt" ASC, event."id" ASC
+    `;
+    if (!occurrences.length) return [];
+
+    const deals = await this.findDealsByIds([...new Set(occurrences.map((item) => item.dealId))]);
+    const dealById = new Map(deals.map((deal) => [deal.id, deal]));
+    return occurrences.flatMap((occurrence) => {
+      const deal = dealById.get(occurrence.dealId);
+      return deal
+        ? [{
+            ...deal,
+            __contractOccurrenceId: occurrence.occurrenceId,
+            __contractOccurredAt: occurrence.occurredAt,
+          }]
+        : [];
+    });
   }
 
   private async findDealIdsFromHistoryMany(stageIds: string[], filters: ReportFilters, role: UserRole, fromStageId?: string) {

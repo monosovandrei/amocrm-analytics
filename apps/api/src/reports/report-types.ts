@@ -47,6 +47,7 @@ export interface DataContractMetric {
   pipelineId?: string;
   fromStageId?: string;
   stageIds?: string[];
+  stageEntryMode?: 'first_ever_deal' | 'event';
   fieldId?: string;
   fieldOperator?: 'equals' | 'contains' | 'is_set' | 'lt' | 'lte' | 'gt' | 'gte';
   fieldValue?: unknown;

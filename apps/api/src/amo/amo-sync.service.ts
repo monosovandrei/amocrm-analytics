@@ -423,7 +423,7 @@ export class AmoSyncService {
     const overlapMs = this.getRecentReconcileOverlapMinutes() * 60_000;
     const earliestAllowed = startedAt.getTime() - lookbackMs;
     const cursorFrom = previousCursor ? previousCursor.getTime() - overlapMs : earliestAllowed;
-    const syncFrom = new Date(Math.max(earliestAllowed, cursorFrom));
+    const syncFrom = new Date(cursorFrom);
     const updatedSince = Math.floor(syncFrom.getTime() / 1000);
     const stats: Record<string, number> = {};
 
@@ -768,16 +768,16 @@ export class AmoSyncService {
 
   private getRecentReconcileLookbackMinutes() {
     const rawMinutes = this.config.get<string>('AMOCRM_RECENT_RECONCILE_LOOKBACK_MINUTES');
-    if (!rawMinutes) return 10;
+    if (!rawMinutes) return 30;
     const parsed = Number(rawMinutes);
-    return Number.isFinite(parsed) && parsed > 0 ? Math.min(10, parsed) : 10;
+    return Number.isFinite(parsed) && parsed > 0 ? Math.min(10_080, parsed) : 30;
   }
 
   private getRecentReconcileOverlapMinutes() {
     const rawMinutes = this.config.get<string>('AMOCRM_RECENT_RECONCILE_OVERLAP_MINUTES');
     if (!rawMinutes) return 2;
     const parsed = Number(rawMinutes);
-    return Number.isFinite(parsed) && parsed >= 0 ? Math.min(5, parsed) : 2;
+    return Number.isFinite(parsed) && parsed >= 0 ? Math.min(60, parsed) : 2;
   }
 
   private getRecentFactRefreshMinutes() {
@@ -789,16 +789,16 @@ export class AmoSyncService {
 
   private getRecentReconcileMaxDeals() {
     const rawLimit = this.config.get<string>('AMOCRM_RECENT_RECONCILE_MAX_DEALS');
-    if (!rawLimit) return 500;
+    if (!rawLimit) return 5000;
     const parsed = Number(rawLimit);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : 500;
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 5000;
   }
 
   private getRecentReconcileMaxEvents() {
     const rawLimit = this.config.get<string>('AMOCRM_RECENT_RECONCILE_MAX_EVENTS');
-    if (!rawLimit) return 1000;
+    if (!rawLimit) return 10_000;
     const parsed = Number(rawLimit);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : 1000;
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 10_000;
   }
 
   private getLeadSlaReconcileLimit() {
@@ -2202,7 +2202,10 @@ export class AmoSyncService {
 
     stats.deals = totalDeals;
     stats.dealPages = page;
-    if (hasNextPage && totalDeals >= maxDeals) stats.dealsTruncated = 1;
+    if (hasNextPage && totalDeals >= maxDeals) {
+      stats.dealsTruncated = 1;
+      throw new Error(`Recent amoCRM deal reconciliation exceeded ${maxDeals} records; cursor was not advanced`);
+    }
   }
 
   private async syncRecentStageEvents(
@@ -2212,7 +2215,7 @@ export class AmoSyncService {
     updatedSince: number,
   ) {
     const maxEvents = this.getRecentReconcileMaxEvents();
-    const pageLimit = Math.min(250, maxEvents);
+    const pageLimit = Math.min(100, maxEvents);
     const params: Record<string, string | number> = {
       'filter[created_at][from]': updatedSince,
       'filter[type]': 'lead_status_changed',
@@ -2242,7 +2245,10 @@ export class AmoSyncService {
 
     stats.events = eventsById.size;
     stats.eventPages = page;
-    if (hasNextPage && eventsById.size >= maxEvents) stats.eventsTruncated = 1;
+    if (hasNextPage && eventsById.size >= maxEvents) {
+      stats.eventsTruncated = 1;
+      throw new Error(`Recent amoCRM event reconciliation exceeded ${maxEvents} records; cursor was not advanced`);
+    }
     await this.backfillStageHistoryFromStoredEvents(maps, stats, updatedSince);
   }
 

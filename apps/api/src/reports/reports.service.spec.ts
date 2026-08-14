@@ -1252,6 +1252,62 @@ describe('ReportsService data contract', () => {
     expect(row.metrics.kp).toMatchObject({ value: 0, dealCount: 0 });
   });
 
+  it('counts every amoCRM stage event when the metric uses event entry mode', async () => {
+    const factDeal = factDealCurrentRows()[0];
+    const db = {
+      amoConnection: {
+        findFirst: jest.fn().mockResolvedValue(null),
+      },
+      pipelineStage: {
+        findMany: jest.fn().mockResolvedValue([
+          {
+            externalId: 'stage-kp-external',
+            pipeline: { externalId: 'pipeline-sales-external' },
+          },
+        ]),
+      },
+      factDealCurrent: {
+        findMany: jest.fn().mockResolvedValue([factDeal]),
+      },
+      $queryRaw: jest.fn().mockResolvedValue([
+        { occurrenceId: 'event-1', dealId: factDeal.dealId, occurredAt: new Date('2026-02-10T10:00:00.000Z') },
+        { occurrenceId: 'event-2', dealId: factDeal.dealId, occurredAt: new Date('2026-02-11T10:00:00.000Z') },
+      ]),
+    };
+    const localService = new ReportsService(db as any, audit as any);
+    jest.spyOn(localService as any, 'visibleManagerIds').mockResolvedValue([managers.first.id]);
+
+    const result = await (localService as any).computeFresh(
+      {
+        sourceType: 'EVENT' as any,
+        filters: { dateFrom: '2026-02-01T00:00:00.000Z', dateTo: '2026-02-28T23:59:59.999Z' },
+        config: {
+          metric: 'contract',
+          contract: {
+            groupBy: 'none',
+            metrics: [
+              {
+                id: 'kp',
+                label: 'КП',
+                type: 'stage_reached',
+                stageIds: [stages.kp.id],
+                stageEntryMode: 'event',
+                measure: 'deal_count',
+                display: 'number',
+              },
+            ],
+          },
+        },
+      } as any,
+      { id: 'user-1', role: 'ADMIN' as any },
+    );
+
+    const metric = (result as any).rows.find((item: any) => item.groupId === 'all').metrics.kp;
+    expect(metric).toMatchObject({ value: 2, dealCount: 2, sampleSize: 2 });
+    expect(metric.samples.map((sample: any) => sample.occurrenceId)).toEqual(['event-2', 'event-1']);
+    expect(db.$queryRaw).toHaveBeenCalledTimes(1);
+  });
+
   it('computes deal cycle durations from stage entry to stage exit', async () => {
     const result = await service.compute(
       {
