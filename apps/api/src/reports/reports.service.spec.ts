@@ -1252,7 +1252,7 @@ describe('ReportsService data contract', () => {
     expect(row.metrics.kp).toMatchObject({ value: 0, dealCount: 0 });
   });
 
-  it('counts every amoCRM stage event when the metric uses event entry mode', async () => {
+  it('counts every amoCRM stage event under the manager who performed it', async () => {
     const factDeal = factDealCurrentRows()[0];
     const db = {
       amoConnection: {
@@ -1270,12 +1270,29 @@ describe('ReportsService data contract', () => {
         findMany: jest.fn().mockResolvedValue([factDeal]),
       },
       $queryRaw: jest.fn().mockResolvedValue([
-        { occurrenceId: 'event-1', dealId: factDeal.dealId, occurredAt: new Date('2026-02-10T10:00:00.000Z') },
-        { occurrenceId: 'event-2', dealId: factDeal.dealId, occurredAt: new Date('2026-02-11T10:00:00.000Z') },
+        {
+          occurrenceId: 'event-1',
+          dealId: factDeal.dealId,
+          occurredAt: new Date('2026-02-10T10:00:00.000Z'),
+          responsibleId: managers.first.id,
+          responsibleName: managers.first.name,
+          groupId: managers.first.groupId,
+          groupName: managers.first.group.name,
+        },
+        {
+          occurrenceId: 'event-2',
+          dealId: factDeal.dealId,
+          occurredAt: new Date('2026-02-11T10:00:00.000Z'),
+          responsibleId: managers.second.id,
+          responsibleName: managers.second.name,
+          groupId: managers.second.groupId,
+          groupName: managers.second.group.name,
+        },
       ]),
     };
     const localService = new ReportsService(db as any, audit as any);
-    jest.spyOn(localService as any, 'visibleManagerIds').mockResolvedValue([managers.first.id]);
+    jest.spyOn(localService as any, 'visibleManagerIds').mockResolvedValue(Object.values(managers).map((manager) => manager.id));
+    jest.spyOn(localService as any, 'visibleManagers').mockResolvedValue(Object.values(managers));
 
     const result = await (localService as any).computeFresh(
       {
@@ -1284,7 +1301,7 @@ describe('ReportsService data contract', () => {
         config: {
           metric: 'contract',
           contract: {
-            groupBy: 'none',
+            groupBy: 'manager',
             metrics: [
               {
                 id: 'kp',
@@ -1302,9 +1319,12 @@ describe('ReportsService data contract', () => {
       { id: 'user-1', role: 'ADMIN' as any },
     );
 
-    const metric = (result as any).rows.find((item: any) => item.groupId === 'all').metrics.kp;
-    expect(metric).toMatchObject({ value: 2, dealCount: 2, sampleSize: 2 });
-    expect(metric.samples.map((sample: any) => sample.occurrenceId)).toEqual(['event-2', 'event-1']);
+    const firstMetric = (result as any).rows.find((item: any) => item.groupId === managers.first.id).metrics.kp;
+    const secondMetric = (result as any).rows.find((item: any) => item.groupId === managers.second.id).metrics.kp;
+    expect(firstMetric).toMatchObject({ value: 1, dealCount: 1, sampleSize: 1 });
+    expect(secondMetric).toMatchObject({ value: 1, dealCount: 1, sampleSize: 1 });
+    expect(firstMetric.samples[0].occurrenceId).toBe('event-1');
+    expect(secondMetric.samples[0].occurrenceId).toBe('event-2');
     expect(db.$queryRaw).toHaveBeenCalledTimes(1);
   });
 

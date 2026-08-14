@@ -5021,7 +5021,7 @@ ${sheets}
       Prisma.sql`event."type" = 'lead_status_changed'`,
       Prisma.sql`event."dealId" IS NOT NULL`,
       Prisma.sql`deal."deleted_at" IS NULL`,
-      Prisma.sql`deal."responsible_id" IN (${Prisma.join(allowedManagerIds)})`,
+      Prisma.sql`COALESCE(event_manager."id", deal."responsible_id") IN (${Prisma.join(allowedManagerIds)})`,
       Prisma.sql`(${Prisma.join(stageConditions, ' OR ')})`,
     ];
     if (range?.gte) where.push(Prisma.sql`event."createdAt" >= ${range.gte}`);
@@ -5070,13 +5070,24 @@ ${sheets}
       occurrenceId: string;
       dealId: string;
       occurredAt: Date;
+      responsibleId: string | null;
+      responsibleName: string | null;
+      groupId: string | null;
+      groupName: string | null;
     }>>`
       SELECT
         event."id" AS "occurrenceId",
         event."dealId" AS "dealId",
-        event."createdAt" AS "occurredAt"
+        event."createdAt" AS "occurredAt",
+        COALESCE(event_manager."id", deal."responsible_id") AS "responsibleId",
+        COALESCE(event_manager."name", deal."responsible_name") AS "responsibleName",
+        COALESCE(event_group."id", deal."group_id") AS "groupId",
+        COALESCE(event_group."name", deal."group_name") AS "groupName"
       FROM "CrmEvent" event
       JOIN "fact_deal_current" deal ON deal."deal_id" = event."dealId"
+      LEFT JOIN "CrmUser" event_manager
+        ON event_manager."externalId" = event."raw"->>'created_by'
+      LEFT JOIN "CrmGroup" event_group ON event_group."id" = event_manager."groupId"
       WHERE ${Prisma.join(where, ' AND ')}
       ORDER BY event."createdAt" ASC, event."id" ASC
     `;
@@ -5089,6 +5100,17 @@ ${sheets}
       return deal
         ? [{
             ...deal,
+            responsibleId: occurrence.responsibleId ?? deal.responsibleId,
+            responsible: occurrence.responsibleId
+              ? {
+                  id: occurrence.responsibleId,
+                  name: occurrence.responsibleName ?? deal.responsible?.name ?? 'Без менеджера',
+                  groupId: occurrence.groupId,
+                  group: occurrence.groupId
+                    ? { id: occurrence.groupId, name: occurrence.groupName ?? 'Без группы' }
+                    : null,
+                }
+              : deal.responsible,
             __contractOccurrenceId: occurrence.occurrenceId,
             __contractOccurredAt: occurrence.occurredAt,
           }]
