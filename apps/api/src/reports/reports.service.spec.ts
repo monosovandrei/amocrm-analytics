@@ -807,6 +807,48 @@ describe('ReportsService data contract', () => {
     expect(weightedTotal.formula).not.toContain('Счета x 90%');
   });
 
+  it('separates prepared and presented proposals in the Sales funnel only', async () => {
+    const templates = await (service as any).buildSalesReportTemplates();
+    const funnel = templates.find((item: any) => item.config?.builtinKey === 'sales_funnel_steps');
+    const weighted = templates.find((item: any) => item.config?.builtinKey === 'sales_weighted_funnel');
+    const funnelMetrics = funnel.config.contract.metrics;
+
+    expect(funnelMetrics.map((metric: any) => metric.label)).toEqual(expect.arrayContaining([
+      'КП подготовили',
+      'Конверсия КП подготовлено -> презентовано',
+      'КП презентовали',
+      'Конверсия КП презентовано -> счёт',
+    ]));
+    expect(funnelMetrics.find((metric: any) => metric.id === 'kp_prepared')).toEqual(expect.objectContaining({
+      stageIds: ['stage-kp-prepared'],
+      legacyStageIds: [stages.kp.id],
+      legacyStageBefore: '2026-08-13T00:00:00+03:00',
+    }));
+    expect(weighted.config.contract.metrics.some((metric: any) => metric.stageIds?.includes('stage-kp-prepared'))).toBe(false);
+
+    const forecastRefs = await (service as any).resolveRevenueForecastRefs();
+    expect(forecastRefs.quoteStages.map((stage: any) => stage.id)).not.toContain('stage-kp-prepared');
+  });
+
+  it('uses presented proposals as the prepared-step proxy only before launch', () => {
+    const metric = {
+      legacyStageIds: [stages.kp.id],
+      legacyStageBefore: '2026-08-13T00:00:00+03:00',
+    } as any;
+
+    expect((service as any).legacyStageFilters(metric, {
+      dateFrom: '2026-08-01',
+      dateTo: '2026-08-31',
+    })).toEqual(expect.objectContaining({
+      dateFrom: '2026-08-01',
+      dateTo: '2026-08-12T20:59:59.999Z',
+    }));
+    expect((service as any).legacyStageFilters(metric, {
+      dateFrom: '2026-08-13',
+      dateTo: '2026-08-31',
+    })).toBeNull();
+  });
+
   it('does not publish retired built-in reports', async () => {
     const prisma = createPrismaMock() as any;
     const localService = new ReportsService(prisma, audit as any);
@@ -1524,6 +1566,7 @@ function createPrismaMock() {
       isArchived: false,
       stages: [
         { ...stages.qualified, externalId: '20959402', name: 'Назначен ответственный' },
+        { id: 'stage-kp-prepared', externalId: '87857738', name: 'КП подготовлено', pipelineId: 'pipe-sales', isWon: false, isLost: false },
         { ...stages.kp, externalId: '20959408', name: 'КП презентовано' },
         { id: 'stage-objections', externalId: '57732446', name: 'Есть возражения', pipelineId: 'pipe-sales', isWon: false, isLost: false },
         { ...stages.invoice, externalId: '20959411', name: 'Счет отправлен' },

@@ -917,9 +917,15 @@ export class ReportsService {
           },
         ],
       },
-      conversionMetric('conv_lead_to_kp', 'Конверсия лид -> КП', 'leads_received', 'kp_presented'),
-      stageMetric('kp_presented', 'КП сделали', [refs.stages.kp.id]),
-      conversionMetric('conv_kp_to_invoice', 'Конверсия КП -> счёт', 'kp_presented', 'invoice_sent'),
+      conversionMetric('conv_lead_to_kp_prepared', 'Конверсия лид -> КП подготовлено', 'leads_received', 'kp_prepared'),
+      {
+        ...stageMetric('kp_prepared', 'КП подготовили', [refs.stages.kpPrepared.id]),
+        legacyStageIds: [refs.stages.kp.id],
+        legacyStageBefore: '2026-08-13T00:00:00+03:00',
+      },
+      conversionMetric('conv_kp_prepared_to_presented', 'Конверсия КП подготовлено -> презентовано', 'kp_prepared', 'kp_presented'),
+      stageMetric('kp_presented', 'КП презентовали', [refs.stages.kp.id]),
+      conversionMetric('conv_kp_presented_to_invoice', 'Конверсия КП презентовано -> счёт', 'kp_presented', 'invoice_sent'),
       stageMetric('invoice_sent', 'Счета выставили', [refs.stages.invoice.id]),
       conversionMetric('conv_invoice_to_paid', 'Конверсия счёт -> оплата', 'invoice_sent', 'paid'),
       stageMetric('paid', 'Оплаты получили', refs.stages.success.map((stage) => stage.id)),
@@ -2200,8 +2206,18 @@ ${sheets}
       if (metric.stageEntryMode === 'event') {
         return applyMetricFilters(await this.findStageEventDeals(stageIds, filters, role, metric.fromStageId));
       }
-      const dealIds = await this.findDealIdsFromHistoryMany(stageIds, filters, role, metric.fromStageId);
-      return applyMetricFilters(await this.findDealsByIds(dealIds));
+      const dealIds = new Set(await this.findDealIdsFromHistoryMany(stageIds, filters, role, metric.fromStageId));
+      const legacyFilters = this.legacyStageFilters(metric, filters);
+      if (legacyFilters && metric.legacyStageIds?.length) {
+        const legacyDealIds = await this.findDealIdsFromHistoryMany(
+          metric.legacyStageIds.filter(Boolean),
+          legacyFilters,
+          role,
+          metric.fromStageId,
+        );
+        for (const dealId of legacyDealIds) dealIds.add(dealId);
+      }
+      return applyMetricFilters(await this.findDealsByIds([...dealIds]));
     }
 
     if (metric.type === 'current_stage' || metric.type === 'weighted_stage_sum') {
@@ -4530,6 +4546,9 @@ ${sheets}
     const assigned =
       stageByExternalId(salesStages, '20959402') ??
       stageByName(salesStages, ['назначен', 'ответствен']);
+    const kpPrepared =
+      stageByExternalId(salesStages, '87857738') ??
+      stageByName(salesStages, ['кп', 'подготов']);
     const kp =
       stageByExternalId(salesStages, '20959408') ??
       stageByName(salesStages, ['кп', 'презент']) ??
@@ -4546,7 +4565,7 @@ ${sheets}
       salesStages.find((stage) => this.isBusinessWonStage(stage)) ??
       null;
     const success = this.businessWonStages(salesStages);
-    if (!assigned || !kp || !invoice || !paid) return null;
+    if (!assigned || !kpPrepared || !kp || !invoice || !paid) return null;
 
     const assemblyStages = (assemblyPipeline?.stages ?? [])
       .filter((stage) => !this.isBusinessWonStage(stage) && !this.isBusinessLostStage(stage))
@@ -4562,6 +4581,7 @@ ${sheets}
       assemblyStages,
       stages: {
         assigned,
+        kpPrepared,
         kp,
         objections,
         invoice,
@@ -5324,6 +5344,20 @@ ${sheets}
     if (filters.dateFrom) range.gte = this.parseFilterDate(filters.dateFrom, false);
     if (filters.dateTo) range.lte = this.parseFilterDate(filters.dateTo, true);
     return Object.keys(range).length ? range : undefined;
+  }
+
+  private legacyStageFilters(metric: DataContractMetric, filters: ReportFilters): ReportFilters | null {
+    if (!metric.legacyStageBefore || !metric.legacyStageIds?.length) return null;
+    const cutoff = new Date(metric.legacyStageBefore);
+    if (Number.isNaN(cutoff.getTime())) return null;
+    const range = this.dateRange(filters);
+    if (range?.gte && range.gte >= cutoff) return null;
+    const legacyTo = new Date(cutoff.getTime() - 1);
+    const effectiveTo = range?.lte && range.lte < legacyTo ? range.lte : legacyTo;
+    return {
+      ...filters,
+      dateTo: effectiveTo.toISOString(),
+    };
   }
 
   private isDateInRange(value: Date, range?: Record<string, Date>) {

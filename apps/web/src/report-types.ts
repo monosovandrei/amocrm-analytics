@@ -261,6 +261,8 @@ export interface ContractMetricPayload {
   pipelineId?: string;
   fromStageId?: string;
   stageIds?: string[];
+  legacyStageIds?: string[];
+  legacyStageBefore?: string;
   fieldId?: string;
   fieldOperator?: FieldOperator;
   fieldValue?: unknown;

@@ -1645,6 +1645,7 @@ export class AmoSyncService {
       stats.csmZeroTakenToWorkNotifications = result.csmZeroTakenToWork;
       stats.csmZeroOfferMadeNotifications = result.csmZeroOfferMade;
       stats.invoiceNoPaymentNotifications = result.invoiceNoPayment;
+      stats.proposalPreparedStaleNotifications = result.proposalPreparedStale;
       stats.proposalStaleNotifications = result.proposalStale;
       stats.highValueIdleNotifications = result.highValueIdle;
       stats.notificationSkips = result.skipped;

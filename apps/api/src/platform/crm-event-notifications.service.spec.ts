@@ -168,4 +168,14 @@ describe('CrmEventNotificationsService payment notification routing', () => {
     );
     expect(telegram.sendDirectMessageToCrmUser).not.toHaveBeenCalled();
   });
+
+  it('treats prepared proposals as overdue after two Moscow working days', () => {
+    const { service } = createService();
+    const enteredAt = new Date('2026-08-14T09:00:00.000Z'); // Friday, 12:00 MSK
+
+    expect(service.isPreparedProposalStage('КП подготовлено')).toBe(true);
+    expect(service.isProposalOrObjectionStage('КП подготовлено')).toBe(false);
+    expect(service.preparedProposalIsStale(enteredAt, new Date('2026-08-17T20:59:59.000Z'))).toBe(false);
+    expect(service.preparedProposalIsStale(enteredAt, new Date('2026-08-18T09:00:00.000Z'))).toBe(true);
+  });
 });

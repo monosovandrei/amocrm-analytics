@@ -130,6 +130,7 @@ export class CrmEventNotificationsService {
       csmZeroTakenToWork: 0,
       csmZeroOfferMade: 0,
       invoiceNoPayment: 0,
+      proposalPreparedStale: 0,
       proposalStale: 0,
       highValueIdle: 0,
     };
@@ -201,6 +202,7 @@ export class CrmEventNotificationsService {
       result.assignedLeadNew += stateAlerts.assignedLeadNew;
       result.assignedLeadReminder += stateAlerts.assignedLeadReminder;
       result.invoiceNoPayment += stateAlerts.invoiceNoPayment;
+      result.proposalPreparedStale += stateAlerts.proposalPreparedStale;
       result.proposalStale += stateAlerts.proposalStale;
       result.highValueIdle += stateAlerts.highValueIdle;
       result.skipped += stateAlerts.skipped;
@@ -710,11 +712,11 @@ export class CrmEventNotificationsService {
   private async notifyStateBasedAlerts(users: AppUser[], leaders: AppUser[], domain: string) {
     const salesPipelineIds = await this.salesPipelineIds();
     if (!salesPipelineIds.length) {
-      return { assignedLeadNew: 0, assignedLeadReminder: 0, invoiceNoPayment: 0, proposalStale: 0, highValueIdle: 0, skipped: 0 };
+      return { assignedLeadNew: 0, assignedLeadReminder: 0, invoiceNoPayment: 0, proposalPreparedStale: 0, proposalStale: 0, highValueIdle: 0, skipped: 0 };
     }
 
     const now = new Date();
-    const result = { assignedLeadNew: 0, assignedLeadReminder: 0, invoiceNoPayment: 0, proposalStale: 0, highValueIdle: 0, skipped: 0 };
+    const result = { assignedLeadNew: 0, assignedLeadReminder: 0, invoiceNoPayment: 0, proposalPreparedStale: 0, proposalStale: 0, highValueIdle: 0, skipped: 0 };
     const maxDeals = 2000;
     const batchSize = 200;
     for (let skip = 0; skip < maxDeals; skip += batchSize) {
@@ -743,6 +745,12 @@ export class CrmEventNotificationsService {
         if (this.isInvoiceSentStage(deal.stage?.name)) {
           const delivered = await this.notifyInvoiceNoPayment(deal, leaders, domain, now);
           result.invoiceNoPayment += delivered.sent;
+          result.skipped += delivered.skipped;
+        }
+
+        if (this.isPreparedProposalStage(deal.stage?.name)) {
+          const delivered = await this.notifyPreparedProposalStale(deal, leaders, domain, now);
+          result.proposalPreparedStale += delivered.sent;
           result.skipped += delivered.skipped;
         }
 
@@ -885,6 +893,33 @@ export class CrmEventNotificationsService {
     });
     const payload = { type: 'amo_proposal_stale_24h', dealId: deal.id, dealExternalId: deal.externalId };
     const configuredDeliveries = await this.sendConfiguredNotification('amo_proposal_stale_24h', message, payload, eventKey);
+    if (configuredDeliveries) {
+      return configuredDeliveries.some((delivery) => delivery?.status === 'SENT') ? { sent: 1, skipped: 0 } : { sent: 0, skipped: 1 };
+    }
+    const deliveries = await this.telegram.sendDirectMessageToUsers(
+      leaders.map((leader) => leader.id),
+      message,
+      payload,
+      undefined,
+      eventKey,
+    );
+    return deliveries.some((delivery) => delivery?.status === 'SENT') ? { sent: 1, skipped: 0 } : { sent: 0, skipped: 1 };
+  }
+
+  private async notifyPreparedProposalStale(deal: any, leaders: AppUser[], domain: string, now: Date) {
+    if (!leaders.length || !this.preparedProposalIsStale(this.currentStageEnteredAt(deal), now)) {
+      return { sent: 0, skipped: 0 };
+    }
+
+    const eventKey = `amo:proposal-prepared-stale-2bd:${deal.id}:${deal.stageId}`;
+    const message = await this.renderNotification('amo_proposal_prepared_stale_2bd', 'amo_proposal_prepared_stale_2bd', {
+      deal: deal.title,
+      dealUrl: this.dealUrl(domain, deal.externalId),
+      amount: this.formatMoney(deal.amount),
+      manager: deal.responsible?.name ?? '-',
+    });
+    const payload = { type: 'amo_proposal_prepared_stale_2bd', dealId: deal.id, dealExternalId: deal.externalId };
+    const configuredDeliveries = await this.sendConfiguredNotification('amo_proposal_prepared_stale_2bd', message, payload, eventKey);
     if (configuredDeliveries) {
       return configuredDeliveries.some((delivery) => delivery?.status === 'SENT') ? { sent: 1, skipped: 0 } : { sent: 0, skipped: 1 };
     }
@@ -1225,6 +1260,16 @@ export class CrmEventNotificationsService {
       (normalized.includes(this.normalizeText('\u043e\u0442\u043f\u0440\u0430\u0432')) ||
         normalized.includes(this.normalizeText('\u043f\u0440\u0435\u0437\u0435\u043d\u0442')));
     return isProposal || normalized.includes(this.normalizeText('\u0432\u043e\u0437\u0440\u0430\u0436'));
+  }
+
+  private isPreparedProposalStage(name?: string | null) {
+    const normalized = this.normalizeText(name ?? '');
+    return normalized.includes(this.normalizeText('\u043a\u043f')) &&
+      normalized.includes(this.normalizeText('\u043f\u043e\u0434\u0433\u043e\u0442\u043e\u0432'));
+  }
+
+  private preparedProposalIsStale(enteredAt: Date, now: Date) {
+    return moscowWeekdayElapsedMs(enteredAt, now) >= 2 * 24 * 60 * 60_000;
   }
 
   async leadSlaCards(options: { domain?: string } = {}) {
@@ -1623,6 +1668,9 @@ export class CrmEventNotificationsService {
     }
     if (type === 'amo_proposal_stale_24h') {
       return '\u0421\u0434\u0435\u043b\u043a\u0430 \u043d\u0430 {amount} \u0441\u0442\u043e\u0438\u0442 \u0432\u0442\u043e\u0440\u043e\u0439 \u0434\u0435\u043d\u044c - {dealUrl}';
+    }
+    if (type === 'amo_proposal_prepared_stale_2bd') {
+      return '\u041a\u041f \u043f\u043e\u0434\u0433\u043e\u0442\u043e\u0432\u043b\u0435\u043d\u043e, \u043d\u043e \u043d\u0435 \u043f\u0440\u0435\u0437\u0435\u043d\u0442\u043e\u0432\u0430\u043d\u043e \u043a\u043b\u0438\u0435\u043d\u0442\u0443 \u0437\u0430 2 \u0440\u0430\u0431\u043e\u0447\u0438\u0445 \u0434\u043d\u044f.\n\u0421\u0434\u0435\u043b\u043a\u0430: {deal}\n\u041c\u0435\u043d\u0435\u0434\u0436\u0435\u0440: {manager}\n\u0421\u0443\u043c\u043c\u0430: {amount}\n\u0421\u0441\u044b\u043b\u043a\u0430: {dealUrl}';
     }
     if (type === 'amo_high_value_idle_24h') {
       return '\u041a\u0440\u0443\u043f\u043d\u0430\u044f \u0441\u0434\u0435\u043b\u043a\u0430 \u0431\u0435\u0437 \u0434\u0432\u0438\u0436\u0435\u043d\u0438\u044f 24 \u0447\u0430\u0441\u0430.\n\u0421\u0434\u0435\u043b\u043a\u0430: {deal}\n\u0421\u0443\u043c\u043c\u0430: {amount}\n\u041c\u0435\u043d\u0435\u0434\u0436\u0435\u0440: {manager}\n\u042d\u0442\u0430\u043f: {stage}\n\u0421\u0441\u044b\u043b\u043a\u0430: {dealUrl}';
