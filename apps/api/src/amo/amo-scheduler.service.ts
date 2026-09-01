@@ -59,7 +59,7 @@ export class AmoSchedulerService {
     const syncIntervalMinutes = this.getSyncIntervalMinutes();
     if (syncIntervalMinutes <= 0) return;
 
-    const lastSync = connection.lastIncrementalSyncAt ?? connection.lastFullSyncAt;
+    const lastSync = connection.lastPullSyncAt ?? connection.lastIncrementalSyncAt ?? connection.lastFullSyncAt;
     const syncType = lastSync ? SyncJobType.INCREMENTAL : SyncJobType.FULL;
     if (!pullSyncJobTypes.includes(syncType)) return;
     const due = !lastSync || Date.now() - lastSync.getTime() >= syncIntervalMinutes * 60_000;
@@ -256,10 +256,10 @@ export class AmoSchedulerService {
 
   private getSyncIntervalMinutes() {
     const rawInterval = this.config.get<string>('AMOCRM_SYNC_INTERVAL_MINUTES');
-    if (!rawInterval) return 0;
+    if (!rawInterval) return 1;
 
     const parsed = Number(rawInterval);
-    return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
+    return Number.isFinite(parsed) ? Math.max(1, parsed) : 1;
   }
 
   private getWebhookSubscriptionCheckMinutes() {
@@ -283,7 +283,7 @@ export class AmoSchedulerService {
     if (!rawInterval) return 60;
 
     const parsed = Number(rawInterval);
-    return Number.isFinite(parsed) ? Math.max(0, parsed) : 60;
+    return Number.isFinite(parsed) ? Math.max(30, parsed) : 60;
   }
 
   private getLeadSlaReconcileIntervalSeconds() {

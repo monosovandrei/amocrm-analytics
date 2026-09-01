@@ -1,13 +1,50 @@
-import { Controller, Get } from '@nestjs/common';
+import { Controller, Get, ServiceUnavailableException } from '@nestjs/common';
 import { ApiRuntimeMetrics } from '../common/api-memory.interceptor';
 import { PrismaService } from '../prisma/prisma.service';
+import { DataQualityService } from '../quality/data-quality.service';
+import { METRIC_VERSION, RELEASE_BUILD_ID } from '../quality/release-info';
 
 const MB = 1024 * 1024;
 const PROCESS_STARTED_AT = new Date();
 
 @Controller('health')
 export class HealthController {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly quality: DataQualityService,
+  ) {}
+
+  @Get('live')
+  live() {
+    return {
+      status: 'ok',
+      service: 'amocrm-analytics-api',
+      buildId: RELEASE_BUILD_ID,
+      metricVersion: METRIC_VERSION,
+      startedAt: PROCESS_STARTED_AT.toISOString(),
+    };
+  }
+
+  @Get('ready')
+  async ready() {
+    await this.prisma.$queryRaw`SELECT 1`;
+    const quality = await this.quality.status();
+    const response = {
+      status: quality.availability === 'BLOCKED' ? 'blocked' : 'ok',
+      buildId: RELEASE_BUILD_ID,
+      metricVersion: METRIC_VERSION,
+      checkedAt: quality.checkedAt,
+    };
+    if (response.status === 'blocked') throw new ServiceUnavailableException(response);
+    return response;
+  }
+
+  @Get('data')
+  async data() {
+    const response = await this.quality.sanitizedStatus();
+    if (response.status === 'blocked') throw new ServiceUnavailableException(response);
+    return response;
+  }
 
   @Get()
   async health() {
@@ -15,7 +52,17 @@ export class HealthController {
     const now = Date.now();
     const connection = await this.prisma.amoConnection.findFirst({
       orderBy: { createdAt: 'desc' },
-      select: { id: true, status: true, lastError: true, lastFullSyncAt: true, lastIncrementalSyncAt: true },
+      select: {
+        id: true,
+        status: true,
+        lastError: true,
+        lastFullSyncAt: true,
+        lastIncrementalSyncAt: true,
+        lastPullSyncAt: true,
+        lastReconcileAt: true,
+        lastWebhookAppliedAt: true,
+        lastCertifiedAt: true,
+      },
     });
 
     const [
@@ -116,6 +163,8 @@ export class HealthController {
     return {
       status: healthy ? 'ok' : 'degraded',
       service: 'amocrm-analytics-api',
+      buildId: RELEASE_BUILD_ID,
+      metricVersion: METRIC_VERSION,
       process: {
         startedAt: PROCESS_STARTED_AT.toISOString(),
         uptimeSeconds: Math.floor(process.uptime()),
@@ -128,6 +177,10 @@ export class HealthController {
         lastError: connection?.lastError ?? null,
         lastFullSyncAt: connection?.lastFullSyncAt ?? null,
         lastIncrementalSyncAt: connection?.lastIncrementalSyncAt ?? null,
+        lastPullSyncAt: connection?.lastPullSyncAt ?? null,
+        lastReconcileAt: connection?.lastReconcileAt ?? null,
+        lastWebhookAppliedAt: connection?.lastWebhookAppliedAt ?? null,
+        lastCertifiedAt: connection?.lastCertifiedAt ?? null,
         syncLagSeconds,
         pendingRawAmoEvents,
         readyRawAmoEvents,
@@ -148,6 +201,8 @@ export class HealthController {
           heartbeatAt: worker.heartbeatAt,
           rssMb: worker.rssMb,
           heapUsedMb: worker.heapUsedMb,
+          buildId: worker.buildId,
+          metricVersion: worker.metricVersion,
         })),
       },
       redConditions,

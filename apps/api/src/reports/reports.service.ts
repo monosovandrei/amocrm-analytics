@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { ForbiddenException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { ForbiddenException, Injectable, Logger, NotFoundException, Optional, ServiceUnavailableException } from '@nestjs/common';
 import { ExportJobStatus, Prisma, ReportSourceType, UserRole } from '../generated/prisma';
 import {
   absoluteDurationDays,
@@ -33,6 +33,8 @@ import {
   RevenueForecastEngineResult,
   RevenueForecastPrediction,
 } from './revenue-forecast-engine';
+import { DataQualityService } from '../quality/data-quality.service';
+import { METRIC_VERSION, RELEASE_BUILD_ID } from '../quality/release-info';
 
 type XlsxValue = string | number | boolean | null | undefined;
 type XlsxSheet = { name: string; rows: XlsxValue[][] };
@@ -97,6 +99,12 @@ type ReportCacheRow = {
   refresh_status: string;
   refresh_error: string | null;
   updated_at: Date;
+  data_cutoff_at: Date | null;
+  quality_status: string;
+  quality_checked_at: Date | null;
+  quality_incident_id: string | null;
+  metric_version: string;
+  build_id: string;
 };
 type RevenueForecastBucketKey =
   | 'salesShippedThisMonth'
@@ -113,7 +121,7 @@ type RevenueForecastBucketKey =
 const LOSS_REASON_CUSTOM_FIELD_NAMES = new Set(['причина отказа', 'причины отказа'].map(normalizeCustomFieldName));
 const MISSING_LOSS_REASON_LABEL = 'Не указано';
 const DEFAULT_REPORT_FRESH_COMPUTE_CONCURRENCY = 2;
-const DEFAULT_WORKER_RECYCLE_RSS_MB = 0;
+const DEFAULT_WORKER_RECYCLE_RSS_MB = 650;
 const DEFAULT_REPORT_CACHE_STALE_TOLERANCE_SECONDS = 90;
 const DEFAULT_REPORT_SNAPSHOT_STALE_ENQUEUE_LIMIT = 4;
 const DEFAULT_REPORT_SNAPSHOT_STALE_REQUEUE_COOLDOWN_SECONDS = 300;
@@ -146,6 +154,7 @@ export class ReportsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
+    @Optional() private readonly dataQuality?: DataQualityService,
   ) {}
 
   async compute(dto: ReportQueryDto, user: { id: string; role: UserRole }) {
@@ -153,6 +162,7 @@ export class ReportsService {
     const latestSyncAt = await this.latestReportSourceSyncAt();
     const cached = await this.getCachedReport(cacheKey);
     if (cached) {
+      await this.assertReportAvailable(dto, cached.sourceSyncAt);
       if (this.cacheIsStale(cached.sourceSyncAt, latestSyncAt)) {
         await this.enqueueReportCacheRefresh(cacheKey, dto, user);
       }
@@ -161,6 +171,7 @@ export class ReportsService {
 
     const report = await this.computeFresh(dto, user);
     await this.saveCachedReport(cacheKey, dto.name, report, latestSyncAt, dto, user);
+    await this.assertReportAvailable(dto, latestSyncAt);
     return report;
   }
 
@@ -175,12 +186,15 @@ export class ReportsService {
     const uniqueCacheKeys = [...new Set(reports.map((report) => report.cacheKey))];
     const rows = uniqueCacheKeys.length
       ? await this.prisma.$queryRaw<ReportCacheRow[]>`
-          SELECT cache_key, payload, source_sync_at, refresh_status, refresh_error, updated_at
+          SELECT cache_key, payload, source_sync_at, refresh_status, refresh_error, updated_at,
+                 data_cutoff_at, quality_status, quality_checked_at, quality_incident_id,
+                 metric_version, build_id
           FROM report_snapshot
           WHERE cache_key IN (${Prisma.join(uniqueCacheKeys)})
         `
       : [];
     const rowsByKey = new Map(rows.map((row) => [row.cache_key, row]));
+    const currentQuality = this.dataQuality ? await this.dataQuality.status() : null;
     const stalePayloadRefreshLimit = this.reportSnapshotStaleEnqueueLimit();
     let stalePayloadRefreshesQueued = 0;
 
@@ -199,6 +213,13 @@ export class ReportsService {
           sourceSyncAt: null,
           updatedAt: null,
           refreshError: null,
+          qualityStatus: 'CHECKING',
+          qualityCheckedAt: null,
+          qualityIncidentId: null,
+          dataCutoffAt: null,
+          metricVersion: METRIC_VERSION,
+          buildId: RELEASE_BUILD_ID,
+          downloadAllowed: false,
         });
         continue;
       }
@@ -227,17 +248,40 @@ export class ReportsService {
           : row.refresh_status === 'RUNNING' || row.refresh_status === 'QUEUED'
             ? 'PENDING'
             : 'READY';
+      const quality = this.dataQuality
+        ? await this.dataQuality.reportQuality(
+            { name: report.dto.name, filters: report.dto.filters as Record<string, unknown> },
+            row.source_sync_at,
+            currentQuality ?? undefined,
+          )
+        : {
+            status: row.quality_status,
+            checkedAt: row.quality_checked_at?.toISOString() ?? null,
+            cutoffAt: row.data_cutoff_at?.toISOString() ?? null,
+            incidentId: row.quality_incident_id,
+            metricVersion: row.metric_version,
+            buildId: row.build_id,
+            reason: null,
+          };
+      const blocked = quality.status === 'BLOCKED';
 
       items.push({
         index: report.index,
         cacheKey: report.cacheKey,
         name: report.dto.name,
-        status,
+        status: blocked ? 'ERROR' : status,
         stale,
-        payload: placeholderPayload ? null : row.payload,
+        payload: blocked || placeholderPayload ? null : row.payload,
         sourceSyncAt: row.source_sync_at,
         updatedAt: row.updated_at,
-        refreshError: row.refresh_error,
+        refreshError: blocked ? quality.reason : row.refresh_error,
+        qualityStatus: quality.status,
+        qualityCheckedAt: quality.checkedAt,
+        qualityIncidentId: quality.incidentId,
+        dataCutoffAt: row.data_cutoff_at ?? row.source_sync_at,
+        metricVersion: quality.metricVersion,
+        buildId: quality.buildId,
+        downloadAllowed: !blocked,
       });
     }
 
@@ -261,6 +305,7 @@ export class ReportsService {
         filters: dto.filters,
         config: dto.config,
         role: user.role,
+        metricVersion: METRIC_VERSION,
       }))
       .digest('hex');
   }
@@ -305,6 +350,21 @@ export class ReportsService {
   ) {
     await this.ensureReportCacheTable();
     const reportConfig = dto && user ? JSON.stringify({ dto, user: { id: user.id, role: user.role } }) : null;
+    const quality = this.dataQuality
+      ? await this.dataQuality.reportQuality(
+          { name, filters: dto?.filters as Record<string, unknown> | undefined },
+          sourceSyncAt,
+        )
+      : {
+          status: 'CERTIFIED',
+          checkedAt: new Date().toISOString(),
+          cutoffAt: sourceSyncAt?.toISOString() ?? null,
+          incidentId: null,
+          metricVersion: METRIC_VERSION,
+          buildId: RELEASE_BUILD_ID,
+        };
+    const enforce = (process.env.DATA_QUALITY_ENFORCEMENT || 'enforce').toLowerCase() === 'enforce';
+    const publishPayload = !enforce || quality.status === 'CERTIFIED';
     await this.prisma.$executeRawUnsafe(
       `
         INSERT INTO report_snapshot (
@@ -318,28 +378,63 @@ export class ReportsService {
           refreshing_at,
           refresh_error,
           last_accessed_at,
+          data_cutoff_at,
+          quality_status,
+          quality_checked_at,
+          quality_incident_id,
+          metric_version,
+          build_id,
           updated_at
         )
-        VALUES ($1, $2, $3::jsonb, $4::jsonb, $5, 'IDLE', NULL, NULL, NULL, NOW(), NOW())
+        VALUES ($1, $2, $3::jsonb, $4::jsonb, $5, 'IDLE', NULL, NULL, $6, NOW(), $7, $8::"DataQualityStatus", $9, $10, $11, $12, NOW())
         ON CONFLICT (cache_key)
         DO UPDATE SET
           name = EXCLUDED.name,
-          payload = EXCLUDED.payload,
+          payload = CASE WHEN $13 THEN EXCLUDED.payload ELSE report_snapshot.payload END,
           report_config = COALESCE(EXCLUDED.report_config, report_snapshot.report_config),
-          source_sync_at = EXCLUDED.source_sync_at,
+          source_sync_at = CASE WHEN $13 THEN EXCLUDED.source_sync_at ELSE report_snapshot.source_sync_at END,
           refresh_status = 'IDLE',
           refresh_requested_at = NULL,
           refreshing_at = NULL,
-          refresh_error = NULL,
+          refresh_error = EXCLUDED.refresh_error,
           last_accessed_at = NOW(),
+          data_cutoff_at = CASE WHEN $13 THEN EXCLUDED.data_cutoff_at ELSE report_snapshot.data_cutoff_at END,
+          quality_status = EXCLUDED.quality_status,
+          quality_checked_at = EXCLUDED.quality_checked_at,
+          quality_incident_id = EXCLUDED.quality_incident_id,
+          metric_version = EXCLUDED.metric_version,
+          build_id = EXCLUDED.build_id,
           updated_at = NOW()
       `,
       cacheKey,
       name,
-      JSON.stringify(report),
+      JSON.stringify(publishPayload ? report : { type: 'pending' }),
       reportConfig,
       sourceSyncAt,
+      publishPayload ? null : quality.status === 'BLOCKED' ? 'Данные заблокированы проверкой качества' : 'Данные проходят проверку',
+      quality.cutoffAt ? new Date(quality.cutoffAt) : sourceSyncAt,
+      quality.status,
+      quality.checkedAt ? new Date(quality.checkedAt) : new Date(),
+      quality.incidentId,
+      quality.metricVersion,
+      quality.buildId,
+      publishPayload,
     );
+  }
+
+  private async assertReportAvailable(dto: ReportQueryDto, sourceSyncAt: Date | null) {
+    if (!this.dataQuality) return;
+    const quality = await this.dataQuality.reportQuality(
+      { name: dto.name, filters: dto.filters as Record<string, unknown> },
+      sourceSyncAt,
+    );
+    if (quality.status === 'BLOCKED') {
+      throw new ServiceUnavailableException({
+        message: 'Цифры скрыты: обнаружено расхождение данных',
+        qualityStatus: quality.status,
+        incidentId: quality.incidentId,
+      });
+    }
   }
 
   private async enqueueReportCacheRefresh(cacheKey: string, dto: ReportQueryDto, user: { id: string; role: UserRole }) {
@@ -434,6 +529,7 @@ export class ReportsService {
       LIMIT ${limit}
     `;
 
+    let processed = 0;
     for (const job of jobs) {
       const locked = await this.prisma.$executeRawUnsafe(
         `
@@ -444,6 +540,7 @@ export class ReportsService {
         job.id,
       );
       if (!locked) continue;
+      processed += 1;
       await this.prisma.$executeRawUnsafe(
         `
           UPDATE report_snapshot
@@ -491,11 +588,12 @@ export class ReportsService {
         this.logger.warn(`Report cache refresh ${job.cache_key} failed: ${error.message}`);
       } finally {
         this.compactHeap();
-        await this.recycleWorkerIfNeeded('report cache refresh');
+        const restartScheduled = await this.recycleWorkerIfNeeded('report cache refresh');
+        if (restartScheduled) break;
       }
     }
 
-    return { processed: jobs.length };
+    return { processed };
   }
 
   async enqueueStaleReportCacheRefreshJobs(limit = 25) {
@@ -588,9 +686,22 @@ export class ReportsService {
   private async latestReportSourceSyncAt() {
     const connection = await this.prisma.amoConnection.findFirst({
       orderBy: { createdAt: 'desc' },
-      select: { lastIncrementalSyncAt: true, lastFullSyncAt: true },
+      select: {
+        lastPullSyncAt: true,
+        lastReconcileAt: true,
+        lastWebhookAppliedAt: true,
+        lastIncrementalSyncAt: true,
+        lastFullSyncAt: true,
+      },
     });
-    return connection?.lastIncrementalSyncAt ?? connection?.lastFullSyncAt ?? null;
+    const timestamps = [
+      connection?.lastPullSyncAt,
+      connection?.lastReconcileAt,
+      connection?.lastWebhookAppliedAt,
+      connection?.lastIncrementalSyncAt,
+      connection?.lastFullSyncAt,
+    ].filter((value): value is Date => value instanceof Date);
+    return timestamps.length ? new Date(Math.max(...timestamps.map((value) => value.getTime()))) : null;
   }
 
   private cacheIsStale(cachedSyncAt: Date | null, latestSyncAt: Date | null) {
@@ -1577,6 +1688,7 @@ export class ReportsService {
 
   async exportExcel(dto: ReportQueryDto, user: { id: string; role: UserRole }) {
     const latestSyncAt = await this.latestReportSourceSyncAt();
+    await this.assertReportAvailable(dto, latestSyncAt);
     const cacheKey = this.reportCacheKey(dto, user);
     const report = await this.computeFresh(dto, user);
     await this.saveCachedReport(cacheKey, dto.name, report, latestSyncAt, dto, user);
@@ -1621,6 +1733,7 @@ export class ReportsService {
   }
 
   async enqueueExport(dto: ReportQueryDto, user: { id: string; role: UserRole }) {
+    await this.assertReportAvailable(dto, await this.latestReportSourceSyncAt());
     const job = await this.prisma.exportJob.create({
       data: {
         status: ExportJobStatus.QUEUED,
@@ -1670,7 +1783,8 @@ export class ReportsService {
         this.logger.warn(`Export job ${job.id} failed: ${error.message}`);
       } finally {
         this.compactHeap();
-        await this.recycleWorkerIfNeeded('report export');
+        const restartScheduled = await this.recycleWorkerIfNeeded('report export');
+        if (restartScheduled) break;
       }
     }
 
@@ -1716,21 +1830,22 @@ export class ReportsService {
   }
 
   private async recycleWorkerIfNeeded(reason: string) {
-    if (!process.argv.some((arg) => arg.endsWith('worker.js'))) return;
+    if (!process.argv.some((arg) => arg.endsWith('worker.js'))) return false;
     const limit = this.resolveWorkerRecycleRssMb();
-    if (limit <= 0) return;
+    if (limit <= 0) return false;
 
     const rssMb = Math.round(process.memoryUsage().rss / MB);
-    if (rssMb < limit) return;
+    if (rssMb < limit) return false;
 
     const runningSyncJobs = await this.prisma.syncJob.count({ where: { status: 'RUNNING' } });
     if (runningSyncJobs > 0) {
       this.logger.warn(`Worker RSS ${rssMb}MB exceeded ${limit}MB after ${reason}; restart delayed, sync jobs are running`);
-      return;
+      return false;
     }
 
     this.logger.warn(`Worker RSS ${rssMb}MB exceeded ${limit}MB after ${reason}; restarting worker process`);
     setTimeout(() => process.exit(0), 100);
+    return true;
   }
 
   private resolveWorkerRecycleRssMb() {

@@ -45,10 +45,10 @@ describe('ReportsSchedulerService report cache refresh defaults', () => {
     expect(service().resolveStaleQueueBatchSize()).toBe(0);
   });
 
-  it('processes a bounded dashboard batch by default', () => {
+  it('processes one memory-bounded report at a time by default', () => {
     delete process.env.REPORT_CACHE_REFRESH_BATCH_SIZE;
 
-    expect(service().resolveRefreshBatchSize()).toBe(3);
+    expect(service().resolveRefreshBatchSize()).toBe(1);
   });
 
   it('does not enqueue stale reports while active refresh jobs are waiting', async () => {
@@ -61,7 +61,7 @@ describe('ReportsSchedulerService report cache refresh defaults', () => {
 
     await (new ReportsSchedulerService(reports as any) as any).processReportCacheRefreshJobs();
 
-    expect(reports.processReportCacheRefreshJobs).toHaveBeenCalledWith(3);
+    expect(reports.processReportCacheRefreshJobs).toHaveBeenCalledWith(1);
     expect(reports.enqueueStaleReportCacheRefreshJobs).not.toHaveBeenCalled();
   });
 

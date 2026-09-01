@@ -116,6 +116,17 @@ enum QualitySeverity {
   CRITICAL
 }
 
+enum DataQualityStatus {
+  CHECKING
+  CERTIFIED
+  BLOCKED
+}
+
+enum DataQualityIncidentStatus {
+  OPEN
+  RESOLVED
+}
+
 enum ReportScheduleFrequency {
   DAILY
   WEEKLY
@@ -161,6 +172,10 @@ model AmoConnection {
   syncIntervalMinutes Int                 @default(10)
   lastFullSyncAt      DateTime?
   lastIncrementalSyncAt DateTime?
+  lastPullSyncAt      DateTime?
+  lastReconcileAt     DateTime?
+  lastWebhookAppliedAt DateTime?
+  lastCertifiedAt     DateTime?
   lastError           String?
   config              Json                @default("{}")
   createdAt           DateTime            @default(now())
@@ -169,6 +184,8 @@ model AmoConnection {
   syncJobs      SyncJob[]
   webhookEvents WebhookEvent[]
   rawAmoEventInbox RawAmoEventInbox[]
+  dataQualityChecks DataQualityCheck[]
+  dataQualityIncidents DataQualityIncident[]
 }
 
 model AmoAccountSnapshot {
@@ -317,6 +334,7 @@ model PipelineStage {
   historyFrom DealStageHistory[] @relation("FromStage")
   historyTo   DealStageHistory[] @relation("ToStage")
   probabilities StageProbability[]
+  ropSlaRules RopStageSlaRule[]
 
   @@unique([pipelineId, externalId])
   @@index([pipelineId, position])
@@ -862,6 +880,12 @@ model ReportSnapshot {
   refreshingAt       DateTime? @map("refreshing_at")
   refreshError       String?  @map("refresh_error")
   lastAccessedAt     DateTime? @map("last_accessed_at")
+  dataCutoffAt       DateTime? @map("data_cutoff_at")
+  qualityStatus      DataQualityStatus @default(CHECKING) @map("quality_status")
+  qualityCheckedAt   DateTime? @map("quality_checked_at")
+  qualityIncidentId String?   @map("quality_incident_id")
+  metricVersion      String   @default("1") @map("metric_version")
+  buildId            String   @default("unknown") @map("build_id")
   createdAt          DateTime @default(now()) @map("created_at")
   updatedAt          DateTime @updatedAt @map("updated_at")
 
@@ -869,6 +893,7 @@ model ReportSnapshot {
 
   @@index([refreshStatus, refreshRequestedAt])
   @@index([sourceSyncAt])
+  @@index([qualityStatus, qualityCheckedAt])
   @@map("report_snapshot")
 }
 
@@ -898,12 +923,63 @@ model WorkerRuntime {
   heartbeatAt DateTime @map("heartbeat_at")
   rssMb       Int      @default(0) @map("rss_mb")
   heapUsedMb  Int      @default(0) @map("heap_used_mb")
+  buildId     String   @default("unknown") @map("build_id")
+  metricVersion String @default("1") @map("metric_version")
   createdAt   DateTime @default(now()) @map("created_at")
   updatedAt   DateTime @updatedAt @map("updated_at")
 
   @@index([heartbeatAt])
   @@index([startedAt])
   @@map("worker_runtime")
+}
+
+model DataQualityCheck {
+  id            String            @id @default(uuid())
+  connectionId  String?
+  checkType     String            @map("check_type")
+  status        DataQualityStatus @default(CHECKING)
+  cutoffAt      DateTime?         @map("cutoff_at")
+  scope         Json              @default("{}")
+  stats         Json              @default("{}")
+  message       String?
+  buildId       String            @default("unknown") @map("build_id")
+  metricVersion String            @default("1") @map("metric_version")
+  startedAt     DateTime          @default(now()) @map("started_at")
+  finishedAt    DateTime?         @map("finished_at")
+  createdAt     DateTime          @default(now()) @map("created_at")
+
+  connection AmoConnection? @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@index([connectionId, startedAt])
+  @@index([status, startedAt])
+  @@map("data_quality_check")
+}
+
+model DataQualityIncident {
+  id                String                    @id @default(uuid())
+  connectionId      String?
+  code              String
+  severity          QualitySeverity           @default(CRITICAL)
+  status            DataQualityIncidentStatus @default(OPEN)
+  scope             Json                      @default("{}")
+  message           String
+  details           Json                      @default("{}")
+  detectionCount    Int                       @default(1) @map("detection_count")
+  firstDetectedAt   DateTime                  @default(now()) @map("first_detected_at")
+  lastDetectedAt    DateTime                  @default(now()) @map("last_detected_at")
+  confirmedAt       DateTime?                 @map("confirmed_at")
+  resolvedAt        DateTime?                 @map("resolved_at")
+  lastNotifiedAt    DateTime?                 @map("last_notified_at")
+  resolvedNotifiedAt DateTime?                @map("resolved_notified_at")
+  notificationCount Int                       @default(0) @map("notification_count")
+  createdAt         DateTime                  @default(now()) @map("created_at")
+  updatedAt         DateTime                  @updatedAt @map("updated_at")
+
+  connection AmoConnection? @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@index([status, confirmedAt])
+  @@index([connectionId, code, status])
+  @@map("data_quality_incident")
 }
 
 model DashboardLayout {
@@ -939,6 +1015,23 @@ model StageProbability {
   stage PipelineStage @relation(fields: [stageId], references: [id], onDelete: Cascade)
 
   @@unique([stageId])
+}
+
+model RopStageSlaRule {
+  id            String   @id @default(uuid())
+  departmentKey String
+  stageId       String
+  slaDays       Int?
+  isEnabled     Boolean  @default(true)
+  reason        String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  stage PipelineStage @relation(fields: [stageId], references: [id], onDelete: Cascade)
+
+  @@unique([departmentKey, stageId])
+  @@index([departmentKey])
+  @@index([stageId])
 }
 
 model ExportJob {

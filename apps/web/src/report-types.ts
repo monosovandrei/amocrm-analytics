@@ -389,6 +389,243 @@ export interface PlatformOverview {
   deliveries: Array<Record<string, any>>;
 }
 
+export type RopActionPriority = 'critical' | 'warning' | 'info';
+export type RopActionType =
+  | 'offer_touch'
+  | 'pending_email'
+  | 'overdue_task'
+  | 'no_next_step'
+  | 'stuck_deal'
+  | 'crm_issue'
+  | 'risk_deal';
+export type RopActionQueueKey =
+  | 'offerTouches'
+  | 'pendingEmails'
+  | 'overdueTasks'
+  | 'noNextStep'
+  | 'stuckDeals'
+  | 'crmIssues'
+  | 'riskDeals';
+
+export interface RopDashboardFilterDepartment {
+  id: string;
+  key?: string | null;
+  name: string;
+  label?: string | null;
+  groupIds?: string[];
+  managerIds?: string[];
+  groups?: RopDashboardFilterGroup[];
+  managers?: RopDashboardFilterManager[];
+  pipelines?: RopDashboardFilterPipeline[];
+}
+
+export interface RopDashboardFilterGroup {
+  id: string;
+  name: string;
+  label?: string | null;
+  departmentId?: string | null;
+  departmentKey?: string | null;
+  departmentLabel?: string | null;
+  managerIds?: string[];
+  managerCount?: number | null;
+}
+
+export interface RopDashboardFilterManager {
+  id: string;
+  name: string;
+  groupId?: string | null;
+  groupName?: string | null;
+  departmentId?: string | null;
+  departmentKey?: string | null;
+  departmentName?: string | null;
+  departmentLabel?: string | null;
+  active?: boolean;
+  isActive?: boolean;
+}
+
+export interface RopDashboardFilterPipeline {
+  id: string;
+  name: string;
+  openDeals?: number | null;
+  stuckDeals?: number | null;
+}
+
+export interface RopDashboardFilterStage {
+  id: string;
+  name: string;
+  pipelineId: string;
+  pipelineName: string;
+  stagePosition?: number | null;
+  openDeals?: number | null;
+}
+
+export interface RopManagerRow {
+  managerId: string;
+  managerName: string;
+  groupId?: string | null;
+  groupName?: string | null;
+  departmentId?: string | null;
+  departmentKey?: string | null;
+  departmentName?: string | null;
+  active?: boolean;
+  isActive?: boolean;
+  status?: string | null;
+  statusLabel?: string | null;
+  openDeals?: number | null;
+  openAmount?: number | null;
+  tasksTodayTotal?: number | null;
+  tasksTodayDone?: number | null;
+  tasksTodayOpen?: number | null;
+  offerTouches?: number | null;
+  pendingEmails?: number | null;
+  overdueTasks?: number | null;
+  taskReschedules?: number | null;
+  noNextStep?: number | null;
+  stuckDeals?: number | null;
+  crmIssues?: number | null;
+  riskDeals?: number | null;
+  actionTotal?: number | null;
+  crmQualityPercent?: number | null;
+}
+
+export interface RopActionQueueItem {
+  id?: string | null;
+  type?: RopActionType | null;
+  priority?: RopActionPriority | null;
+  title?: string | null;
+  action?: string | null;
+  reason?: string | null;
+  managerId?: string | null;
+  managerName?: string | null;
+  groupId?: string | null;
+  groupName?: string | null;
+  departmentId?: string | null;
+  departmentKey?: string | null;
+  departmentName?: string | null;
+  dealId?: string | null;
+  dealExternalId?: string | null;
+  dealTitle?: string | null;
+  dealUrl?: string | null;
+  pipelineId?: string | null;
+  pipelineName?: string | null;
+  stageId?: string | null;
+  stageName?: string | null;
+  amount?: number | null;
+  ageHours?: number | null;
+  ageDays?: number | null;
+  slaDays?: number | null;
+  taskId?: string | null;
+  threadId?: string | null;
+  ruleCode?: string | null;
+  dueAt?: string | null;
+  detectedAt?: string | null;
+}
+
+export interface RopDepartmentDashboard {
+  id: string;
+  key?: string | null;
+  name: string;
+  label?: string | null;
+  summary?: {
+    managers?: number | null;
+    openDeals?: number | null;
+    openAmount?: number | null;
+    tasksTodayTotal?: number | null;
+    tasksTodayDone?: number | null;
+    tasksTodayOpen?: number | null;
+    overdueTasks?: number | null;
+    taskReschedules?: number | null;
+    noNextStep?: number | null;
+    offerTouches?: number | null;
+    pendingEmails?: number | null;
+    stuckDeals?: number | null;
+    crmIssues?: number | null;
+    riskDeals?: number | null;
+    crmQualityPercent?: number | null;
+  };
+  managerRows: RopManagerRow[];
+}
+
+export interface RopFunnelStageRow {
+  pipelineId: string;
+  pipelineName: string;
+  stageId?: string | null;
+  stageName?: string | null;
+  stage?: { id: string; name: string; position?: number | null };
+  stagePosition?: number | null;
+  openDeals?: number | null;
+  stuckAmount?: number | null;
+  stuckDeals?: number | null;
+  avgStageAgeDays?: number | null;
+  slaDays?: number | null;
+  slaApplies?: boolean | null;
+  reason?: string | null;
+  topDeals?: RopActionQueueItem[];
+}
+
+export interface RopDashboardResponse {
+  generatedAt: string;
+  filters: {
+    selected?: {
+      departments?: string[];
+      groupIds?: string[];
+      managerIds?: string[];
+      pipelineId?: string | null;
+      stageIds?: string[];
+      periodPreset?: 'today' | 'yesterday' | 'this_week' | 'this_month';
+    };
+    period?: {
+      preset: 'today' | 'yesterday' | 'this_week' | 'this_month';
+      label: string;
+      startAt: string;
+      endAt: string;
+    };
+    departments: RopDashboardFilterDepartment[];
+    groups: RopDashboardFilterGroup[];
+    managers: RopDashboardFilterManager[];
+    pipelines: RopDashboardFilterPipeline[];
+    stages?: RopDashboardFilterStage[];
+  };
+  departments: RopDepartmentDashboard[];
+  actionQueues: Partial<Record<RopActionQueueKey, RopActionQueueItem[]>>;
+  funnel: {
+    pipelines?: RopDashboardFilterPipeline[];
+    selectedPipelineId?: string | null;
+    stages: RopFunnelStageRow[];
+  };
+}
+
+export interface RopStageSlaRuleRow {
+  departmentKey: 'sales' | 'csm';
+  stageId: string;
+  stageName: string;
+  stagePosition: number;
+  pipelineId: string;
+  pipelineName: string;
+  openDeals: number;
+  ruleId?: string | null;
+  isEnabled: boolean;
+  slaDays?: number | null;
+  reason?: string | null;
+}
+
+export interface RopStageSlaPipeline {
+  id: string;
+  name: string;
+  stages: RopStageSlaRuleRow[];
+}
+
+export interface RopStageSlaDepartment {
+  key: 'sales' | 'csm';
+  label: string;
+  pipelines: RopStageSlaPipeline[];
+}
+
+export interface RopStageSlaSettingsResponse {
+  generatedAt: string;
+  departments: RopStageSlaDepartment[];
+}
+
 export interface AlertRule {
   id: string;
   name: string;

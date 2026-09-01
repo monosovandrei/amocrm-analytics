@@ -20,6 +20,14 @@ import { ReportsService } from '../reports/reports.service';
 import { DataContractMetric, ReportConfig, ReportFilters } from '../reports/report-types';
 import { TelegramService } from './telegram.service';
 import { CrmEventNotificationsService } from './crm-event-notifications.service';
+import {
+  isRealAmoExternalId,
+  ROP_DEFAULT_STAGE_SLA_DAYS,
+  ROP_DEPARTMENTS,
+  resolveDefaultRopStageSla,
+  ropDepartmentKeyFromInput,
+  RopDepartmentKey,
+} from './rop-stage-sla';
 
 type PlanFactTeamKey = 'sales' | 'csm';
 type PlanFactMetricUnit = 'number' | 'money' | 'percent';
@@ -106,6 +114,119 @@ type EmailThreadStateView = {
   deal: EmailThreadDraft['deal'];
 };
 
+type RopActionPriority = 'critical' | 'warning' | 'info';
+type RopActionType =
+  | 'offer_touch'
+  | 'pending_email'
+  | 'overdue_task'
+  | 'no_next_step'
+  | 'stuck_deal'
+  | 'crm_issue'
+  | 'risk_deal';
+type RopPeriodPreset = 'today' | 'yesterday' | 'this_week' | 'this_month';
+
+type RopDashboardV2Query = {
+  department?: string | string[];
+  departments?: string | string[];
+  groupId?: string | string[];
+  groupIds?: string | string[];
+  managerId?: string | string[];
+  managerIds?: string | string[];
+  pipelineId?: string | string[];
+  stageId?: string | string[];
+  stageIds?: string | string[];
+  periodPreset?: string | string[];
+};
+
+type RopSelectedFilters = {
+  departments: Set<RopDepartmentKey>;
+  groupIds: Set<string>;
+  managerIds: Set<string>;
+  pipelineId: string | null;
+  stageIds: Set<string>;
+  periodPreset: RopPeriodPreset;
+};
+
+type RopManagerAccumulator = {
+  departmentKey: RopDepartmentKey;
+  departmentLabel: string;
+  managerId: string;
+  managerName: string;
+  groupId: string;
+  groupName: string;
+  openDeals: number;
+  openAmount: number;
+  tasksTodayTotal: number;
+  tasksTodayDone: number;
+  overdueTasks: number;
+  taskReschedules: number;
+  noNextStep: number;
+  offerTouches: number;
+  pendingEmails: number;
+  stuckDeals: number;
+  crmIssues: number;
+  riskDealIds: Set<string>;
+};
+
+type RopActionQueueItem = {
+  id: string;
+  type: RopActionType;
+  priority: RopActionPriority;
+  title: string;
+  reason: string;
+  departmentKey: RopDepartmentKey;
+  departmentLabel: string;
+  managerId: string;
+  managerName: string;
+  groupId: string;
+  groupName: string;
+  dealId: string;
+  dealExternalId: string;
+  dealTitle: string;
+  dealUrl: string;
+  pipelineId: string;
+  pipelineName: string;
+  stageId: string;
+  stageName: string;
+  amount: number;
+  ageHours: number | null;
+  ageDays?: number;
+  slaDays?: number;
+  taskId?: string;
+  threadId?: string;
+  ruleCode?: string;
+  detectedAt: Date;
+};
+
+type RopManagerMeta = {
+  departmentKey: RopDepartmentKey;
+  departmentLabel: string;
+  managerId: string;
+  managerName: string;
+  managerExternalId: string;
+  groupId: string;
+  groupName: string;
+  groupExternalId: string;
+};
+
+type RopDealRef = RopManagerMeta & {
+  dealId: string;
+  dealExternalId: string;
+  dealTitle: string;
+  dealUrl: string;
+  amount: number;
+  pipelineId: string;
+  pipelineName: string;
+  stageId: string;
+  stageName: string;
+};
+
+type RopStageSlaRuleConfig = {
+  isEnabled: boolean;
+  slaDays: number | null;
+  reason: string | null;
+};
+
 const EMAIL_THREAD_CREATE_BATCH_SIZE = 100;
 const EMAIL_THREAD_SOURCE_LOOKUP_BATCH_SIZE = 100;
 const EMAIL_EVENT_SCAN_BATCH_SIZE = 100;
@@ -128,6 +249,10 @@ const BASE_EMAIL_STAGE_NAMES = new Set([
   'сделано предложение',
   'счет отправлен',
 ]);
+
+const ROP_ACTION_LIMIT = 200;
+const ROP_TOP_DEALS_LIMIT = 5;
+const ROP_IGNORED_QUALITY_RULE_CODES = new Set(['open_deal_without_task']);
 
 const PLAN_FACT_METRICS: PlanFactMetric[] = [
   { key: 'sales_qualified_leads', label: 'Квал лиды', unit: 'number', team: 'sales', kind: 'additive' },
@@ -188,6 +313,755 @@ export class PlatformService {
       openViolations,
       schedulesCount,
       deliveries,
+    };
+  }
+
+  async ropDashboard(actor: AuthUser) {
+    return this.ropDashboardV2(actor, {});
+  }
+
+  async ropDashboardV2(actor: AuthUser, query: RopDashboardV2Query = {}) {
+    this.ensureEmailThreadAccess(actor);
+
+    const now = new Date();
+    const filters = this.parseRopDashboardV2Query(query);
+    const period = this.resolveRopPeriod(filters.periodPreset, now);
+    const [domain, crmUsers] = await Promise.all([
+      this.resolveAmoDomain(),
+      this.prisma.crmUser.findMany({
+        where: { isActive: true, isVisible: true },
+        orderBy: [{ group: { name: 'asc' } }, { name: 'asc' }],
+        select: {
+          id: true,
+          externalId: true,
+          name: true,
+          groupId: true,
+          group: { select: { id: true, externalId: true, name: true } },
+        },
+      }),
+    ]);
+
+    const allManagers = crmUsers
+      .map((user): RopManagerMeta | null => {
+        const department = this.ropDepartmentFromGroupName(user.group?.name);
+        if (!department || !user.groupId || !user.group?.name) return null;
+        if (!isRealAmoExternalId(user.externalId) || !isRealAmoExternalId(user.group?.externalId)) return null;
+        return {
+          departmentKey: department.key,
+          departmentLabel: department.label,
+          managerId: user.id,
+          managerExternalId: user.externalId,
+          managerName: user.name,
+          groupId: user.groupId,
+          groupExternalId: user.group.externalId,
+          groupName: user.group.name,
+        };
+      })
+      .filter((manager): manager is RopManagerMeta => Boolean(manager));
+
+    const managerById = new Map(allManagers.map((manager) => [manager.managerId, manager]));
+    const activeManagerIds = [...managerById.keys()];
+    const selectedManagers = allManagers.filter((manager) => this.ropManagerMatchesFilters(manager, filters));
+    const selectedManagerIds = new Set(selectedManagers.map((manager) => manager.managerId));
+
+    const [allOpenDeals, taskRows, pendingEmailStates, qualityViolations, stageSlaRules, taskDeadlineEvents] = await Promise.all([
+      this.prisma.deal.findMany({
+        where: {
+          deletedAt: null,
+          responsibleId: { in: activeManagerIds },
+          pipeline: { isArchived: false },
+          stage: { isWon: false, isLost: false, isVisible: true },
+        },
+        select: {
+          id: true,
+          externalId: true,
+          title: true,
+          amount: true,
+          createdAt: true,
+          updatedAt: true,
+          responsibleId: true,
+          pipeline: { select: { id: true, name: true } },
+          stage: { select: { id: true, name: true, position: true } },
+        },
+      }),
+      this.prisma.task.findMany({
+        where: {
+          AND: [
+            {
+              OR: [
+                { dueAt: { gte: period.startAt, lt: period.endAt } },
+                { completedAt: { gte: period.startAt, lt: period.endAt } },
+                { isCompleted: false },
+              ],
+            },
+            {
+              OR: [
+                { responsibleId: { in: activeManagerIds } },
+                { deal: { responsibleId: { in: activeManagerIds } } },
+              ],
+            },
+          ],
+        },
+        select: {
+          id: true,
+          externalId: true,
+          title: true,
+          dueAt: true,
+          completedAt: true,
+          isCompleted: true,
+          deal: {
+            select: {
+              id: true,
+              externalId: true,
+              title: true,
+              amount: true,
+              responsibleId: true,
+              pipeline: { select: { id: true, name: true } },
+              stage: { select: { id: true, name: true } },
+            },
+          },
+        },
+      }),
+      this.prisma.emailThreadState.findMany({
+        where: {
+          isPending: true,
+          lastIncomingAt: { not: null },
+          lastIncomingNoteExternalId: { not: null },
+          deal: {
+            deletedAt: null,
+            responsibleId: { in: activeManagerIds },
+            stage: { isWon: false, isLost: false },
+          },
+        },
+        orderBy: { lastIncomingAt: 'asc' },
+        select: {
+          dealId: true,
+          threadId: true,
+          lastIncomingNoteExternalId: true,
+          lastIncomingAt: true,
+          subject: true,
+          summary: true,
+          attachCount: true,
+          messages: true,
+          deal: {
+            select: {
+              id: true,
+              externalId: true,
+              title: true,
+              amount: true,
+              contactId: true,
+              responsibleId: true,
+              pipeline: { select: { id: true, name: true } },
+              stage: { select: { id: true, name: true } },
+              responsible: {
+                select: {
+                  id: true,
+                  name: true,
+                  externalId: true,
+                  groupId: true,
+                  group: { select: { id: true, name: true } },
+                },
+              },
+              contact: { select: { externalId: true, name: true, email: true } },
+            },
+          },
+        },
+      }),
+      this.prisma.qualityViolation.findMany({
+        where: { resolvedAt: null },
+        select: {
+          id: true,
+          managerId: true,
+          dealId: true,
+          taskId: true,
+          severity: true,
+          message: true,
+          detectedAt: true,
+          rule: { select: { code: true, name: true } },
+        },
+      }),
+      this.prisma.ropStageSlaRule.findMany({
+        select: {
+          departmentKey: true,
+          stageId: true,
+          isEnabled: true,
+          slaDays: true,
+          reason: true,
+        },
+      }),
+      this.prisma.crmEvent.findMany({
+        where: {
+          type: 'task_deadline_changed',
+          createdAt: { gte: period.startAt, lt: period.endAt },
+        },
+        select: {
+          externalId: true,
+          raw: true,
+          createdAt: true,
+        },
+      }),
+    ]);
+    const stageSlaRuleMap = new Map(
+      stageSlaRules.map((rule) => [this.ropStageSlaKey(rule.departmentKey, rule.stageId), {
+        isEnabled: rule.isEnabled,
+        slaDays: rule.slaDays,
+        reason: rule.reason,
+      }]),
+    );
+
+    const managerScopedDeals = allOpenDeals.filter((deal) => selectedManagerIds.has(deal.responsibleId ?? ''));
+    const selectedPipelineCandidates = new Set(managerScopedDeals.map((deal) => deal.pipeline.id));
+    const scopedDeals = managerScopedDeals.filter((deal) => {
+      if (filters.pipelineId && deal.pipeline.id !== filters.pipelineId) return false;
+      if (filters.stageIds.size && !filters.stageIds.has(deal.stage.id)) return false;
+      return true;
+    });
+    const scopedDealIds = new Set(scopedDeals.map((deal) => deal.id));
+    const stageHistory = scopedDeals.length
+      ? await this.prisma.dealStageHistory.findMany({
+        where: { dealId: { in: scopedDeals.map((deal) => deal.id) } },
+        orderBy: { movedAt: 'desc' },
+        select: { dealId: true, toStageId: true, movedAt: true },
+      })
+      : [];
+    const [todayTouchNotes, todayTouchEvents] = scopedDeals.length
+      ? await Promise.all([
+        this.prisma.note.findMany({
+          where: {
+            dealId: { in: scopedDeals.map((deal) => deal.id) },
+            createdAt: { gte: period.startAt, lt: period.endAt },
+          },
+          select: { dealId: true, type: true, raw: true },
+        }),
+        this.prisma.crmEvent.findMany({
+          where: {
+            dealId: { in: scopedDeals.map((deal) => deal.id) },
+            createdAt: { gte: period.startAt, lt: period.endAt },
+            type: { in: ['outgoing_mail'] },
+          },
+          select: { dealId: true },
+        }),
+      ])
+      : [[], []];
+
+    const stageEntryByDealId = new Map<string, Date>();
+    const currentStageByDealId = new Map(scopedDeals.map((deal) => [deal.id, deal.stage.id]));
+    for (const item of stageHistory) {
+      if (stageEntryByDealId.has(item.dealId)) continue;
+      if (currentStageByDealId.get(item.dealId) === item.toStageId) {
+        stageEntryByDealId.set(item.dealId, item.movedAt);
+      }
+    }
+
+    const managerRows = new Map<string, RopManagerAccumulator>();
+    for (const manager of selectedManagers) {
+      managerRows.set(manager.managerId, {
+        ...manager,
+        openDeals: 0,
+        openAmount: 0,
+        tasksTodayTotal: 0,
+        tasksTodayDone: 0,
+        overdueTasks: 0,
+        taskReschedules: 0,
+        noNextStep: 0,
+        offerTouches: 0,
+        pendingEmails: 0,
+        stuckDeals: 0,
+        crmIssues: 0,
+        riskDealIds: new Set<string>(),
+      });
+    }
+
+    const queue: Record<Exclude<RopActionType, 'risk_deal'>, RopActionQueueItem[]> = {
+      offer_touch: [],
+      pending_email: [],
+      overdue_task: [],
+      no_next_step: [],
+      stuck_deal: [],
+      crm_issue: [],
+    };
+    const riskByDealId = new Map<string, { ref: RopDealRef; priority: RopActionPriority; reasons: string[]; detectedAt: Date }>();
+    const dealRefsById = new Map<string, RopDealRef>();
+    const stageMetaByDealId = new Map<string, {
+      enteredAt: Date;
+      ageDays: number;
+      slaDays: number | null;
+      slaApplies: boolean;
+      reason: string;
+      isStuck: boolean;
+    }>();
+    const pipelineStats = new Map<string, { id: string; name: string; openDeals: number; stuckDeals: number; stuckAmount: number }>();
+
+    const addRisk = (ref: RopDealRef, priority: RopActionPriority, reason: string, detectedAt: Date) => {
+      const row = managerRows.get(ref.managerId);
+      row?.riskDealIds.add(ref.dealId);
+      const existing = riskByDealId.get(ref.dealId);
+      if (!existing) {
+        riskByDealId.set(ref.dealId, { ref, priority, reasons: [reason], detectedAt });
+        return;
+      }
+      if (!existing.reasons.includes(reason)) existing.reasons.push(reason);
+      if (this.actionPriorityRank(priority) < this.actionPriorityRank(existing.priority)) existing.priority = priority;
+      if (detectedAt < existing.detectedAt) existing.detectedAt = detectedAt;
+    };
+
+    for (const deal of scopedDeals) {
+      const manager = managerById.get(deal.responsibleId ?? '');
+      const row = deal.responsibleId ? managerRows.get(deal.responsibleId) : null;
+      if (!manager || !row) continue;
+
+      const amount = this.numberValue(deal.amount);
+      const ref: RopDealRef = {
+        ...manager,
+        dealId: deal.id,
+        dealExternalId: deal.externalId,
+        dealTitle: deal.title,
+        dealUrl: this.dealUrl(domain, deal.externalId),
+        amount,
+        pipelineId: deal.pipeline.id,
+        pipelineName: deal.pipeline.name,
+        stageId: deal.stage.id,
+        stageName: deal.stage.name,
+      };
+      dealRefsById.set(deal.id, ref);
+
+      row.openDeals += 1;
+      row.openAmount += amount;
+
+      const enteredAt = stageEntryByDealId.get(deal.id) ?? deal.updatedAt ?? deal.createdAt;
+      const ageDays = this.ageDays(enteredAt, now);
+      const sla = this.resolveRopStageSla(manager.departmentKey, deal.stage.id, deal.pipeline.name, deal.stage.name, stageSlaRuleMap);
+      const isStuck = sla.days !== null && ageDays >= sla.days;
+      stageMetaByDealId.set(deal.id, {
+        enteredAt,
+        ageDays,
+        slaDays: sla.days,
+        slaApplies: sla.days !== null,
+        reason: sla.reason,
+        isStuck,
+      });
+
+      const pipeline = pipelineStats.get(deal.pipeline.id) ?? {
+        id: deal.pipeline.id,
+        name: deal.pipeline.name,
+        openDeals: 0,
+        stuckDeals: 0,
+        stuckAmount: 0,
+      };
+      pipeline.openDeals += 1;
+      if (isStuck) {
+        pipeline.stuckDeals += 1;
+        pipeline.stuckAmount += amount;
+      }
+      pipelineStats.set(deal.pipeline.id, pipeline);
+
+      if (!isStuck) continue;
+      row.stuckDeals += 1;
+      const slaDays = sla.days ?? ROP_DEFAULT_STAGE_SLA_DAYS;
+      const priority: RopActionPriority = ageDays >= slaDays * 2 ? 'critical' : 'warning';
+      const action: RopActionQueueItem = {
+        ...ref,
+        id: `stuck-deal:${deal.id}`,
+        type: 'stuck_deal',
+        priority,
+        title: 'Зависшая сделка',
+        reason: `${sla.reason} На этапе ${this.roundMetric(ageDays)} дн.`,
+        ageHours: this.ageHours(enteredAt, now),
+        ageDays: this.roundMetric(ageDays),
+        slaDays,
+        detectedAt: enteredAt,
+      };
+      queue.stuck_deal.push(action);
+      addRisk(ref, priority, action.reason, enteredAt);
+    }
+
+    const openTaskByDealId = new Map<string, (typeof taskRows)[number]>();
+    const openTaskDueInPeriodByDealId = new Map<string, (typeof taskRows)[number]>();
+    const taskDealIdByExternalId = new Map<string, string>();
+    const touchedDealIdsInPeriod = new Set<string>();
+    for (const note of todayTouchNotes) {
+      if (note.dealId && this.isRopTouchNote(note)) touchedDealIdsInPeriod.add(note.dealId);
+    }
+    for (const event of todayTouchEvents) {
+      if (event.dealId) touchedDealIdsInPeriod.add(event.dealId);
+    }
+    for (const task of taskRows) {
+      if (!task.deal?.id || !scopedDealIds.has(task.deal.id)) continue;
+      if (task.externalId) taskDealIdByExternalId.set(task.externalId, task.deal.id);
+      const ref = dealRefsById.get(task.deal.id);
+      const row = ref ? managerRows.get(ref.managerId) : null;
+      if (!ref || !row) continue;
+
+      const dueAt = task.dueAt;
+      const completedAt = task.completedAt;
+      const dueInPeriod = Boolean(dueAt && dueAt >= period.startAt && dueAt < period.endAt);
+      const completedInPeriod = Boolean(completedAt && completedAt >= period.startAt && completedAt < period.endAt);
+      const overdue = Boolean(!task.isCompleted && dueAt && dueAt < now && dueAt < period.endAt);
+      if (!task.isCompleted) {
+        openTaskByDealId.set(task.deal.id, task);
+        if (dueInPeriod && !openTaskDueInPeriodByDealId.has(task.deal.id)) {
+          openTaskDueInPeriodByDealId.set(task.deal.id, task);
+        }
+      }
+
+      if (dueInPeriod) {
+        row.tasksTodayTotal += 1;
+        if (task.isCompleted) row.tasksTodayDone += 1;
+      }
+      if (completedInPeriod) touchedDealIdsInPeriod.add(task.deal.id);
+      if (!overdue || !dueAt) continue;
+
+      row.overdueTasks += 1;
+      const priority: RopActionPriority = dueAt < period.startAt ? 'critical' : 'warning';
+      const action: RopActionQueueItem = {
+        ...ref,
+        id: `overdue-task:${task.id}`,
+        type: 'overdue_task',
+        priority,
+        title: 'Просроченная задача',
+        reason: task.title,
+        taskId: task.id,
+        ageHours: this.ageHours(dueAt, now),
+        detectedAt: dueAt,
+      };
+      queue.overdue_task.push(action);
+      addRisk(ref, priority, 'Просроченная задача', dueAt);
+    }
+
+    const managerByExternalId = new Map(selectedManagers.map((manager) => [manager.managerExternalId, manager]));
+    const hasDealScopeFilter = Boolean(filters.pipelineId) || filters.stageIds.size > 0;
+    for (const event of taskDeadlineEvents) {
+      const manager = managerByExternalId.get(this.ropEventActorExternalId(event));
+      if (!manager) continue;
+      if (hasDealScopeFilter) {
+        const taskExternalId = this.ropEventEntityId(event);
+        const dealId = taskExternalId ? taskDealIdByExternalId.get(taskExternalId) : null;
+        if (!dealId || !scopedDealIds.has(dealId)) continue;
+      }
+      const row = managerRows.get(manager.managerId);
+      if (row) row.taskReschedules += 1;
+    }
+
+    for (const deal of scopedDeals) {
+      const ref = dealRefsById.get(deal.id);
+      const row = ref ? managerRows.get(ref.managerId) : null;
+      const touchTask = openTaskDueInPeriodByDealId.get(deal.id);
+      if (!ref || !row || !touchTask || touchedDealIdsInPeriod.has(deal.id)) continue;
+      if (!this.isRopOfferSentStage(deal.stage.name)) continue;
+
+      row.offerTouches += 1;
+      const action: RopActionQueueItem = {
+        ...ref,
+        id: `offer-touch:${deal.id}:${touchTask.id}`,
+        type: 'offer_touch',
+        priority: 'warning',
+        title: 'Нужно касание по отправленному офферу',
+        reason: 'Оффер отправлен, задача на касание стоит на сегодня, завершенного касания сегодня нет.',
+        taskId: touchTask.id,
+        ageHours: touchTask.dueAt ? this.ageHours(touchTask.dueAt, now) : null,
+        detectedAt: touchTask.dueAt ?? now,
+      };
+      queue.offer_touch.push(action);
+      addRisk(ref, 'warning', 'Нужно касание после оффера в выбранном периоде', action.detectedAt);
+    }
+
+    for (const deal of scopedDeals) {
+      if (openTaskByDealId.has(deal.id)) continue;
+      const ref = dealRefsById.get(deal.id);
+      const row = ref ? managerRows.get(ref.managerId) : null;
+      if (!ref || !row) continue;
+
+      row.noNextStep += 1;
+      const action: RopActionQueueItem = {
+        ...ref,
+        id: `no-next-step:${deal.id}`,
+        type: 'no_next_step',
+        priority: 'critical',
+        title: 'Нет следующего шага',
+        reason: 'В открытой сделке нет незавершенной задачи. РОПу нужно добиться конкретного следующего действия.',
+        ageHours: null,
+        detectedAt: now,
+      };
+      queue.no_next_step.push(action);
+      addRisk(ref, 'critical', 'В сделке нет следующего шага', now);
+    }
+
+    const pendingEmailThreads = await this.visiblePendingEmailThreadsFromStates(pendingEmailStates, now, domain);
+    for (const { state, thread } of pendingEmailThreads) {
+      if (!scopedDealIds.has(state.dealId)) continue;
+      const ref = dealRefsById.get(state.dealId);
+      const row = ref ? managerRows.get(ref.managerId) : null;
+      if (!ref || !row) continue;
+
+      row.pendingEmails += 1;
+      const priority: RopActionPriority = thread.waitingSeconds >= 24 * 60 * 60 ? 'critical' : 'warning';
+      const detectedAt = state.lastIncomingAt ?? now;
+      const action: RopActionQueueItem = {
+        ...ref,
+        id: `pending-email:${thread.id}`,
+        type: 'pending_email',
+        priority,
+        title: 'Письмо без ответа',
+        reason: thread.subject || thread.summary || 'Есть входящее письмо без исходящего ответа.',
+        threadId: state.threadId,
+        ageHours: this.roundMetric(thread.waitingSeconds / 3600),
+        detectedAt,
+      };
+      queue.pending_email.push(action);
+      addRisk(ref, priority, 'Письмо клиента без ответа', detectedAt);
+    }
+
+    for (const violation of qualityViolations) {
+      if (ROP_IGNORED_QUALITY_RULE_CODES.has(violation.rule.code)) continue;
+      if (!violation.dealId || !scopedDealIds.has(violation.dealId)) continue;
+      const ref = dealRefsById.get(violation.dealId);
+      const row = ref ? managerRows.get(ref.managerId) : null;
+      if (!ref || !row) continue;
+
+      row.crmIssues += 1;
+      const priority = this.qualitySeverityPriority(violation.severity);
+      const action: RopActionQueueItem = {
+        ...ref,
+        id: `crm-issue:${violation.id}`,
+        type: 'crm_issue',
+        priority,
+        title: violation.rule.name,
+        reason: violation.message,
+        taskId: violation.taskId ?? undefined,
+        ruleCode: violation.rule.code,
+        ageHours: this.ageHours(violation.detectedAt, now),
+        detectedAt: violation.detectedAt,
+      };
+      queue.crm_issue.push(action);
+      addRisk(ref, priority, `CRM-дисциплина: ${violation.rule.name}`, violation.detectedAt);
+    }
+
+    const selectedPipelineId = filters.pipelineId && selectedPipelineCandidates.has(filters.pipelineId)
+      ? filters.pipelineId
+      : ([...pipelineStats.values()].sort((a, b) => a.name.localeCompare(b.name, 'ru'))[0]?.id ?? null);
+
+    const stageBuckets = new Map<string, {
+      pipelineId: string;
+      pipelineName: string;
+      stageId: string;
+      stageName: string;
+      stagePosition: number;
+      openDeals: number;
+      stuckDeals: number;
+      stuckAmount: number;
+      ageDays: number[];
+      slaDays: number | null;
+      slaApplies: boolean;
+      reason: string;
+      topDeals: Array<RopDealRef & { ageDays: number; slaDays: number; reason: string }>;
+    }>();
+
+    for (const deal of scopedDeals) {
+      const ref = dealRefsById.get(deal.id);
+      const stageMeta = stageMetaByDealId.get(deal.id);
+      if (!ref || !stageMeta) continue;
+
+      const key = `${deal.pipeline.id}:${deal.stage.id}`;
+      const bucket = stageBuckets.get(key) ?? {
+        pipelineId: deal.pipeline.id,
+        pipelineName: deal.pipeline.name,
+        stageId: deal.stage.id,
+        stageName: deal.stage.name,
+        stagePosition: deal.stage.position,
+        openDeals: 0,
+        stuckDeals: 0,
+        stuckAmount: 0,
+        ageDays: [],
+        slaDays: stageMeta.slaDays,
+        slaApplies: stageMeta.slaApplies,
+        reason: stageMeta.reason,
+        topDeals: [],
+      };
+      bucket.openDeals += 1;
+      bucket.ageDays.push(stageMeta.ageDays);
+      if (stageMeta.isStuck) {
+        bucket.stuckDeals += 1;
+        bucket.stuckAmount += ref.amount;
+        bucket.topDeals.push({
+          ...ref,
+          ageDays: this.roundMetric(stageMeta.ageDays),
+          slaDays: stageMeta.slaDays ?? ROP_DEFAULT_STAGE_SLA_DAYS,
+          reason: stageMeta.reason,
+        });
+      }
+      stageBuckets.set(key, bucket);
+    }
+
+    const riskDeals = [...riskByDealId.values()].map(({ ref, priority, reasons, detectedAt }): RopActionQueueItem => ({
+      ...ref,
+      id: `risk-deal:${ref.dealId}`,
+      type: 'risk_deal',
+      priority,
+      title: 'Сделка с риском',
+      reason: reasons.join('; '),
+      ageHours: this.ageHours(detectedAt, now),
+      detectedAt,
+    }));
+
+    const managerOutput = [...managerRows.values()]
+      .map((row) => ({
+        departmentKey: row.departmentKey,
+        departmentLabel: row.departmentLabel,
+        departmentId: row.departmentKey,
+        departmentName: row.departmentLabel,
+        managerId: row.managerId,
+        managerName: row.managerName,
+        groupId: row.groupId,
+        groupName: row.groupName,
+        openDeals: row.openDeals,
+        openAmount: this.roundMetric(row.openAmount),
+        tasksTodayTotal: row.tasksTodayTotal,
+        tasksTodayDone: row.tasksTodayDone,
+        tasksTodayOpen: Math.max(0, row.tasksTodayTotal - row.tasksTodayDone),
+        overdueTasks: row.overdueTasks,
+        taskReschedules: row.taskReschedules,
+        noNextStep: row.noNextStep,
+        offerTouches: row.offerTouches,
+        pendingEmails: row.pendingEmails,
+        stuckDeals: row.stuckDeals,
+        crmIssues: row.crmIssues,
+        riskDeals: row.riskDealIds.size,
+        crmQualityPercent: this.ropCrmQualityPercent(row.openDeals, row.riskDealIds.size),
+      }))
+      .sort((a, b) => this.ropManagerAttention(b) - this.ropManagerAttention(a) || a.managerName.localeCompare(b.managerName, 'ru'));
+
+    const hasDepartmentFilter = filters.departments.size > 0;
+    const hasManagerScopeFilter = filters.groupIds.size > 0 || filters.managerIds.size > 0 || Boolean(filters.pipelineId) || filters.stageIds.size > 0;
+    const departments = ROP_DEPARTMENTS
+      .filter((department) => !hasDepartmentFilter || filters.departments.has(department.key))
+      .map((department) => {
+        const rows = managerOutput
+          .filter((row) => row.departmentKey === department.key)
+          .filter((row) => !hasDealScopeFilter || row.openDeals > 0 || row.tasksTodayTotal > 0 || this.ropManagerAttention(row) > 0);
+        const managers = selectedManagers
+          .filter((manager) => manager.departmentKey === department.key)
+          .sort((a, b) => a.managerName.localeCompare(b.managerName, 'ru'));
+        return {
+          id: department.key,
+          key: department.key,
+          name: department.label,
+          label: department.label,
+          groups: this.ropGroupOptions(managers),
+          managers: managers.map((manager) => ({
+            id: manager.managerId,
+            name: manager.managerName,
+            groupId: manager.groupId,
+            groupName: manager.groupName,
+          })),
+          summary: this.ropDepartmentSummary(rows),
+          managerRows: rows,
+        };
+      })
+      .filter((department) => !hasManagerScopeFilter || department.managerRows.length > 0);
+
+    const filterDepartments = this.ropFilterDepartments(allManagers, allOpenDeals);
+    const filterGroups = filterDepartments.flatMap((department) =>
+      department.groups.map((group) => ({
+        ...group,
+        departmentKey: department.key,
+        departmentLabel: department.label,
+      })),
+    );
+    const filterManagers = filterDepartments.flatMap((department) =>
+      department.managers.map((manager) => ({
+        ...manager,
+        departmentKey: department.key,
+        departmentLabel: department.label,
+      })),
+    );
+    const filterPipelines = [...new Map(
+      filterDepartments
+        .flatMap((department) => department.pipelines)
+        .map((pipeline) => [pipeline.id, pipeline]),
+    ).values()].sort((a, b) => a.name.localeCompare(b.name, 'ru'));
+    const filterStages = this.ropFilterStages(allManagers, allOpenDeals);
+
+    return {
+      generatedAt: now.toISOString(),
+      filters: {
+        selected: {
+          departments: [...filters.departments],
+          groupIds: [...filters.groupIds],
+          managerIds: [...filters.managerIds],
+          pipelineId: filters.pipelineId,
+          stageIds: [...filters.stageIds],
+          periodPreset: filters.periodPreset,
+        },
+        period: {
+          preset: filters.periodPreset,
+          label: period.label,
+          startAt: period.startAt.toISOString(),
+          endAt: period.endAt.toISOString(),
+        },
+        departments: filterDepartments,
+        groups: filterGroups,
+        managers: filterManagers,
+        pipelines: filterPipelines,
+        stages: filterStages,
+      },
+      departments,
+      actionQueues: {
+        offerTouches: this.sortRopActions(queue.offer_touch),
+        pendingEmails: this.sortRopActions(queue.pending_email),
+        overdueTasks: this.sortRopActions(queue.overdue_task),
+        noNextStep: this.sortRopActions(queue.no_next_step),
+        stuckDeals: this.sortRopActions(queue.stuck_deal),
+        crmIssues: this.sortRopActions(queue.crm_issue),
+        riskDeals: this.sortRopActions(riskDeals),
+      },
+      funnel: {
+        pipelines: [...pipelineStats.values()]
+          .map((pipeline) => ({
+            id: pipeline.id,
+            name: pipeline.name,
+            openDeals: pipeline.openDeals,
+            stuckDeals: pipeline.stuckDeals,
+            stuckAmount: this.roundMetric(pipeline.stuckAmount),
+          }))
+          .sort((a, b) => a.name.localeCompare(b.name, 'ru')),
+        selectedPipelineId,
+        stages: [...stageBuckets.values()]
+          .map((bucket) => ({
+            pipelineId: bucket.pipelineId,
+            pipelineName: bucket.pipelineName,
+            stage: {
+              id: bucket.stageId,
+              name: bucket.stageName,
+              position: bucket.stagePosition,
+            },
+            stageId: bucket.stageId,
+            stageName: bucket.stageName,
+            stagePosition: bucket.stagePosition,
+            openDeals: bucket.openDeals,
+            stuckDeals: bucket.stuckDeals,
+            stuckAmount: this.roundMetric(bucket.stuckAmount),
+            avgStageAgeDays: this.roundMetric(bucket.ageDays.reduce((sum, value) => sum + value, 0) / Math.max(1, bucket.ageDays.length)),
+            slaDays: bucket.slaDays,
+            slaApplies: bucket.slaApplies,
+            reason: bucket.reason,
+            topDeals: bucket.topDeals
+              .sort((a, b) => b.ageDays - a.ageDays || b.amount - a.amount)
+              .slice(0, ROP_TOP_DEALS_LIMIT)
+              .map((deal) => ({
+                dealId: deal.dealId,
+                dealExternalId: deal.dealExternalId,
+                dealTitle: deal.dealTitle,
+                dealUrl: deal.dealUrl,
+                managerId: deal.managerId,
+                managerName: deal.managerName,
+                amount: deal.amount,
+                ageDays: deal.ageDays,
+                slaDays: deal.slaDays,
+                reason: deal.reason,
+              })),
+          }))
+          .sort((a, b) => a.pipelineName.localeCompare(b.pipelineName, 'ru') || a.stage.position - b.stage.position),
+      },
     };
   }
 
@@ -1198,7 +2072,18 @@ export class PlatformService {
   ) {
     const metrics = PLAN_FACT_METRICS.filter((metric) => metric.team === team);
     const managers = await this.prisma.crmUser.findMany({
-      where: { isActive: true, isVisible: true, groupId: refs.group.id },
+      where: {
+        isActive: true,
+        isVisible: true,
+        ...(team === 'sales'
+          ? {
+              OR: [
+                { groupId: refs.group.id },
+                { deals: { some: { pipelineId: { in: refs.pipelineIds }, deletedAt: null } } },
+              ],
+            }
+          : { groupId: refs.group.id }),
+      },
       orderBy: { name: 'asc' },
       select: { id: true, name: true },
     });
@@ -1355,7 +2240,7 @@ export class PlatformService {
     const filters: ReportFilters = {
       dateFrom: dateFrom.toISOString(),
       dateTo: dateTo.toISOString(),
-      groupIds: [refs.group.id],
+      groupIds: team === 'sales' ? undefined : [refs.group.id],
       pipelineIds: refs.pipelineIds,
     };
     const config: ReportConfig = {
@@ -1822,8 +2707,8 @@ export class PlatformService {
     const defaults = [
       {
         code: 'open_deal_without_task',
-        name: 'Открытая сделка без следующей задачи',
-        description: 'У менеджера нет запланированного следующего действия по открытой сделке.',
+        name: 'Открытая сделка без запланированного действия',
+        description: 'У менеджера нет запланированного действия по открытой сделке.',
         severity: 'CRITICAL' as QualitySeverity,
         config: { type: 'deal_without_active_task' },
       },
@@ -3029,6 +3914,346 @@ export class PlatformService {
     const parsed = Number.parseInt(String(value ?? ''), 10);
     if (!Number.isFinite(parsed)) return fallback;
     return Math.min(Math.max(parsed, min), max);
+  }
+
+  private parseRopDashboardV2Query(query: RopDashboardV2Query): RopSelectedFilters {
+    const departmentValues = this.queryValues(query.department, query.departments)
+      .map((value) => ropDepartmentKeyFromInput(value))
+      .filter((value): value is RopDepartmentKey => Boolean(value));
+    const pipelineId = this.queryValues(query.pipelineId)[0] ?? null;
+    const periodPreset = this.parseRopPeriodPreset(this.queryValues(query.periodPreset)[0]);
+
+    return {
+      departments: new Set(departmentValues),
+      groupIds: new Set(this.queryValues(query.groupId, query.groupIds)),
+      managerIds: new Set(this.queryValues(query.managerId, query.managerIds)),
+      pipelineId,
+      stageIds: new Set(this.queryValues(query.stageId, query.stageIds)),
+      periodPreset,
+    };
+  }
+
+  private parseRopPeriodPreset(value?: string | null): RopPeriodPreset {
+    if (value === 'yesterday' || value === 'this_week' || value === 'this_month') return value;
+    return 'today';
+  }
+
+  private resolveRopPeriod(preset: RopPeriodPreset, now: Date) {
+    const parts = moscowParts(now);
+    if (preset === 'yesterday') {
+      const startAt = moscowDate(parts.year, parts.month, parts.day - 1, 0);
+      return {
+        preset,
+        label: 'Вчера',
+        startAt,
+        endAt: moscowDate(parts.year, parts.month, parts.day, 0),
+      };
+    }
+    if (preset === 'this_week') {
+      const mondayOffset = parts.dayOfWeek === 0 ? -6 : 1 - parts.dayOfWeek;
+      const startAt = moscowDate(parts.year, parts.month, parts.day + mondayOffset, 0);
+      return {
+        preset,
+        label: 'Эта неделя',
+        startAt,
+        endAt: now,
+      };
+    }
+    if (preset === 'this_month') {
+      return {
+        preset,
+        label: 'Этот месяц',
+        startAt: moscowDate(parts.year, parts.month, 1, 0),
+        endAt: now,
+      };
+    }
+    return {
+      preset,
+      label: 'Сегодня',
+      startAt: moscowDate(parts.year, parts.month, parts.day, 0),
+      endAt: moscowDate(parts.year, parts.month, parts.day + 1, 0),
+    };
+  }
+
+  private queryValues(...values: unknown[]) {
+    return values
+      .flatMap((value) => Array.isArray(value) ? value : [value])
+      .flatMap((value) => String(value ?? '').split(','))
+      .map((value) => value.trim())
+      .filter(Boolean);
+  }
+
+  private ropDepartmentFromGroupName(name?: string | null) {
+    const key = ropDepartmentKeyFromInput(name);
+    return key ? ROP_DEPARTMENTS.find((department) => department.key === key) ?? null : null;
+  }
+
+  private ropManagerMatchesFilters(manager: RopManagerMeta, filters: RopSelectedFilters) {
+    if (filters.departments.size && !filters.departments.has(manager.departmentKey)) return false;
+    if (filters.groupIds.size && !filters.groupIds.has(manager.groupId)) return false;
+    if (filters.managerIds.size && !filters.managerIds.has(manager.managerId)) return false;
+    return true;
+  }
+
+  private async visiblePendingEmailThreadsFromStates<T extends EmailThreadStateView>(
+    states: T[],
+    now: Date,
+    domain: string,
+  ) {
+    const dealIds = [...new Set(states.map((state) => state.dealId))];
+    const dismissals = dealIds.length
+      ? await this.prisma.emailThreadDismissal.findMany({
+        where: { dealId: { in: dealIds } },
+        select: { dealId: true, threadId: true, lastIncomingNoteExternalId: true },
+      })
+      : [];
+    const dismissedKeys = new Set(
+      dismissals.map((item) => this.emailDismissalKey(item.dealId, item.threadId, item.lastIncomingNoteExternalId)),
+    );
+
+    const latestStatesByDealId = new Map<string, T>();
+    for (const state of states) {
+      const current = latestStatesByDealId.get(state.dealId);
+      if (!current || (state.lastIncomingAt?.getTime() ?? 0) > (current.lastIncomingAt?.getTime() ?? 0)) {
+        latestStatesByDealId.set(state.dealId, state);
+      }
+    }
+
+    const visible = [];
+    for (const state of latestStatesByDealId.values()) {
+      const thread = this.serializePendingEmailThreadState(state, now, domain, dismissedKeys);
+      if (thread) visible.push({ state, thread });
+    }
+    return visible;
+  }
+
+  private resolveRopStageSla(
+    departmentKey: RopDepartmentKey,
+    stageId: string,
+    pipelineName: string | null | undefined,
+    stageName: string | null | undefined,
+    configuredRules: Map<string, RopStageSlaRuleConfig>,
+  ) {
+    const configured = configuredRules.get(this.ropStageSlaKey(departmentKey, stageId));
+    if (configured) {
+      if (!configured.isEnabled) {
+        return {
+          days: null,
+          reason: configured.reason || 'SLA отключён в настройках этапов.',
+        };
+      }
+      const fallback = resolveDefaultRopStageSla(departmentKey, pipelineName, stageName);
+      return {
+        days: configured.slaDays ?? fallback.days,
+        reason: configured.reason || fallback.reason,
+      };
+    }
+    return resolveDefaultRopStageSla(departmentKey, pipelineName, stageName);
+  }
+
+  private ropStageSlaKey(departmentKey: string, stageId: string) {
+    return `${departmentKey}:${stageId}`;
+  }
+
+  private isRopTouchNote(note: { type: string; raw?: unknown }) {
+    if (note.type === 'call_out' || note.type === 'common') return true;
+    if (note.type !== 'amomail_message') return false;
+    const params = (note.raw as { params?: Record<string, any> } | null)?.params ?? {};
+    return params.income === false;
+  }
+
+  private isRopOfferSentStage(stageName?: string | null) {
+    const normalized = this.normalizeName(String(stageName ?? ''));
+    return normalized.includes('кп') ||
+      normalized.includes('предлож') ||
+      normalized.includes('offer') ||
+      normalized.includes('proposal') ||
+      normalized.includes('коммерчес');
+  }
+
+  private qualitySeverityPriority(severity: QualitySeverity): RopActionPriority {
+    if (severity === 'CRITICAL') return 'critical';
+    if (severity === 'WARNING') return 'warning';
+    return 'info';
+  }
+
+  private sortRopActions(items: RopActionQueueItem[]) {
+    return items
+      .sort((a, b) => this.actionPriorityRank(a.priority) - this.actionPriorityRank(b.priority) || (b.ageHours ?? 0) - (a.ageHours ?? 0))
+      .slice(0, ROP_ACTION_LIMIT);
+  }
+
+  private ropManagerAttention(row: {
+    offerTouches: number;
+    pendingEmails: number;
+    overdueTasks: number;
+    taskReschedules: number;
+    noNextStep: number;
+    stuckDeals: number;
+    crmIssues: number;
+    riskDeals: number;
+  }) {
+    return row.offerTouches + row.pendingEmails + row.overdueTasks + row.taskReschedules + row.noNextStep + row.stuckDeals + row.crmIssues + row.riskDeals;
+  }
+
+  private ropGroupOptions(managers: RopManagerMeta[]) {
+    const groups = new Map<string, { id: string; name: string; managerCount: number }>();
+    for (const manager of managers) {
+      const group = groups.get(manager.groupId) ?? { id: manager.groupId, name: manager.groupName, managerCount: 0 };
+      group.managerCount += 1;
+      groups.set(manager.groupId, group);
+    }
+    return [...groups.values()].sort((a, b) => a.name.localeCompare(b.name, 'ru'));
+  }
+
+  private ropDepartmentSummary(rows: Array<{
+    openDeals: number;
+    openAmount: number;
+    tasksTodayTotal: number;
+    tasksTodayDone: number;
+    tasksTodayOpen: number;
+    overdueTasks: number;
+    taskReschedules: number;
+    noNextStep: number;
+    offerTouches: number;
+    pendingEmails: number;
+    stuckDeals: number;
+    crmIssues: number;
+    riskDeals: number;
+    crmQualityPercent: number;
+  }>) {
+    return {
+      managers: rows.length,
+      openDeals: rows.reduce((sum, row) => sum + row.openDeals, 0),
+      openAmount: this.roundMetric(rows.reduce((sum, row) => sum + row.openAmount, 0)),
+      tasksTodayTotal: rows.reduce((sum, row) => sum + row.tasksTodayTotal, 0),
+      tasksTodayDone: rows.reduce((sum, row) => sum + row.tasksTodayDone, 0),
+      tasksTodayOpen: rows.reduce((sum, row) => sum + row.tasksTodayOpen, 0),
+      overdueTasks: rows.reduce((sum, row) => sum + row.overdueTasks, 0),
+      taskReschedules: rows.reduce((sum, row) => sum + row.taskReschedules, 0),
+      noNextStep: rows.reduce((sum, row) => sum + row.noNextStep, 0),
+      offerTouches: rows.reduce((sum, row) => sum + row.offerTouches, 0),
+      pendingEmails: rows.reduce((sum, row) => sum + row.pendingEmails, 0),
+      stuckDeals: rows.reduce((sum, row) => sum + row.stuckDeals, 0),
+      crmIssues: rows.reduce((sum, row) => sum + row.crmIssues, 0),
+      riskDeals: rows.reduce((sum, row) => sum + row.riskDeals, 0),
+      crmQualityPercent: this.roundMetric(rows.reduce((sum, row) => sum + row.crmQualityPercent, 0) / Math.max(1, rows.length)),
+    };
+  }
+
+  private ropCrmQualityPercent(openDeals: number, riskDeals: number) {
+    if (openDeals <= 0) return 100;
+    return this.roundMetric(Math.max(0, Math.min(100, ((openDeals - riskDeals) / openDeals) * 100)));
+  }
+
+  private ropEventEntityId(event: { raw?: unknown }) {
+    const raw = event.raw as Record<string, any> | null;
+    const value = raw?.entity_id ?? raw?._embedded?.entity?.id;
+    return value == null ? null : String(value);
+  }
+
+  private ropEventActorExternalId(event: { raw?: unknown }) {
+    const raw = event.raw as Record<string, any> | null;
+    const rawCreatedBy = raw?.created_by;
+    if (rawCreatedBy && typeof rawCreatedBy === 'object' && rawCreatedBy.id != null) {
+      return String(rawCreatedBy.id);
+    }
+    const value = (rawCreatedBy && typeof rawCreatedBy !== 'object' ? rawCreatedBy : null) ??
+      raw?.created_by_id ??
+      raw?.created_by_user_id;
+    return value == null ? '' : String(value);
+  }
+
+  private ropFilterDepartments(
+    managers: RopManagerMeta[],
+    openDeals: Array<{ responsibleId: string | null; pipeline: { id: string; name: string } }>,
+  ) {
+    const managersById = new Map(managers.map((manager) => [manager.managerId, manager]));
+    return ROP_DEPARTMENTS.map((department) => {
+      const departmentManagers = managers
+        .filter((manager) => manager.departmentKey === department.key)
+        .sort((a, b) => a.managerName.localeCompare(b.managerName, 'ru'));
+      const pipelines = new Map<string, { id: string; name: string; openDeals: number }>();
+      for (const deal of openDeals) {
+        const manager = managersById.get(deal.responsibleId ?? '');
+        if (!manager || manager.departmentKey !== department.key) continue;
+        const pipeline = pipelines.get(deal.pipeline.id) ?? { id: deal.pipeline.id, name: deal.pipeline.name, openDeals: 0 };
+        pipeline.openDeals += 1;
+        pipelines.set(deal.pipeline.id, pipeline);
+      }
+      return {
+        id: department.key,
+        key: department.key,
+        name: department.label,
+        label: department.label,
+        groups: this.ropGroupOptions(departmentManagers),
+        managers: departmentManagers.map((manager) => ({
+          id: manager.managerId,
+          name: manager.managerName,
+          groupId: manager.groupId,
+          groupName: manager.groupName,
+        })),
+        pipelines: [...pipelines.values()].sort((a, b) => a.name.localeCompare(b.name, 'ru')),
+      };
+    });
+  }
+
+  private ropFilterStages(
+    managers: RopManagerMeta[],
+    openDeals: Array<{
+      responsibleId: string | null;
+      pipeline: { id: string; name: string };
+      stage: { id: string; name: string; position: number };
+    }>,
+  ) {
+    const managersById = new Map(managers.map((manager) => [manager.managerId, manager]));
+    const stages = new Map<string, {
+      id: string;
+      name: string;
+      pipelineId: string;
+      pipelineName: string;
+      stagePosition: number;
+      openDeals: number;
+    }>();
+    for (const deal of openDeals) {
+      if (!managersById.has(deal.responsibleId ?? '')) continue;
+      const key = `${deal.pipeline.id}:${deal.stage.id}`;
+      const stage = stages.get(key) ?? {
+        id: deal.stage.id,
+        name: deal.stage.name,
+        pipelineId: deal.pipeline.id,
+        pipelineName: deal.pipeline.name,
+        stagePosition: deal.stage.position,
+        openDeals: 0,
+      };
+      stage.openDeals += 1;
+      stages.set(key, stage);
+    }
+    return [...stages.values()].sort(
+      (left, right) => left.pipelineName.localeCompare(right.pipelineName, 'ru') || left.stagePosition - right.stagePosition,
+    );
+  }
+
+  private numberValue(value: unknown) {
+    if (value === null || value === undefined) return 0;
+    const parsed = Number(String(value));
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  private ageHours(start: Date, end: Date) {
+    if (end <= start) return 0;
+    return this.roundMetric((end.getTime() - start.getTime()) / 3_600_000);
+  }
+
+  private ageDays(start: Date, end: Date) {
+    if (end <= start) return 0;
+    return (end.getTime() - start.getTime()) / 86_400_000;
+  }
+
+  private actionPriorityRank(priority: RopActionPriority) {
+    if (priority === 'critical') return 0;
+    if (priority === 'warning') return 1;
+    return 2;
   }
 
   private json(value: unknown) {

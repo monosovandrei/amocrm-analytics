@@ -7,9 +7,10 @@ import { AmoWebhookController } from './amo-webhook.controller';
 import { AuditModule } from '../audit/audit.module';
 import { FactMartsModule } from '../facts/fact-marts.module';
 import { PlatformModule } from '../platform/platform.module';
+import { QualityModule } from '../quality/quality.module';
 
 @Module({
-  imports: [AuditModule, FactMartsModule, PlatformModule],
+  imports: [AuditModule, FactMartsModule, PlatformModule, QualityModule],
   controllers: [AmoController, AmoWebhookController],
   providers: [AmoClientFactory, AmoService, AmoSyncService],
   exports: [AmoService, AmoSyncService],

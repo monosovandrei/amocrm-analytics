@@ -60,17 +60,18 @@ cp .env.example .env
 - `AMOCRM_CLIENT_SECRET` - secret private integration amoCRM.
 - `AMOCRM_REDIRECT_URI` - redirect URI из настроек amoCRM.
 - `WEBHOOK_BASE_URL` - внешний API URL без завершающего slash, например `https://analytics.example.ru/api/v1`.
-- `AMOCRM_SYNC_INTERVAL_MINUTES` - `0` для production; регулярный polling отключен. Положительное значение использовать только локально или для ручной диагностики.
+- `AMOCRM_SYNC_INTERVAL_MINUTES` - обязательная страховочная синхронизация; для production `1`.
 - `AMOCRM_SYNC_JOB_TIMEOUT_MINUTES` - через сколько минут обычная job без heartbeat считается зависшей; для production рекомендуется `30`.
 - `AMOCRM_WEBHOOK_SYNC_JOB_TIMEOUT_MINUTES` - через сколько минут realtime webhook job без heartbeat считается зависшей; для production рекомендуется `1`.
 - `AMOCRM_FULL_SYNC_JOB_TIMEOUT_MINUTES` - timeout полной исторической синхронизации; для production рекомендуется `360` или больше.
 - `REPORT_CACHE_STALE_TOLERANCE_SECONDS` - окно, внутри которого кэш отчёта считается достаточно свежим; для production рекомендуется `90`.
 - `REPORT_CACHE_STALE_QUEUE_BATCH_SIZE` - сколько stale-отчётов report-worker ставит в очередь за тик; для production рекомендуется `0`, чтобы не гонять весь кэш в фоне.
-- `REPORT_CACHE_REFRESH_BATCH_SIZE` - сколько отчётов report-worker пересчитывает за тик; для production рекомендуется `3`.
+- `REPORT_CACHE_REFRESH_BATCH_SIZE` - сколько отчётов report-worker пересчитывает за тик; для production `1`, чтобы ограничить пики памяти.
 - `REPORT_CACHE_REFRESH_INTERVAL_MS` - пауза между тиками report-worker; для production рекомендуется `10000`.
 - `REPORT_SNAPSHOT_STALE_ENQUEUE_LIMIT` - сколько уже закэшированных stale-отчётов один запрос страницы может поставить на пересчёт; для production рекомендуется `4`.
 - `REPORT_SNAPSHOT_STALE_REQUEUE_COOLDOWN_SECONDS` - минимальная пауза перед повторной постановкой уже пересчитанного stale-отчёта; для production рекомендуется `300`.
-- `WORKER_RECYCLE_RSS_MB` - аварийный self-recycle worker по RSS; для production рекомендуется `0`, память ограничивается systemd `MemoryMax`.
+- `WORKER_RECYCLE_RSS_MB` - мягкий перезапуск после завершения текущего отчёта; для production `650`, ниже systemd `MemoryMax`.
+- `DATA_QUALITY_ENFORCEMENT` - в production только `enforce`: непроверенные цифры не публикуются.
 - `WEB_ORIGIN` - разрешенный origin фронтенда для CORS.
 - `VITE_API_URL` - публичный URL API для web-приложения.
 - `TELEGRAM_BOT_TOKEN` - токен Telegram-бота для уведомлений.
@@ -101,7 +102,7 @@ npm run dev:web
 - API: `http://localhost:4000/api/v1`
 - Healthcheck: `http://localhost:4000/api/v1/health`
 
-Локально polling тоже выключен по умолчанию: `AMOCRM_SYNC_INTERVAL_MINUTES=0`.
+Даже при рабочих webhook страховочная синхронизация остаётся включена: `AMOCRM_SYNC_INTERVAL_MINUTES=1`.
 
 Для проверки без живой amoCRM отправляйте тестовые webhook payload'ы в `/api/v1/webhooks/amocrm/{secret}`.
 
@@ -109,7 +110,7 @@ npm run dev:web
 
 ```env
 WEBHOOK_BASE_URL=https://your-tunnel-url/api/v1
-AMOCRM_SYNC_INTERVAL_MINUTES=0
+AMOCRM_SYNC_INTERVAL_MINUTES=1
 ```
 
 После смены tunnel URL нужно заново зарегистрировать webhook через `POST /api/v1/amo/webhook/register`.

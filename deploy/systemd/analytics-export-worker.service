@@ -7,14 +7,15 @@ Wants=docker.service
 Type=simple
 WorkingDirectory=/opt/analytics/apps/api
 Environment=NODE_ENV=production
-Environment=NODE_OPTIONS=--max-old-space-size=768
+Environment=NODE_OPTIONS=--max-old-space-size=512
+Environment=WORKER_RECYCLE_RSS_MB=650
 ExecStart=/usr/bin/node dist/export-worker.js
 Restart=always
 RestartSec=5
 User=ameri
 Group=ameri
-MemoryHigh=850M
-MemoryMax=1000M
+MemoryHigh=700M
+MemoryMax=850M
 StandardOutput=journal
 StandardError=journal
 

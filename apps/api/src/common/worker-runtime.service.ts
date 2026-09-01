@@ -1,6 +1,7 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Interval } from '@nestjs/schedule';
 import { PrismaService } from '../prisma/prisma.service';
+import { METRIC_VERSION, RELEASE_BUILD_ID } from '../quality/release-info';
 
 const MB = 1024 * 1024;
 
@@ -34,6 +35,8 @@ export class WorkerRuntimeService implements OnModuleInit {
           heartbeatAt: now,
           rssMb: Math.round(memory.rss / MB),
           heapUsedMb: Math.round(memory.heapUsed / MB),
+          buildId: RELEASE_BUILD_ID,
+          metricVersion: METRIC_VERSION,
         },
         update: {
           processId: process.pid,
@@ -41,6 +44,8 @@ export class WorkerRuntimeService implements OnModuleInit {
           heartbeatAt: now,
           rssMb: Math.round(memory.rss / MB),
           heapUsedMb: Math.round(memory.heapUsed / MB),
+          buildId: RELEASE_BUILD_ID,
+          metricVersion: METRIC_VERSION,
         },
       });
     } catch (error: any) {

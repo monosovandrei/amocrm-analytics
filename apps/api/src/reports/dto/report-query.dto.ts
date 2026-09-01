@@ -1,4 +1,5 @@
-import { IsArray, IsIn, IsObject, IsOptional, IsString } from 'class-validator';
+import { Type } from 'class-transformer';
+import { ArrayMaxSize, ArrayMinSize, IsArray, IsIn, IsObject, IsOptional, IsString, ValidateNested } from 'class-validator';
 
 export class ReportQueryDto {
   @IsString()
@@ -22,5 +23,9 @@ export class SaveReportTemplateDto extends ReportQueryDto {
 
 export class ReportSnapshotsDto {
   @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(100)
+  @ValidateNested({ each: true })
+  @Type(() => ReportQueryDto)
   reports!: ReportQueryDto[];
 }

@@ -45,19 +45,21 @@
 
 Для режима синхронизации amoCRM:
 
-- `AMOCRM_SYNC_INTERVAL_MINUTES=0`
+- `AMOCRM_SYNC_INTERVAL_MINUTES=1`
+- `AMOCRM_RECENT_RECONCILE_INTERVAL_SECONDS=60`
 - `AMOCRM_SYNC_JOB_TIMEOUT_MINUTES=30`
 - `AMOCRM_WEBHOOK_SYNC_JOB_TIMEOUT_MINUTES=1`
 - `AMOCRM_FULL_SYNC_JOB_TIMEOUT_MINUTES=360`
 - `REPORT_CACHE_STALE_TOLERANCE_SECONDS=90`
 - `REPORT_CACHE_STALE_QUEUE_BATCH_SIZE=0`
-- `REPORT_CACHE_REFRESH_BATCH_SIZE=3`
+- `REPORT_CACHE_REFRESH_BATCH_SIZE=1`
 - `REPORT_CACHE_REFRESH_INTERVAL_MS=10000`
 - `REPORT_SNAPSHOT_STALE_ENQUEUE_LIMIT=4`
 - `REPORT_SNAPSHOT_STALE_REQUEUE_COOLDOWN_SECONDS=300`
-- `WORKER_RECYCLE_RSS_MB=0`
+- `WORKER_RECYCLE_RSS_MB=650`
+- `DATA_QUALITY_ENFORCEMENT=enforce`
 
-На production регулярный polling отключен. Данные сначала загружаются полным слепком, затем обновляются через amoCRM webhooks. Положительное значение `AMOCRM_SYNC_INTERVAL_MINUTES` использовать только локально или для временной диагностики.
+На production webhook даёт быстрое обновление, а обязательные polling и контрольная сверка закрывают пропуски webhook.
 
 Секреты не коммитить в Git. Реальный `.env` должен лежать только на сервере.
 
@@ -135,7 +137,7 @@ Webhook URL сервис создаст сам после подключения
 
 Для realtime-обновления ИТ должен обеспечить входящий HTTPS-доступ amoCRM к этому webhook URL. Когда в amoCRM происходит изменение, webhook дергает API, API сохраняет событие в очередь и обрабатывает его после первичного слепка. В штатном режиме после слепка отчеты обновляются по webhook-очереди без регулярного polling.
 
-`AMOCRM_SYNC_INTERVAL_MINUTES=0` - штатный production-режим. Если локально нужен polling без webhook-туннеля, можно временно поставить положительное значение, но это не должно попадать в production.
+`AMOCRM_SYNC_INTERVAL_MINUTES=1` и `AMOCRM_RECENT_RECONCILE_INTERVAL_SECONDS=60` - штатный production-режим. Нуль не отключает эти страховочные механизмы.
 
 ## Проверки перед выкладкой
 

@@ -15,6 +15,16 @@ export class PlatformController {
     return this.platform.overview(req.user);
   }
 
+  @Get('rop-dashboard')
+  ropDashboard(@Req() req: AuthRequest) {
+    return this.platform.ropDashboard(req.user);
+  }
+
+  @Get('rop-dashboard-v2')
+  ropDashboardV2(@Req() req: AuthRequest, @Query() query: Record<string, any>) {
+    return this.platform.ropDashboardV2(req.user, query);
+  }
+
   @Get('telegram/status')
   telegramStatus(@Req() req: AuthRequest) {
     return this.platform.telegramStatus(req.user.id);

@@ -444,7 +444,7 @@ export class AmoSyncService {
       }, {
         status: 'ACTIVE',
         lastError: null,
-        lastIncrementalSyncAt: startedAt,
+        lastReconcileAt: startedAt,
       });
 
       return { status: 'ok', from: syncFrom, stats };
@@ -754,9 +754,9 @@ export class AmoSyncService {
 
   private getConfiguredSyncIntervalMinutes() {
     const rawInterval = this.config.get<string>('AMOCRM_SYNC_INTERVAL_MINUTES');
-    if (!rawInterval) return 0;
+    if (!rawInterval) return 1;
     const parsed = Number(rawInterval);
-    return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
+    return Number.isFinite(parsed) ? Math.max(1, parsed) : 1;
   }
 
   private getEmailNotesInitialLookbackDays() {
@@ -882,9 +882,10 @@ export class AmoSyncService {
     try {
       const client = await this.amo.getClient(job.connection);
       const syncStartedAt = new Date();
-      const updatedSince = this.getUpdatedSince(job.type, job.connection.lastIncrementalSyncAt);
-      const notificationSince = job.connection.lastIncrementalSyncAt
-        ? new Date(job.connection.lastIncrementalSyncAt.getTime() - 5 * 60_000)
+      const lastPullSyncAt = job.connection.lastPullSyncAt ?? job.connection.lastIncrementalSyncAt;
+      const updatedSince = this.getUpdatedSince(job.type, lastPullSyncAt);
+      const notificationSince = lastPullSyncAt
+        ? new Date(lastPullSyncAt.getTime() - 5 * 60_000)
         : syncStartedAt;
       const isFullSync = job.type === SyncJobType.FULL;
 
@@ -906,19 +907,19 @@ export class AmoSyncService {
       await this.hydrateExistingEntityMaps(maps);
       await this.touchJob(jobId, 'deals');
       this.logger.log(`amoCRM sync job ${jobId}: syncing deals`);
-      await this.syncDeals(client, maps, stats, updatedSince, jobId);
+      await this.syncDeals(client, maps, stats, updatedSince, jobId, isFullSync);
       if (isFullSync) {
         await this.backfillLossReasonsFromRaw(stats);
       }
       await this.touchJob(jobId, 'notes');
       this.logger.log(`amoCRM sync job ${jobId}: syncing notes`);
-      await this.syncOptional('notes', stats, () => this.syncNotes(client, stats, updatedSince));
+      await this.syncNotes(client, stats, updatedSince, jobId);
       await this.touchJob(jobId, 'events');
       this.logger.log(`amoCRM sync job ${jobId}: syncing events`);
-      await this.syncOptional('events', stats, () => this.syncEvents(client, maps, stats, updatedSince));
+      await this.syncEvents(client, maps, stats, updatedSince, jobId);
       await this.touchJob(jobId, 'tasks');
       this.logger.log(`amoCRM sync job ${jobId}: syncing tasks`);
-      await this.syncOptional('tasks', stats, () => this.syncTasks(client, maps, stats, updatedSince));
+      await this.syncTasks(client, maps, stats, updatedSince, jobId);
       await this.touchJob(jobId, 'contacts_companies');
       this.logger.log(`amoCRM sync job ${jobId}: syncing contacts and companies`);
       await this.syncContacts(client, maps, stats, updatedSince);
@@ -947,6 +948,7 @@ export class AmoSyncService {
           lastError: null,
           lastFullSyncAt: job.type === 'FULL' ? syncFinishedAt : job.connection.lastFullSyncAt,
           lastIncrementalSyncAt: syncStartedAt,
+          lastPullSyncAt: syncStartedAt,
         },
       });
       if (isFullSync) {
@@ -1061,7 +1063,7 @@ export class AmoSyncService {
           status: 'ACTIVE',
           lastError: null,
           lastFullSyncAt: job.connection.lastFullSyncAt,
-          lastIncrementalSyncAt: groups.length > 0 ? finishedAt : job.connection.lastIncrementalSyncAt,
+          lastWebhookAppliedAt: groups.length > 0 ? finishedAt : job.connection.lastWebhookAppliedAt,
         },
       });
     } catch (error: any) {
@@ -1079,10 +1081,10 @@ export class AmoSyncService {
     }
   }
 
-  private getUpdatedSince(type: SyncJobType, lastIncrementalSyncAt: Date | null): number | undefined {
+  private getUpdatedSince(type: SyncJobType, lastPullSyncAt: Date | null): number | undefined {
     if (type === 'FULL') return undefined;
-    if (!lastIncrementalSyncAt) return Math.floor((Date.now() - 5 * 60_000) / 1000);
-    return Math.floor((lastIncrementalSyncAt.getTime() - 5 * 60_000) / 1000);
+    if (!lastPullSyncAt) return Math.floor((Date.now() - 5 * 60_000) / 1000);
+    return Math.floor((lastPullSyncAt.getTime() - 5 * 60_000) / 1000);
   }
 
   private emptyMaps(): AmoSyncMaps {
@@ -2151,13 +2153,19 @@ export class AmoSyncService {
     stats: Record<string, number>,
     updatedSince?: number,
     jobId?: string,
+    isFullSync = false,
   ) {
     const params: Record<string, string | number> = { with: 'contacts,catalog_elements,loss_reason' };
     if (updatedSince) params['filter[updated_at][from]'] = updatedSince;
 
     let totalDeals = 0;
+    const sourceExternalIds = isFullSync ? new Set<string>() : null;
+    const activeBefore = isFullSync
+      ? await this.prisma.deal.findMany({ where: { deletedAt: null }, select: { externalId: true } })
+      : [];
     await client.paginateBatch<any>('/leads', 'leads', params, async (leads, page) => {
       for (const lead of leads) {
+        if (sourceExternalIds && lead?.id) sourceExternalIds.add(String(lead.id));
         await this.upsertDeal(lead, maps);
       }
       totalDeals += leads.length;
@@ -2167,6 +2175,32 @@ export class AmoSyncService {
       }
     });
     stats.deals = totalDeals;
+    if (!sourceExternalIds) return;
+
+    if (activeBefore.length >= 100 && sourceExternalIds.size < activeBefore.length * 0.8) {
+      throw new Error(
+        `Full amoCRM snapshot is suspiciously small: source=${sourceExternalIds.size}, activeBefore=${activeBefore.length}`,
+      );
+    }
+
+    const missingExternalIds = activeBefore
+      .map((deal) => deal.externalId)
+      .filter((externalId) => !sourceExternalIds.has(externalId));
+    const deletedAt = new Date();
+    for (let offset = 0; offset < missingExternalIds.length; offset += 500) {
+      await this.prisma.deal.updateMany({
+        where: { externalId: { in: missingExternalIds.slice(offset, offset + 500) }, deletedAt: null },
+        data: { deletedAt },
+      });
+    }
+
+    const storedActiveDeals = await this.prisma.deal.count({ where: { deletedAt: null } });
+    stats.dealsSource = sourceExternalIds.size;
+    stats.dealsVerified = storedActiveDeals;
+    stats.dealsDeleted = missingExternalIds.length;
+    if (storedActiveDeals !== sourceExternalIds.size) {
+      throw new Error(`Full amoCRM deal parity failed: source=${sourceExternalIds.size}, stored=${storedActiveDeals}`);
+    }
   }
 
   private async syncRecentDeals(
@@ -2184,6 +2218,7 @@ export class AmoSyncService {
     let page = 1;
     let totalDeals = 0;
     let hasNextPage = false;
+    const externalIds = new Set<string>();
 
     while (totalDeals < maxDeals) {
       const limit = Math.min(pageLimit, maxDeals - totalDeals);
@@ -2192,6 +2227,7 @@ export class AmoSyncService {
       if (!Array.isArray(leads) || leads.length === 0) break;
 
       for (const lead of leads) {
+        externalIds.add(String(lead.id));
         await this.upsertDeal(lead, maps);
       }
 
@@ -2206,6 +2242,14 @@ export class AmoSyncService {
     if (hasNextPage && totalDeals >= maxDeals) {
       stats.dealsTruncated = 1;
       throw new Error(`Recent amoCRM deal reconciliation exceeded ${maxDeals} records; cursor was not advanced`);
+    }
+    const storedDeals = externalIds.size
+      ? await this.prisma.deal.count({ where: { externalId: { in: [...externalIds] }, deletedAt: null } })
+      : 0;
+    stats.dealsVerified = storedDeals;
+    stats.dealParityMismatch = externalIds.size - storedDeals;
+    if (storedDeals !== externalIds.size) {
+      throw new Error(`Recent amoCRM deal reconciliation parity failed: source=${externalIds.size}, stored=${storedDeals}`);
     }
   }
 
@@ -2249,6 +2293,14 @@ export class AmoSyncService {
     if (hasNextPage && eventsById.size >= maxEvents) {
       stats.eventsTruncated = 1;
       throw new Error(`Recent amoCRM event reconciliation exceeded ${maxEvents} records; cursor was not advanced`);
+    }
+    const storedEvents = eventsById.size
+      ? await this.prisma.crmEvent.count({ where: { externalId: { in: [...eventsById.keys()] } } })
+      : 0;
+    stats.eventsVerified = storedEvents;
+    stats.eventParityMismatch = eventsById.size - storedEvents;
+    if (storedEvents !== eventsById.size) {
+      throw new Error(`Recent amoCRM event reconciliation parity failed: source=${eventsById.size}, stored=${storedEvents}`);
     }
     await this.backfillStageHistoryFromStoredEvents(maps, stats, updatedSince);
   }
@@ -2505,6 +2557,7 @@ export class AmoSyncService {
       raw: lead,
       closedAt,
       expectedCloseAt: toDateFromAmoTimestamp(lead.closest_task_at),
+      deletedAt: null,
       createdAt: toDateFromAmoTimestamp(lead.created_at) ?? new Date(),
       updatedAt: toDateFromAmoTimestamp(lead.updated_at) ?? new Date(),
     };
@@ -2654,14 +2707,19 @@ export class AmoSyncService {
     maps: AmoSyncMaps,
     stats: Record<string, number>,
     updatedSince?: number,
+    jobId?: string,
   ) {
     const params = updatedSince ? { 'filter[updated_at][from]': updatedSince } : {};
     let total = 0;
-    await client.paginateBatch<any>('/tasks', 'tasks', params, async (tasks) => {
+    await client.paginateBatch<any>('/tasks', 'tasks', params, async (tasks, page) => {
       for (const task of tasks) {
         await this.upsertTask(task, maps);
       }
       total += tasks.length;
+      if (page % 20 === 1) {
+        this.logger.log(`syncTasks: processed page ${page} (${total} tasks so far)`);
+        if (jobId) await this.touchJob(jobId, `tasks:page${page}`);
+      }
     });
     stats.tasks = total;
   }
@@ -2737,18 +2795,24 @@ export class AmoSyncService {
     return normalized === '2' || normalized.includes('lead');
   }
 
-  private async syncNotes(client: AmoClient, stats: Record<string, number>, updatedSince?: number) {
+  private async syncNotes(client: AmoClient, stats: Record<string, number>, updatedSince?: number, jobId?: string) {
     const params: Record<string, string | number> = {};
     if (updatedSince) params['filter[updated_at][from]'] = updatedSince;
 
     let total = 0;
     for (const source of ['leads', 'contacts', 'companies']) {
       try {
-        await client.paginateBatch<any>(`/${source}/notes`, 'notes', params, async (notes) => {
+        let sourceTotal = 0;
+        await client.paginateBatch<any>(`/${source}/notes`, 'notes', params, async (notes, page) => {
           for (const note of notes) {
-            await this.upsertNote(source, note);
+            await this.upsertNote(source, note, { resolveRelatedDealIds: false });
           }
+          sourceTotal += notes.length;
           total += notes.length;
+          if (page === 1 || page % 5 === 0) {
+            this.logger.log(`syncNotes:${source}: processed page ${page} (${sourceTotal} notes so far)`);
+            if (jobId) await this.touchJob(jobId, `notes:${source}:page${page}`);
+          }
         });
       } catch (error: any) {
         if (source === 'leads') throw error;
@@ -2836,7 +2900,8 @@ export class AmoSyncService {
     stats.webhookEmailNotes = emailTotal;
   }
 
-  private async upsertNote(source: string, note: any) {
+  private async upsertNote(source: string, note: any, options: { resolveRelatedDealIds?: boolean } = {}) {
+    const resolveRelatedDealIds = options.resolveRelatedDealIds ?? true;
     const deal = source === 'leads' && note.entity_id
       ? await this.prisma.deal.findUnique({ where: { externalId: String(note.entity_id) }, select: { id: true } })
       : null;
@@ -2861,7 +2926,7 @@ export class AmoSyncService {
 
     if (noteType !== 'amomail_message') return deal?.id ? [deal.id] : [];
     if (deal?.id) return [deal.id];
-    if (source !== 'contacts' || !note.entity_id) return [];
+    if (!resolveRelatedDealIds || source !== 'contacts' || !note.entity_id) return [];
 
     const deals = await this.openDealIdsByContactExternalId(String(note.entity_id));
     return deals.map((item) => item.id);
@@ -2892,6 +2957,7 @@ export class AmoSyncService {
     maps: AmoSyncMaps,
     stats: Record<string, number>,
     updatedSince?: number,
+    jobId?: string,
   ) {
     const params: Record<string, string | number> = {};
     if (updatedSince) {
@@ -2902,8 +2968,12 @@ export class AmoSyncService {
 
     const eventsById = new Map<string, any>();
     const ingest = async (eventParams: Record<string, string | number>) => {
-      await client.paginateBatch<any>('/events', 'events', eventParams, async (events) => {
+      await client.paginateBatch<any>('/events', 'events', eventParams, async (events, page) => {
         for (const event of events) eventsById.set(String(event.id), event);
+        if (page % 20 === 1) {
+          this.logger.log(`syncEvents: processed page ${page} (${eventsById.size} unique events so far)`);
+          if (jobId) await this.touchJob(jobId, `events:page${page}`);
+        }
       });
     };
 
@@ -2913,8 +2983,14 @@ export class AmoSyncService {
     }
 
     const events = [...eventsById.values()];
+    let savedEvents = 0;
     for (const event of events) {
       await this.upsertCrmEvent(event, maps);
+      savedEvents += 1;
+      if (savedEvents === 1 || savedEvents % 5000 === 0) {
+        this.logger.log(`syncEvents: saved ${savedEvents}/${events.length} events`);
+        if (jobId) await this.touchJob(jobId, `events:saved:${savedEvents}`);
+      }
     }
     stats.events = events.length;
     await this.backfillStageHistoryFromStoredEvents(maps, stats, updatedSince);

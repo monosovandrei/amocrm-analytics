@@ -11,6 +11,7 @@ import { HealthModule } from './health/health.module';
 import { AuditModule } from './audit/audit.module';
 import { PlatformModule } from './platform/platform.module';
 import { ApiMemoryInterceptor } from './common/api-memory.interceptor';
+import { QualityModule } from './quality/quality.module';
 
 @Module({
   imports: [
@@ -24,6 +25,7 @@ import { ApiMemoryInterceptor } from './common/api-memory.interceptor';
     HealthModule,
     AuditModule,
     PlatformModule,
+    QualityModule,
   ],
   providers: [
     {

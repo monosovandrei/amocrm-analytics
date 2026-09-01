@@ -1,10 +1,18 @@
-﻿import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 import { Prisma } from '../generated/prisma';
 import { PrismaService } from '../prisma/prisma.service';
 import { UpdateForecastSettingsDto } from './dto/update-forecast-settings.dto';
+import { UpdateRopStageSlaDto } from './dto/update-rop-stage-sla.dto';
 import { UpdateStageProbabilityDto } from './dto/update-stage-probability.dto';
 import { UpdateVisibilityDto } from './dto/update-visibility.dto';
 import { AuditService } from '../audit/audit.service';
+import {
+  isRealAmoExternalId,
+  ROP_DEPARTMENTS,
+  resolveDefaultRopStageSla,
+  ropDepartmentKeyFromInput,
+  RopDepartmentKey,
+} from '../platform/rop-stage-sla';
 
 @Injectable()
 export class SettingsService {
@@ -85,6 +93,132 @@ export class SettingsService {
       orderBy: { stage: { position: 'asc' } },
     });
     return { settings, probabilities };
+  }
+
+  async getRopStageSlaSettings() {
+    const scope = await this.ropStageSlaScope();
+    if (scope.keys.length === 0) {
+      return { generatedAt: new Date().toISOString(), departments: [] };
+    }
+    const existingRules = await this.prisma.ropStageSlaRule.findMany({
+      where: {
+        OR: [...scope.keys].map((key) => ({ departmentKey: key.departmentKey, stageId: key.stageId })),
+      },
+      include: { stage: { include: { pipeline: true } } },
+    });
+    const existingKeys = new Set(existingRules.map((rule) => this.ropStageSlaKey(rule.departmentKey, rule.stageId)));
+    const missing = scope.rows.filter((row) => !existingKeys.has(this.ropStageSlaKey(row.departmentKey, row.stageId)));
+
+    if (missing.length > 0) {
+      await this.prisma.$transaction(
+        missing.map((row) => {
+          const fallback = resolveDefaultRopStageSla(row.departmentKey, row.pipelineName, row.stageName);
+          return this.prisma.ropStageSlaRule.create({
+            data: {
+              departmentKey: row.departmentKey,
+              stageId: row.stageId,
+              isEnabled: fallback.days !== null,
+              slaDays: fallback.days,
+              reason: fallback.reason,
+            },
+          });
+        }),
+      );
+    }
+
+    const rules = missing.length > 0
+      ? await this.prisma.ropStageSlaRule.findMany({
+        where: {
+          OR: [...scope.keys].map((key) => ({ departmentKey: key.departmentKey, stageId: key.stageId })),
+        },
+        include: { stage: { include: { pipeline: true } } },
+      })
+      : existingRules;
+    const ruleByKey = new Map(rules.map((rule) => [this.ropStageSlaKey(rule.departmentKey, rule.stageId), rule]));
+
+    return {
+      generatedAt: new Date().toISOString(),
+      departments: ROP_DEPARTMENTS.map((department) => {
+        const rows = scope.rows.filter((row) => row.departmentKey === department.key);
+        const pipelines = [...new Map(rows.map((row) => [row.pipelineId, {
+          id: row.pipelineId,
+          name: row.pipelineName,
+        }])).values()]
+          .sort((a, b) => a.name.localeCompare(b.name, 'ru'))
+          .map((pipeline) => ({
+            ...pipeline,
+            stages: rows
+              .filter((row) => row.pipelineId === pipeline.id)
+              .sort((a, b) => a.stagePosition - b.stagePosition)
+              .map((row) => {
+                const rule = ruleByKey.get(this.ropStageSlaKey(row.departmentKey, row.stageId));
+                const fallback = resolveDefaultRopStageSla(row.departmentKey, row.pipelineName, row.stageName);
+                return {
+                  departmentKey: row.departmentKey,
+                  stageId: row.stageId,
+                  stageName: row.stageName,
+                  stagePosition: row.stagePosition,
+                  pipelineId: row.pipelineId,
+                  pipelineName: row.pipelineName,
+                  openDeals: row.openDeals,
+                  ruleId: rule?.id ?? null,
+                  isEnabled: rule?.isEnabled ?? fallback.days !== null,
+                  slaDays: rule?.slaDays ?? fallback.days,
+                  reason: rule?.reason ?? fallback.reason,
+                };
+              }),
+          }));
+        return {
+          key: department.key,
+          label: department.label,
+          pipelines,
+        };
+      }).filter((department) => department.pipelines.length > 0),
+    };
+  }
+
+  async updateRopStageSla(dto: UpdateRopStageSlaDto, actorUserId?: string) {
+    const departmentKey = ropDepartmentKeyFromInput(dto.departmentKey);
+    if (!departmentKey) throw new BadRequestException('Неизвестный отдел');
+    if (dto.isEnabled && !dto.slaDays) throw new BadRequestException('Укажи SLA в днях');
+
+    const stage = await this.prisma.pipelineStage.findUnique({
+      where: { id: dto.stageId },
+      include: { pipeline: true },
+    });
+    if (!stage) throw new BadRequestException('Этап не найден');
+
+    const reason = dto.reason?.trim() || null;
+    const rule = await this.prisma.ropStageSlaRule.upsert({
+      where: { departmentKey_stageId: { departmentKey, stageId: dto.stageId } },
+      create: {
+        departmentKey,
+        stageId: dto.stageId,
+        isEnabled: dto.isEnabled,
+        slaDays: dto.isEnabled ? dto.slaDays! : null,
+        reason,
+      },
+      update: {
+        isEnabled: dto.isEnabled,
+        slaDays: dto.isEnabled ? dto.slaDays! : null,
+        reason,
+      },
+    });
+    await this.audit.record({
+      userId: actorUserId,
+      action: 'settings.rop_stage_sla.update',
+      entity: 'RopStageSlaRule',
+      entityId: rule.id,
+      metadata: {
+        departmentKey,
+        stageId: dto.stageId,
+        stageName: stage.name,
+        pipelineName: stage.pipeline.name,
+        isEnabled: dto.isEnabled,
+        slaDays: rule.slaDays,
+      },
+    });
+    return rule;
   }
 
   async updateForecastSettings(dto: UpdateForecastSettingsDto, actorUserId?: string) {
@@ -191,5 +325,78 @@ export class SettingsService {
     const existing = await this.prisma.forecastSettings.findFirst();
     if (existing) return existing;
     return this.prisma.forecastSettings.create({ data: {} });
+  }
+
+  private async ropStageSlaScope() {
+    const crmUsers = await this.prisma.crmUser.findMany({
+      where: { isActive: true, isVisible: true },
+      select: {
+        id: true,
+        externalId: true,
+        group: { select: { externalId: true, name: true } },
+      },
+    });
+    const managerDepartments = new Map<string, RopDepartmentKey>();
+    for (const user of crmUsers) {
+      const departmentKey = ropDepartmentKeyFromInput(user.group?.name);
+      if (!departmentKey || !isRealAmoExternalId(user.externalId) || !isRealAmoExternalId(user.group?.externalId)) continue;
+      managerDepartments.set(user.id, departmentKey);
+    }
+    const deals = managerDepartments.size > 0
+      ? await this.prisma.deal.findMany({
+        where: {
+          deletedAt: null,
+          responsibleId: { in: [...managerDepartments.keys()] },
+          pipeline: { isArchived: false },
+          stage: { isWon: false, isLost: false, isVisible: true },
+        },
+        select: {
+          responsibleId: true,
+          pipeline: { select: { id: true, name: true } },
+          stage: { select: { id: true, name: true, position: true } },
+        },
+      })
+      : [];
+
+    const rowByKey = new Map<string, {
+      departmentKey: RopDepartmentKey;
+      pipelineId: string;
+      pipelineName: string;
+      stageId: string;
+      stageName: string;
+      stagePosition: number;
+      openDeals: number;
+    }>();
+    for (const deal of deals) {
+      const departmentKey = deal.responsibleId ? managerDepartments.get(deal.responsibleId) : null;
+      if (!departmentKey) continue;
+      const key = this.ropStageSlaKey(departmentKey, deal.stage.id);
+      const row = rowByKey.get(key) ?? {
+        departmentKey,
+        pipelineId: deal.pipeline.id,
+        pipelineName: deal.pipeline.name,
+        stageId: deal.stage.id,
+        stageName: deal.stage.name,
+        stagePosition: deal.stage.position,
+        openDeals: 0,
+      };
+      row.openDeals += 1;
+      rowByKey.set(key, row);
+    }
+
+    const rows = [...rowByKey.values()].sort(
+      (a, b) =>
+        a.departmentKey.localeCompare(b.departmentKey, 'ru') ||
+        a.pipelineName.localeCompare(b.pipelineName, 'ru') ||
+        a.stagePosition - b.stagePosition,
+    );
+    return {
+      rows,
+      keys: rows.map((row) => ({ departmentKey: row.departmentKey, stageId: row.stageId })),
+    };
+  }
+
+  private ropStageSlaKey(departmentKey: string, stageId: string) {
+    return `${departmentKey}:${stageId}`;
   }
 }

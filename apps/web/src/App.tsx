@@ -90,6 +90,15 @@ import type {
   ReportFilters,
   ReportSchedule,
   ReportTemplate,
+  RopActionQueueKey,
+  RopActionPriority,
+  RopActionQueueItem,
+  RopDashboardResponse,
+  RopDepartmentDashboard,
+  RopFunnelStageRow,
+  RopManagerRow,
+  RopStageSlaRuleRow,
+  RopStageSlaSettingsResponse,
   SourceType,
   Tab,
   User,
@@ -114,9 +123,10 @@ import {
   validateDraft,
 } from './report-utils';
 
-type AppTab = Tab | 'leadSla' | 'planFact' | 'emailThreads';
+type AppTab = Tab | 'ropDashboard' | 'leadSla' | 'planFact' | 'emailThreads';
 
 const navItems: Array<{ id: AppTab; label: string; icon: ReactNode }> = [
+  { id: 'ropDashboard', label: 'Пульт РОПа', icon: <Users size={17} /> },
   { id: 'workspace', label: 'Отчёты', icon: <LayoutDashboard size={17} /> },
   { id: 'planFact', label: 'План-факт', icon: <BarChart3 size={17} /> },
   { id: 'leadSla', label: 'SLA лидов', icon: <Clock3 size={17} /> },
@@ -367,7 +377,6 @@ const periodPresetLabels: Record<PeriodPreset, string> = {
 };
 
 const workspacePeriodPresets: PeriodPreset[] = ['today', 'yesterday', 'this_week', 'this_month'];
-const dashboardSnapshotRequestConcurrency = 4;
 type DashboardReportSnapshot = {
   cacheKey: string;
   clientCacheKey?: string;
@@ -378,10 +387,23 @@ type DashboardReportSnapshot = {
   sourceSyncAt?: string | null;
   updatedAt?: string | null;
   refreshError?: string | null;
+  dataCutoffAt?: string | null;
+  qualityStatus?: 'CHECKING' | 'CERTIFIED' | 'BLOCKED';
+  qualityCheckedAt?: string | null;
+  qualityIncidentId?: string | null;
+  metricVersion?: string | null;
+  buildId?: string | null;
+  downloadAllowed?: boolean;
 };
 type DashboardReportSnapshotsResponse = {
   latestSourceSyncAt?: string | null;
   reports: Array<DashboardReportSnapshot & { index: number }>;
+};
+type DataQualityView = {
+  overall: 'CHECKING' | 'CERTIFIED' | 'BLOCKED';
+  checkedAt?: string | null;
+  cutoffAt?: string | null;
+  incidents?: Array<{ id: string; message: string }>;
 };
 type DashboardQuery = {
   templateId: string;
@@ -643,6 +665,7 @@ export default function HomePage() {
   const [options, setOptions] = useState<Options | null>(null);
   const [connection, setConnection] = useState<Record<string, any> | null>(null);
   const [syncHealth, setSyncHealth] = useState<Record<string, any> | null>(null);
+  const [dataQuality, setDataQuality] = useState<DataQualityView | null>(null);
   const [forecastSettings, setForecastSettings] = useState<ForecastSettings | null>(null);
   const [templates, setTemplates] = useState<ReportTemplate[]>([]);
   const [filters, setFilters] = useState<ReportFilters>(getInitialFilters);
@@ -654,10 +677,11 @@ export default function HomePage() {
   const lastAmoSyncSeenRef = useRef<string | null>(null);
 
   const loadData = useCallback(async () => {
-    const [nextOptions, nextConnection, nextSyncHealth, nextForecast, nextTemplates, nextLayout] = await Promise.all([
+    const [nextOptions, nextConnection, nextSyncHealth, nextQuality, nextForecast, nextTemplates, nextLayout] = await Promise.all([
       api<Options>('/settings/options'),
       api<Record<string, any> | null>('/amo/connection'),
       api<Record<string, any> | null>('/amo/sync/health').catch(() => null),
+      api<DataQualityView>('/quality/status').catch(() => null),
       api<ForecastSettings>('/settings/forecast'),
       api<ReportTemplate[]>('/reports/templates'),
       api<DashboardLayout>('/settings/dashboard-layout').catch(() => ({ config: {} })),
@@ -665,6 +689,7 @@ export default function HomePage() {
     setOptions(nextOptions);
     setConnection(nextConnection);
     setSyncHealth(nextSyncHealth);
+    setDataQuality(nextQuality);
     setForecastSettings(nextForecast);
     setTemplates(normalizeTemplates(nextTemplates, nextLayout));
   }, []);
@@ -697,13 +722,26 @@ export default function HomePage() {
 
   const ordered = useMemo(() => orderTemplates(templates), [templates]);
   const canAccessTelegram = user?.businessRole === 'OWNER';
-  const visibleNavItems = canAccessTelegram ? navItems : navItems.filter((item) => item.id !== 'platform');
+  const canAccessRopDashboard = user?.role === 'ADMIN' || user?.role === 'ROP' || user?.businessRole === 'ROP' || user?.businessRole === 'OWNER';
+  const visibleNavItems = navItems.filter((item) => {
+    if (item.id === 'platform') return canAccessTelegram;
+    if (item.id === 'ropDashboard') return canAccessRopDashboard;
+    return true;
+  });
   const amoHasConnection = Boolean(connection?.subdomain);
   const amoConnected = amoHasConnection && connection?.status !== 'INACTIVE';
   const lastAmoSyncAt = syncHealth?.lastDataUpdateAt ?? syncHealth?.lastSuccessfulSyncAt ?? connection?.lastIncrementalSyncAt ?? connection?.lastFullSyncAt;
   const amoRealtimeWaitingForFirstWebhook = syncHealth?.syncMode === 'WEBHOOK' && syncHealth?.hasReceivedWebhooks === false;
   const amoConnectionHealthy = amoConnected && syncHealth?.healthy !== false;
-  const amoStatusText = syncHealth?.message ?? (amoConnectionHealthy ? 'Синхронизация работает' : 'Синхронизация не работает');
+  const qualityBlocked = dataQuality?.overall === 'BLOCKED';
+  const qualityChecking = dataQuality?.overall === 'CHECKING';
+  const amoStatusText = qualityBlocked
+    ? 'Данные неверны — цифры скрыты'
+    : qualityChecking
+      ? 'Данные проверяются'
+      : dataQuality?.overall === 'CERTIFIED'
+        ? 'Данные проверены'
+        : syncHealth?.message ?? (amoConnectionHealthy ? 'Синхронизация работает' : 'Синхронизация не работает');
   const amoSyncUpdatedText = amoRealtimeWaitingForFirstWebhook && lastAmoSyncAt
     ? `Данные: ${formatMoscowDateTime(lastAmoSyncAt)} МСК`
     : lastAmoSyncAt
@@ -714,7 +752,10 @@ export default function HomePage() {
     if (tab === 'platform' && !canAccessTelegram) {
       setTab('workspace');
     }
-  }, [canAccessTelegram, tab]);
+    if (tab === 'ropDashboard' && !canAccessRopDashboard) {
+      setTab('workspace');
+    }
+  }, [canAccessRopDashboard, canAccessTelegram, tab]);
 
   useEffect(() => {
     if (!user) return;
@@ -730,14 +771,16 @@ export default function HomePage() {
     let cancelled = false;
     const pollConnection = async () => {
       try {
-        const [nextConnection, nextSyncHealth] = await Promise.all([
+        const [nextConnection, nextSyncHealth, nextQuality] = await Promise.all([
           api<Record<string, any> | null>('/amo/connection'),
           api<Record<string, any> | null>('/amo/sync/health').catch(() => null),
+          api<DataQualityView>('/quality/status').catch(() => null),
         ]);
         if (cancelled || !nextConnection) return;
 
         setConnection(nextConnection);
         setSyncHealth(nextSyncHealth);
+        setDataQuality(nextQuality);
         const nextSyncAt = String(
           nextSyncHealth?.lastDataUpdateAt ??
           nextSyncHealth?.lastSuccessfulSyncAt ??
@@ -914,10 +957,10 @@ export default function HomePage() {
 
           <div className="topbar-actions">
             <div
-              className={`sync-panel ${amoConnectionHealthy ? 'sync-panel-ok' : 'sync-panel-warn'}`}
-              title={`${syncHealth?.message ?? amoStatusText}. ${amoSyncUpdatedText}`}
+              className={`sync-panel ${qualityBlocked ? 'sync-panel-error' : amoConnectionHealthy && !qualityChecking ? 'sync-panel-ok' : 'sync-panel-warn'}`}
+              title={`${dataQuality?.incidents?.[0]?.message ?? syncHealth?.message ?? amoStatusText}. ${amoSyncUpdatedText}`}
             >
-              {amoConnectionHealthy ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}
+              {amoConnectionHealthy && !qualityBlocked && !qualityChecking ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}
               <div className="min-w-0">
                 <div className="sync-panel-title">{amoStatusText}</div>
                 <div className="sync-panel-meta">{amoSyncUpdatedText}</div>
@@ -951,6 +994,10 @@ export default function HomePage() {
                 <CheckCircle2 className="mt-0.5 text-[var(--pb-accent-green)]" size={17} />
                 <span>{message}</span>
               </div>
+            )}
+
+            {tab === 'ropDashboard' && canAccessRopDashboard && (
+              <RopDashboardTab />
             )}
 
             {tab === 'workspace' && (
@@ -1096,42 +1143,37 @@ function WorkspaceTab({
       setSnapshotByTemplateId({});
       setSnapshotErrorByTemplateId({});
 
-      const loaded = await mapWithConcurrency(
-        dashboardQueries,
-        dashboardSnapshotRequestConcurrency,
-        async (item): Promise<{ item: DashboardQuery; snapshot?: DashboardReportSnapshot; error?: string }> => {
-          try {
-            const response = await api<DashboardReportSnapshotsResponse>('/reports/snapshots', {
-              method: 'POST',
-              body: JSON.stringify({ reports: [item.query] }),
-            });
-            const snapshot = response.reports?.[0];
-            return {
-              item,
-              snapshot: snapshot ? { ...snapshot, clientCacheKey: reportWidgetCacheKey(item.query) } : undefined,
-            };
-          } catch (err) {
-            return {
-              item,
-              error: err instanceof Error ? err.message : 'Не удалось загрузить отчёт',
-            };
-          }
-        },
-      );
+      let response: DashboardReportSnapshotsResponse;
+      try {
+        response = await api<DashboardReportSnapshotsResponse>('/reports/snapshots', {
+          method: 'POST',
+          body: JSON.stringify({ reports: dashboardQueries.map((item) => item.query) }),
+        });
+      } catch (err) {
+        if (cancelled) return;
+        const message = err instanceof Error ? err.message : 'Не удалось загрузить отчёты';
+        setSnapshotErrorByTemplateId(Object.fromEntries(dashboardQueries.map((item) => [item.templateId, message])));
+        return;
+      }
       if (cancelled) return;
 
       const nextSnapshots: Record<string, DashboardReportSnapshot> = {};
       const nextErrors: Record<string, string> = {};
       let shouldPollSnapshots = false;
 
-      for (const item of loaded) {
-        if (item.snapshot) {
-          nextSnapshots[item.item.templateId] = item.snapshot;
-          if (item.snapshot.status === 'PENDING' && (!item.snapshot.payload || item.snapshot.payload.type === 'pending')) {
+      for (let index = 0; index < dashboardQueries.length; index += 1) {
+        const item = dashboardQueries[index];
+        const rawSnapshot = response.reports?.find((report) => report.index === index) ?? response.reports?.[index];
+        const snapshot = rawSnapshot
+          ? { ...rawSnapshot, clientCacheKey: reportWidgetCacheKey(item.query) }
+          : undefined;
+        if (snapshot) {
+          nextSnapshots[item.templateId] = snapshot;
+          if (snapshot.status === 'PENDING' && (!snapshot.payload || snapshot.payload.type === 'pending')) {
             shouldPollSnapshots = true;
           }
         } else {
-          nextErrors[item.item.templateId] = item.error || 'Не удалось загрузить отчёт';
+          nextErrors[item.templateId] = 'Сервер не вернул этот отчёт';
         }
       }
 
@@ -1149,6 +1191,31 @@ function WorkspaceTab({
       if (pollTimer) window.clearTimeout(pollTimer);
     };
   }, [dashboardQueryKey, refreshStamp, snapshotPollStamp]);
+
+  const reportQuality = useMemo(() => {
+    const snapshots = Object.values(snapshotByTemplateId);
+    if (snapshots.length === 0) return null;
+    const blocked = snapshots.find((snapshot) => snapshot.qualityStatus === 'BLOCKED');
+    const checking = snapshots.find((snapshot) => snapshot.qualityStatus === 'CHECKING');
+    const cutoff = snapshots
+      .map((snapshot) => snapshot.dataCutoffAt || snapshot.sourceSyncAt)
+      .filter((value): value is string => Boolean(value))
+      .sort()
+      .at(0);
+    if (blocked) {
+      return { status: 'blocked' as const, text: 'Цифры скрыты: обнаружено расхождение с amoCRM.' };
+    }
+    if (checking) {
+      return {
+        status: 'checking' as const,
+        text: `Обновляем данны. Показан последний проверенный снимок${cutoff ? ` на ${formatDateTime(cutoff)}` : ''}.`,
+      };
+    }
+    return {
+      status: 'certified' as const,
+      text: `Проверено с amoCRM${cutoff ? `, данны актуальны на ${formatDateTime(cutoff)}` : ''}.`,
+    };
+  }, [snapshotByTemplateId]);
 
   const renderWidget = (template: ReportTemplate) => (
     <ReportWidget
@@ -1170,6 +1237,12 @@ function WorkspaceTab({
           <p className="page-description">
             Продажи, CSM и прогноз по актуальным данным amoCRM.
           </p>
+          {reportQuality && (
+            <div className={`report-quality report-quality-${reportQuality.status}`} role="status">
+              {reportQuality.status === 'certified' ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}
+              <span>{reportQuality.text}</span>
+            </div>
+          )}
         </div>
       </div>
 
@@ -1458,8 +1531,10 @@ function ReportWidget({
       return;
     }
 
-    if (currentSnapshot.status === 'ERROR' && !hasLoadedRef.current) {
-      setError(currentSnapshot.refreshError || 'Не удалось посчитать отчёт');
+    if ((currentSnapshot.status === 'ERROR' || currentSnapshot.qualityStatus === 'BLOCKED') && !hasLoadedRef.current) {
+      setError(currentSnapshot.qualityStatus === 'BLOCKED'
+        ? 'Цифры скрыты: обнаружено расхождение с amoCRM.'
+        : currentSnapshot.refreshError || 'Не удалось посчитать отчёт');
       setLoading(false);
       return;
     }
@@ -1524,23 +1599,6 @@ function writeReportWidgetCache(cacheKey: string, result: Record<string, any>) {
   } catch {
     // Cache is best-effort. Reports still work without it.
   }
-}
-
-async function mapWithConcurrency<T, R>(items: T[], concurrency: number, worker: (item: T) => Promise<R>): Promise<R[]> {
-  const results: R[] = [];
-  let cursor = 0;
-
-  async function runNext() {
-    while (cursor < items.length) {
-      const index = cursor;
-      cursor += 1;
-      results[index] = await worker(items[index]);
-    }
-  }
-
-  const runners = Array.from({ length: Math.min(concurrency, items.length) }, () => runNext());
-  await Promise.all(runners);
-  return results;
 }
 
 function stableStringify(value: unknown): string {
@@ -3708,6 +3766,1520 @@ function planFactSaveLabel(state: 'dirty' | 'saving' | 'saved' | 'error') {
 function currentMonthInput() {
   const date = new Date();
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+}
+
+type RopFilterOption = {
+  id: string;
+  name: string;
+  secondary?: string | null;
+  groupId?: string | null;
+  groupName?: string | null;
+  departmentId?: string | null;
+  departmentKey?: string | null;
+  departmentName?: string | null;
+};
+
+type RopStageSlaDraft = {
+  isEnabled: boolean;
+  slaDays: string;
+  reason: string;
+};
+
+type RopPeriodPreset = 'today' | 'yesterday' | 'this_week' | 'this_month';
+type RopPriorityFilter = RopActionPriority | 'all';
+
+const ROP_ACTION_QUEUE_CONFIG: Array<{
+  key: RopActionQueueKey;
+  label: string;
+  defaultAction: string;
+  emptyText: string;
+}> = [
+  {
+    key: 'pendingEmails',
+    label: 'Письма без ответа',
+    defaultAction: 'Ответить на последнее письмо клиента',
+    emptyText: 'Нет писем клиента без ответа.',
+  },
+  {
+    key: 'noNextStep',
+    label: 'Без следующего шага',
+    defaultAction: 'Поставить следующую задачу',
+    emptyText: 'Нет сделок без следующего шага.',
+  },
+  {
+    key: 'overdueTasks',
+    label: 'Просроченные задачи',
+    defaultAction: 'Закрыть просроченную задачу в amoCRM',
+    emptyText: 'Нет просроченных задач.',
+  },
+  {
+    key: 'offerTouches',
+    label: 'КП без касания',
+    defaultAction: 'Связаться с клиентом по отправленному КП',
+    emptyText: 'Нет отправленных КП, по которым сегодня нужен контакт.',
+  },
+  {
+    key: 'stuckDeals',
+    label: 'Зависшие сделки',
+    defaultAction: 'Разобрать сделку без движения',
+    emptyText: 'Нет сделок, которые лежат на этапе дольше SLA.',
+  },
+  {
+    key: 'crmIssues',
+    label: 'CRM-ошибки',
+    defaultAction: 'Исправить ведение сделки в amoCRM',
+    emptyText: 'Нет найденных проблем по ведению amoCRM.',
+  },
+  {
+    key: 'riskDeals',
+    label: 'Рисковые сделки',
+    defaultAction: 'Помочь менеджеру вернуть сделку в работу',
+    emptyText: 'Нет сделок с явными признаками риска.',
+  },
+];
+
+const ROP_PERIOD_OPTIONS: Array<{ id: RopPeriodPreset; label: string }> = [
+  { id: 'today', label: 'Сегодня' },
+  { id: 'yesterday', label: 'Вчера' },
+  { id: 'this_week', label: 'Эта неделя' },
+  { id: 'this_month', label: 'Этот месяц' },
+];
+
+const ROP_PRIORITY_FILTER_OPTIONS: Array<{ id: RopPriorityFilter; label: string }> = [
+  { id: 'all', label: 'Все риски' },
+  { id: 'critical', label: 'Срочно' },
+  { id: 'warning', label: 'Сегодня' },
+  { id: 'info', label: 'Низко' },
+];
+
+function normalizeRopDepartments(data: RopDashboardResponse | null): RopDepartmentDashboard[] {
+  const result = new Map<string, RopDepartmentDashboard>();
+  const sourceDepartments = data?.departments ?? [];
+  for (const department of sourceDepartments) {
+    if (!isRopDepartmentAllowed(department)) continue;
+    const id = safeRopId(department.id, department.key, department.name);
+    if (!id) continue;
+    result.set(id, {
+      id,
+      key: department.key ?? null,
+      name: department.label || department.name || id,
+      label: department.label ?? null,
+      summary: department.summary,
+      managerRows: (department.managerRows ?? [])
+        .filter((row) => row.managerId && isActiveRopManager(row))
+        .map((row) => ({
+          ...row,
+          managerId: String(row.managerId),
+          departmentId: row.departmentId ?? id,
+          departmentKey: row.departmentKey ?? department.key ?? null,
+          departmentName: row.departmentName ?? department.name,
+        })),
+    });
+  }
+
+  for (const department of data?.filters?.departments ?? []) {
+    if (!isRopDepartmentAllowed(department)) continue;
+    const id = safeRopId(department.id, department.key, department.name);
+    if (!id || result.has(id)) continue;
+    result.set(id, {
+      id,
+      key: department.key ?? null,
+      name: department.label || department.name || id,
+      label: department.label ?? null,
+      managerRows: [],
+    });
+  }
+
+  return [...result.values()].sort((left, right) => ropDepartmentOrder(left) - ropDepartmentOrder(right));
+}
+
+function buildRopManagerOptions(data: RopDashboardResponse | null, departments: RopDepartmentDashboard[]) {
+  const result = new Map<string, RopFilterOption>();
+  const addOption = (option: RopFilterOption) => {
+    if (!option.id) return;
+    const existing = result.get(option.id);
+    result.set(option.id, {
+      ...option,
+      ...existing,
+      name: option.name || existing?.name || option.id,
+      secondary: option.secondary ?? existing?.secondary ?? null,
+      groupId: option.groupId ?? existing?.groupId ?? null,
+      groupName: option.groupName ?? existing?.groupName ?? null,
+      departmentId: option.departmentId ?? existing?.departmentId ?? null,
+      departmentKey: option.departmentKey ?? existing?.departmentKey ?? null,
+      departmentName: option.departmentName ?? existing?.departmentName ?? null,
+    });
+  };
+
+  for (const manager of data?.filters?.managers ?? []) {
+    if (!manager.id || !isActiveRopManager(manager)) continue;
+    const groupName = ropGroupLabel(manager.groupName);
+    addOption({
+      id: manager.id,
+      name: manager.name || manager.id,
+      secondary: groupName ?? ropDepartmentLabel({
+        id: manager.departmentId ?? undefined,
+        key: manager.departmentKey ?? undefined,
+        name: manager.departmentName ?? undefined,
+      }),
+      groupId: manager.groupId ?? null,
+      groupName,
+      departmentId: manager.departmentId ?? null,
+      departmentKey: manager.departmentKey ?? null,
+      departmentName: manager.departmentName ?? null,
+    });
+  }
+
+  for (const department of departments) {
+    for (const row of department.managerRows) {
+      const groupName = ropGroupLabel(row.groupName);
+      addOption({
+        id: row.managerId,
+        name: row.managerName || row.managerId,
+        secondary: groupName ?? ropDepartmentLabel(department),
+        groupId: row.groupId ?? null,
+        groupName,
+        departmentId: row.departmentId ?? department.id,
+        departmentKey: row.departmentKey ?? department.key ?? null,
+        departmentName: row.departmentName ?? department.name,
+      });
+    }
+  }
+
+  return [...result.values()].sort((left, right) => left.name.localeCompare(right.name, 'ru'));
+}
+
+function buildRopGroupOptions(data: RopDashboardResponse | null, managers: RopFilterOption[]) {
+  const result = new Map<string, RopFilterOption>();
+  const addOption = (option: RopFilterOption) => {
+    if (!option.id) return;
+    const existing = result.get(option.id);
+    result.set(option.id, {
+      ...option,
+      ...existing,
+      name: option.name || existing?.name || option.id,
+      departmentId: option.departmentId ?? existing?.departmentId ?? null,
+      departmentKey: option.departmentKey ?? existing?.departmentKey ?? null,
+      departmentName: option.departmentName ?? existing?.departmentName ?? null,
+    });
+  };
+
+  for (const group of data?.filters?.groups ?? []) {
+    addOption({
+      id: group.id,
+      name: ropGroupLabel(group.name) || group.name || group.id,
+      departmentId: group.departmentId ?? null,
+      departmentKey: group.departmentKey ?? null,
+    });
+  }
+
+  for (const manager of managers) {
+    if (!manager.groupId) continue;
+    addOption({
+      id: manager.groupId,
+      name: ropGroupLabel(manager.groupName) || manager.groupName || manager.groupId,
+      departmentId: manager.departmentId ?? null,
+      departmentKey: manager.departmentKey ?? null,
+      departmentName: manager.departmentName ?? null,
+    });
+  }
+
+  return [...result.values()].sort((left, right) => left.name.localeCompare(right.name, 'ru'));
+}
+
+function buildRopPipelineOptions(data: RopDashboardResponse | null) {
+  const result = new Map<string, string>();
+  for (const pipeline of data?.filters?.pipelines ?? []) {
+    if (pipeline.id) result.set(pipeline.id, pipeline.name || pipeline.id);
+  }
+  for (const pipeline of data?.funnel?.pipelines ?? []) {
+    if (pipeline.id) result.set(pipeline.id, pipeline.name || pipeline.id);
+  }
+  for (const stage of data?.funnel?.stages ?? []) {
+    if (stage.pipelineId) result.set(stage.pipelineId, stage.pipelineName || stage.pipelineId);
+  }
+  return [...result.entries()]
+    .map(([id, name]) => ({ id, name }))
+    .sort((left, right) => left.name.localeCompare(right.name, 'ru'));
+}
+
+function buildRopStageOptions(data: RopDashboardResponse | null, pipelineId: string) {
+  const result = new Map<string, RopFilterOption>();
+  for (const stage of data?.filters?.stages ?? []) {
+    if (!stage.id || (pipelineId && stage.pipelineId !== pipelineId)) continue;
+    result.set(stage.id, {
+      id: stage.id,
+      name: stage.name || stage.id,
+      secondary: stage.pipelineName,
+    });
+  }
+  for (const row of data?.funnel?.stages ?? []) {
+    const stageId = ropStageId(row);
+    if (result.has(stageId)) continue;
+    if (!stageId || (pipelineId && row.pipelineId !== pipelineId)) continue;
+    result.set(stageId, {
+      id: stageId,
+      name: ropStageName(row),
+      secondary: row.pipelineName,
+    });
+  }
+  return [...result.values()].sort((left, right) => left.name.localeCompare(right.name, 'ru'));
+}
+
+function buildRopQueueTypeOptions() {
+  return ROP_ACTION_QUEUE_CONFIG.map((queue) => ({
+    id: queue.key,
+    name: queue.label,
+  }));
+}
+
+function buildRopStageSlaRows(settings: RopStageSlaSettingsResponse | null, pipelineId: string) {
+  return (settings?.departments ?? [])
+    .flatMap((department) =>
+      department.pipelines.flatMap((pipeline) =>
+        pipeline.stages
+          .filter((stage) => !pipelineId || stage.pipelineId === pipelineId)
+          .map((stage) => ({
+            ...stage,
+            departmentLabel: ropDepartmentLabel({ key: department.key, name: department.label }),
+          })),
+      ),
+    )
+    .sort(
+      (left, right) =>
+        left.departmentLabel.localeCompare(right.departmentLabel, 'ru') ||
+        left.pipelineName.localeCompare(right.pipelineName, 'ru') ||
+        left.stagePosition - right.stagePosition,
+    );
+}
+
+function buildRopStageSlaDraft(settings: RopStageSlaSettingsResponse | null) {
+  const next: Record<string, RopStageSlaDraft> = {};
+  for (const row of buildRopStageSlaRows(settings, '')) {
+    next[ropStageSlaKey(row)] = {
+      isEnabled: row.isEnabled,
+      slaDays: row.slaDays === null || row.slaDays === undefined ? '' : String(row.slaDays),
+      reason: row.reason ?? '',
+    };
+  }
+  return next;
+}
+
+function ropStageSlaKey(row: Pick<RopStageSlaRuleRow, 'departmentKey' | 'stageId'>) {
+  return `${row.departmentKey}:${row.stageId}`;
+}
+
+function toggleRopSelection(allIds: string[], selectedIds: string[], id: string) {
+  const selected = selectedIds.length === 0 ? new Set(allIds) : new Set(selectedIds.filter((item) => allIds.includes(item)));
+  if (selected.has(id)) selected.delete(id);
+  else selected.add(id);
+  const next = [...selected].filter((item) => allIds.includes(item));
+  return next.length === allIds.length ? [] : next;
+}
+
+function pruneRopSelection(selectedIds: string[], allowedIds: string[]) {
+  if (selectedIds.length === 0) return selectedIds;
+  const next = selectedIds.filter((id) => allowedIds.includes(id));
+  if (next.length === selectedIds.length) return selectedIds;
+  return next.length === allowedIds.length ? [] : next;
+}
+
+function buildRopDepartmentTokenSet(departments: RopDepartmentDashboard[], selectedIds: string[]) {
+  const tokens = new Set<string>();
+  if (selectedIds.length === 0) return tokens;
+  for (const department of departments) {
+    if (!selectedIds.includes(department.id)) continue;
+    for (const value of [department.id, department.key, department.name, ropDepartmentLabel(department)]) {
+      const token = normalizeRopText(value);
+      if (token) tokens.add(token);
+    }
+  }
+  return tokens;
+}
+
+function ropOptionMatchesDepartments(option: RopFilterOption, departmentTokens: Set<string>) {
+  if (departmentTokens.size === 0) return true;
+  const optionTokens = [option.departmentId, option.departmentKey, option.departmentName].map(normalizeRopText).filter(Boolean);
+  return optionTokens.length === 0 || optionTokens.some((token) => departmentTokens.has(token));
+}
+
+function isActiveRopManager(item: { active?: boolean; isActive?: boolean }) {
+  return item.active !== false && item.isActive !== false;
+}
+
+function isRopDepartmentAllowed(department: { id?: string | null; key?: string | null; name?: string | null }) {
+  const token = normalizeRopText(`${department.id ?? ''} ${department.key ?? ''} ${department.name ?? ''}`);
+  return token.includes('sales') || token.includes('продаж') || token.includes('csm');
+}
+
+function ropDepartmentOrder(department: { id?: string | null; key?: string | null; name?: string | null }) {
+  const token = normalizeRopText(`${department.id ?? ''} ${department.key ?? ''} ${department.name ?? ''}`);
+  if (token.includes('sales') || token.includes('продаж')) return 0;
+  if (token.includes('csm')) return 1;
+  return 2;
+}
+
+function ropDepartmentLabel(department: { id?: string | null; key?: string | null; name?: string | null }) {
+  const token = normalizeRopText(`${department.id ?? ''} ${department.key ?? ''} ${department.name ?? ''}`);
+  if (token.includes('sales') || token.includes('продаж')) return 'Продажи';
+  if (token.includes('csm')) return 'CSM';
+  return department.name || department.id || 'Отдел';
+}
+
+function ropGroupLabel(name: string | null | undefined) {
+  const token = normalizeRopText(name);
+  if (token === 'sales') return 'Продажи';
+  return name?.trim() || null;
+}
+
+function safeRopId(...values: Array<string | null | undefined>) {
+  return values.find((value) => value && value.trim())?.trim() ?? '';
+}
+
+function normalizeRopText(value: string | null | undefined) {
+  return String(value ?? '').trim().toLowerCase();
+}
+
+function normalizeRopSearch(value: string | null | undefined) {
+  return normalizeRopText(value).replace(/\s+/g, ' ');
+}
+
+function ropManagerMatchesSearch(row: RopManagerRow, query: string) {
+  if (!query) return true;
+  return normalizeRopSearch([row.managerName, row.groupName, row.departmentName].filter(Boolean).join(' ')).includes(query);
+}
+
+function ropActionMatchesSearch(row: RopActionQueueItem, query: string) {
+  if (!query) return true;
+  return normalizeRopSearch([
+    row.title,
+    row.action,
+    row.reason,
+    row.dealTitle,
+    row.managerName,
+    row.groupName,
+    row.pipelineName,
+    row.stageName,
+  ].filter(Boolean).join(' ')).includes(query);
+}
+
+function ropActionMatchesStage(row: RopActionQueueItem, selectedStageIds: string[]) {
+  return selectedStageIds.length === 0 || Boolean(row.stageId && selectedStageIds.includes(row.stageId));
+}
+
+function ropActionMatchesProblem(row: RopActionQueueItem, selectedQueueKeys: string[]) {
+  if (selectedQueueKeys.length === 0) return true;
+  return selectedQueueKeys.some((key) => ropActionTypeMatchesQueue(row, key as RopActionQueueKey));
+}
+
+function ropActionMatchesPriority(row: RopActionQueueItem, priority: RopPriorityFilter) {
+  return priority === 'all' || row.priority === priority;
+}
+
+function ropActionTypeMatchesQueue(row: RopActionQueueItem, queueKey: RopActionQueueKey) {
+  if (queueKey === 'offerTouches') return row.type === 'offer_touch';
+  if (queueKey === 'pendingEmails') return row.type === 'pending_email';
+  if (queueKey === 'overdueTasks') return row.type === 'overdue_task';
+  if (queueKey === 'noNextStep') return row.type === 'no_next_step';
+  if (queueKey === 'stuckDeals') return row.type === 'stuck_deal';
+  if (queueKey === 'crmIssues') return row.type === 'crm_issue';
+  return row.type === 'risk_deal';
+}
+
+function ropManagerMetricByQueue(row: RopManagerRow, queueKey: RopActionQueueKey) {
+  if (queueKey === 'offerTouches') return ropMetric(row.offerTouches);
+  if (queueKey === 'pendingEmails') return ropMetric(row.pendingEmails);
+  if (queueKey === 'overdueTasks') return ropMetric(row.overdueTasks);
+  if (queueKey === 'noNextStep') return ropMetric(row.noNextStep);
+  if (queueKey === 'stuckDeals') return ropMetric(row.stuckDeals);
+  if (queueKey === 'crmIssues') return ropMetric(row.crmIssues);
+  return ropMetric(row.riskDeals);
+}
+
+function ropVisibleManagerIdsByActions(queues: Record<RopActionQueueKey, RopActionQueueItem[]>) {
+  const ids = new Set<string>();
+  for (const rows of Object.values(queues)) {
+    for (const row of rows) {
+      if (row.managerId) ids.add(row.managerId);
+    }
+  }
+  return ids;
+}
+
+function ropBuildSummary(departments: RopDepartmentDashboard[]) {
+  const rows = departments.flatMap((department) => department.managerRows);
+  const openDeals = rows.reduce((sum, row) => sum + ropMetric(row.openDeals), 0);
+  const riskDeals = rows.reduce((sum, row) => sum + ropMetric(row.riskDeals), 0);
+  const qualityValues = rows.map((row) => ropMetric(row.crmQualityPercent));
+  return {
+    managers: rows.length,
+    tasksTotal: rows.reduce((sum, row) => sum + ropMetric(row.tasksTodayTotal), 0),
+    tasksDone: rows.reduce((sum, row) => sum + ropMetric(row.tasksTodayDone), 0),
+    overdueTasks: rows.reduce((sum, row) => sum + ropMetric(row.overdueTasks), 0),
+    taskReschedules: rows.reduce((sum, row) => sum + ropMetric(row.taskReschedules), 0),
+    noNextStep: rows.reduce((sum, row) => sum + ropMetric(row.noNextStep), 0),
+    stuckDeals: rows.reduce((sum, row) => sum + ropMetric(row.stuckDeals), 0),
+    crmIssues: rows.reduce((sum, row) => sum + ropMetric(row.crmIssues), 0),
+    riskDeals,
+    openDeals,
+    crmQualityPercent: qualityValues.length
+      ? qualityValues.reduce((sum, value) => sum + value, 0) / qualityValues.length
+      : 100,
+  };
+}
+
+function ropFindManagerRow(departments: RopDepartmentDashboard[], managerId: string) {
+  for (const department of departments) {
+    const row = department.managerRows.find((manager) => manager.managerId === managerId);
+    if (row) return row;
+  }
+  return null;
+}
+
+function ropManagerQueueItems(queues: Record<RopActionQueueKey, RopActionQueueItem[]>, managerId: string) {
+  return ROP_ACTION_QUEUE_CONFIG.flatMap((queue) =>
+    (queues[queue.key] ?? [])
+      .filter((row) => row.managerId === managerId)
+      .map((row) => ({ ...row, queueLabel: queue.label, queueKey: queue.key })),
+  );
+}
+
+function RopDashboardTab() {
+  const [data, setData] = useState<RopDashboardResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [selectedDepartmentIds, setSelectedDepartmentIds] = useState<string[]>([]);
+  const [selectedGroupIds, setSelectedGroupIds] = useState<string[]>([]);
+  const [selectedManagerIds, setSelectedManagerIds] = useState<string[]>([]);
+  const [periodPreset, setPeriodPreset] = useState<RopPeriodPreset>('today');
+  const [selectedStageIds, setSelectedStageIds] = useState<string[]>([]);
+  const [selectedQueueKeys, setSelectedQueueKeys] = useState<string[]>([]);
+  const [priorityFilter, setPriorityFilter] = useState<RopPriorityFilter>('all');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedManagerId, setSelectedManagerId] = useState('');
+  const [activeQueueKey, setActiveQueueKey] = useState<RopActionQueueKey>('pendingEmails');
+  const [pipelineId, setPipelineId] = useState('');
+  const [slaSettings, setSlaSettings] = useState<RopStageSlaSettingsResponse | null>(null);
+  const [slaDraft, setSlaDraft] = useState<Record<string, RopStageSlaDraft>>({});
+  const [slaLoading, setSlaLoading] = useState(false);
+  const [slaSavingKey, setSlaSavingKey] = useState('');
+  const [slaError, setSlaError] = useState('');
+
+  const load = useCallback(async () => {
+    try {
+      const query = new URLSearchParams();
+      if (selectedDepartmentIds.length) query.set('departments', selectedDepartmentIds.join(','));
+      if (selectedGroupIds.length) query.set('groupIds', selectedGroupIds.join(','));
+      if (selectedManagerIds.length) query.set('managerIds', selectedManagerIds.join(','));
+      if (periodPreset !== 'today') query.set('periodPreset', periodPreset);
+      if (pipelineId) query.set('pipelineId', pipelineId);
+      if (selectedStageIds.length) query.set('stageIds', selectedStageIds.join(','));
+      const suffix = query.toString();
+      const next = await api<RopDashboardResponse>(`/platform/rop-dashboard-v2${suffix ? `?${suffix}` : ''}`);
+      setData(next);
+      setError('');
+    } catch (err) {
+      setError(readApiError(err, 'Не удалось загрузить Пульт РОПа'));
+    } finally {
+      setLoading(false);
+    }
+  }, [periodPreset, pipelineId, selectedDepartmentIds, selectedGroupIds, selectedManagerIds, selectedStageIds]);
+
+  const loadSlaSettings = useCallback(async () => {
+    try {
+      setSlaLoading(true);
+      const next = await api<RopStageSlaSettingsResponse>('/settings/rop-stage-sla');
+      setSlaSettings(next);
+      setSlaDraft(buildRopStageSlaDraft(next));
+      setSlaError('');
+    } catch (err) {
+      setSlaError(readApiError(err, 'Не удалось загрузить SLA этапов'));
+    } finally {
+      setSlaLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+    const timer = window.setInterval(() => void load(), 60_000);
+    return () => window.clearInterval(timer);
+  }, [load]);
+
+  useEffect(() => {
+    void loadSlaSettings();
+  }, [loadSlaSettings]);
+
+  const departments = useMemo(() => normalizeRopDepartments(data), [data]);
+  const departmentOptions = useMemo(
+    () => departments.map((department) => ({ id: department.id, name: ropDepartmentLabel(department) })),
+    [departments],
+  );
+  const departmentIds = useMemo(() => departmentOptions.map((item) => item.id), [departmentOptions]);
+  const selectedDepartmentTokens = useMemo(
+    () => buildRopDepartmentTokenSet(departments, selectedDepartmentIds),
+    [departments, selectedDepartmentIds],
+  );
+  const managerOptions = useMemo(() => buildRopManagerOptions(data, departments), [data, departments]);
+  const groupOptions = useMemo(
+    () => buildRopGroupOptions(data, managerOptions).filter((group) => ropOptionMatchesDepartments(group, selectedDepartmentTokens)),
+    [data, managerOptions, selectedDepartmentTokens],
+  );
+  const groupIds = useMemo(() => groupOptions.map((item) => item.id), [groupOptions]);
+  const managerOptionsForFilters = useMemo(
+    () =>
+      managerOptions.filter((manager) => {
+        const departmentMatched = ropOptionMatchesDepartments(manager, selectedDepartmentTokens);
+        const groupMatched = selectedGroupIds.length === 0 || Boolean(manager.groupId && selectedGroupIds.includes(manager.groupId));
+        return departmentMatched && groupMatched;
+      }),
+    [managerOptions, selectedDepartmentTokens, selectedGroupIds],
+  );
+  const managerIds = useMemo(() => managerOptionsForFilters.map((item) => item.id), [managerOptionsForFilters]);
+  const effectiveManagerIds = selectedManagerIds.length > 0 ? selectedManagerIds : managerIds;
+  const effectiveManagerSet = useMemo(() => new Set(effectiveManagerIds), [effectiveManagerIds]);
+  const shouldApplyManagerScope =
+    managerOptions.length > 0 || selectedDepartmentIds.length > 0 || selectedGroupIds.length > 0 || selectedManagerIds.length > 0;
+  const activeQueue = ROP_ACTION_QUEUE_CONFIG.find((queue) => queue.key === activeQueueKey) ?? ROP_ACTION_QUEUE_CONFIG[0];
+  const pipelineOptions = useMemo(() => buildRopPipelineOptions(data), [data]);
+  const stageOptions = useMemo(() => buildRopStageOptions(data, pipelineId), [data, pipelineId]);
+  const stageIds = useMemo(() => stageOptions.map((item) => item.id), [stageOptions]);
+  const queueTypeOptions = useMemo(() => buildRopQueueTypeOptions(), []);
+  const normalizedSearch = normalizeRopSearch(searchQuery);
+
+  useEffect(() => {
+    setSelectedDepartmentIds((current) => pruneRopSelection(current, departmentIds));
+  }, [departmentIds]);
+
+  useEffect(() => {
+    setSelectedGroupIds((current) => pruneRopSelection(current, groupIds));
+  }, [groupIds]);
+
+  useEffect(() => {
+    setSelectedManagerIds((current) => pruneRopSelection(current, managerIds));
+  }, [managerIds]);
+
+  useEffect(() => {
+    setSelectedStageIds((current) => pruneRopSelection(current, stageIds));
+  }, [stageIds]);
+
+  const filteredQueues = useMemo(() => {
+    return ROP_ACTION_QUEUE_CONFIG.reduce(
+      (acc, queue) => {
+        acc[queue.key] = (data?.actionQueues?.[queue.key] ?? []).filter((row) =>
+          ropActionMatchesManagerScope(row, effectiveManagerSet, shouldApplyManagerScope) &&
+          ropActionMatchesStage(row, selectedStageIds) &&
+          ropActionMatchesProblem(row, selectedQueueKeys) &&
+          ropActionMatchesPriority(row, priorityFilter) &&
+          ropActionMatchesSearch(row, normalizedSearch),
+        );
+        return acc;
+      },
+      {} as Record<RopActionQueueKey, RopActionQueueItem[]>,
+    );
+  }, [data?.actionQueues, effectiveManagerSet, normalizedSearch, priorityFilter, selectedQueueKeys, selectedStageIds, shouldApplyManagerScope]);
+
+  const managerIdsFromFilteredActions = useMemo(() => ropVisibleManagerIdsByActions(filteredQueues), [filteredQueues]);
+  const hasActionFilters = selectedQueueKeys.length > 0 || priorityFilter !== 'all' || selectedStageIds.length > 0;
+  const displayedDepartments = useMemo(
+    () =>
+      departments
+        .filter((department) => selectedDepartmentIds.length === 0 || selectedDepartmentIds.includes(department.id))
+        .map((department) => ({
+          ...department,
+          managerRows: department.managerRows.filter((row) => {
+            if (!isActiveRopManager(row) || !row.managerId || !effectiveManagerSet.has(row.managerId)) return false;
+            if (hasActionFilters && !managerIdsFromFilteredActions.has(row.managerId)) return false;
+            if (normalizedSearch && !ropManagerMatchesSearch(row, normalizedSearch) && !managerIdsFromFilteredActions.has(row.managerId)) return false;
+            if (selectedQueueKeys.length > 0 && !selectedQueueKeys.some((key) => ropManagerMetricByQueue(row, key as RopActionQueueKey) > 0)) {
+              return managerIdsFromFilteredActions.has(row.managerId);
+            }
+            return true;
+          }),
+        })),
+    [
+      departments,
+      effectiveManagerSet,
+      hasActionFilters,
+      managerIdsFromFilteredActions,
+      normalizedSearch,
+      selectedDepartmentIds,
+      selectedQueueKeys,
+    ],
+  );
+  const summary = useMemo(() => ropBuildSummary(displayedDepartments), [displayedDepartments]);
+  const selectedManager = selectedManagerId ? ropFindManagerRow(displayedDepartments, selectedManagerId) : null;
+  const selectedManagerActions = useMemo(
+    () => (selectedManagerId ? ropManagerQueueItems(filteredQueues, selectedManagerId) : []),
+    [filteredQueues, selectedManagerId],
+  );
+
+  useEffect(() => {
+    if (selectedManagerId && !selectedManager) setSelectedManagerId('');
+  }, [selectedManager, selectedManagerId]);
+
+  useEffect(() => {
+    if (selectedQueueKeys.length > 0 && !selectedQueueKeys.includes(activeQueueKey)) {
+      setActiveQueueKey(selectedQueueKeys[0] as RopActionQueueKey);
+    }
+  }, [activeQueueKey, selectedQueueKeys]);
+
+  const funnelRows = useMemo(
+    () =>
+      (data?.funnel?.stages ?? [])
+        .filter((row) => !pipelineId || row.pipelineId === pipelineId)
+        .filter((row) => selectedStageIds.length === 0 || selectedStageIds.includes(ropStageId(row)))
+        .map((row) => {
+          const topDeals = row.topDeals ?? [];
+          const filteredTopDeals = topDeals.filter((deal) =>
+            ropActionMatchesManagerScope(deal, effectiveManagerSet, shouldApplyManagerScope),
+          );
+          return { ...row, topDeals: filteredTopDeals };
+        })
+        .filter((row) => {
+          const rowStageId = ropStageId(row);
+          const originalTopDeals = data?.funnel?.stages.find((stage) => ropStageId(stage) === rowStageId && stage.pipelineId === row.pipelineId)?.topDeals;
+          return !shouldApplyManagerScope || !originalTopDeals?.length || Boolean(row.topDeals?.length);
+        })
+        .sort((left, right) => (ropStagePosition(left) ?? 0) - (ropStagePosition(right) ?? 0)),
+    [data?.funnel?.stages, effectiveManagerSet, pipelineId, selectedStageIds, shouldApplyManagerScope],
+  );
+  const slaRows = useMemo(() => buildRopStageSlaRows(slaSettings, pipelineId), [pipelineId, slaSettings]);
+
+  const hasAnyData = departments.length > 0 || ROP_ACTION_QUEUE_CONFIG.some((queue) => (data?.actionQueues?.[queue.key] ?? []).length > 0);
+
+  async function saveStageSla(row: RopStageSlaRuleRow) {
+    const key = ropStageSlaKey(row);
+    const draft = slaDraft[key] ?? {
+      isEnabled: row.isEnabled,
+      slaDays: row.slaDays === null || row.slaDays === undefined ? '' : String(row.slaDays),
+      reason: row.reason ?? '',
+    };
+    const slaDays = Number.parseInt(draft.slaDays, 10);
+    if (draft.isEnabled && (!Number.isFinite(slaDays) || slaDays < 1)) {
+      setSlaError('Для включённого SLA укажи число дней от 1.');
+      return;
+    }
+    try {
+      setSlaSavingKey(key);
+      await api('/settings/rop-stage-sla', {
+        method: 'PATCH',
+        body: JSON.stringify({
+          departmentKey: row.departmentKey,
+          stageId: row.stageId,
+          isEnabled: draft.isEnabled,
+          slaDays: draft.isEnabled ? slaDays : undefined,
+          reason: draft.reason.trim() || undefined,
+        }),
+      });
+      await loadSlaSettings();
+      await load();
+      setSlaError('');
+    } catch (err) {
+      setSlaError(readApiError(err, 'Не удалось сохранить SLA этапа'));
+    } finally {
+      setSlaSavingKey('');
+    }
+  }
+
+  return (
+    <section className="grid gap-4">
+      <div className="page-row">
+        <div>
+          <h1 className="page-title">Пульт РОПа</h1>
+          {data && (
+            <p className="page-description">
+              Рабочий контроль продаж и CSM: задачи, письма, КП, CRM-ошибки, риски и зависания. Обновлено: {formatMoscowDateTime(data.generatedAt)}
+            </p>
+          )}
+        </div>
+        <button className="btn" type="button" onClick={() => void load()} disabled={loading}>
+          <RefreshCw size={15} />
+          Обновить
+        </button>
+      </div>
+
+      {error && <div className="alert alert-error"><AlertCircle size={17} />{error}</div>}
+
+      {loading && !data ? (
+        <div className="card p-5 text-sm text-[var(--pb-text-secondary)]">Загрузка Пульта РОПа...</div>
+      ) : !data || !hasAnyData ? (
+        <div className="empty-state">
+          <Users size={24} />
+          <div>
+            <strong>Нет данных для Пульта РОПа</strong>
+            <span>В локальной базе нет активных менеджеров продаж и CSM с реальными amoCRM-учётками.</span>
+          </div>
+        </div>
+      ) : (
+        <>
+          <section className="card">
+            <div className="card-header rop-card-header">
+              <div>
+                <div className="card-title">Фильтры</div>
+              </div>
+              <button
+                className="btn"
+                type="button"
+                onClick={() => {
+                  setSelectedDepartmentIds([]);
+                  setSelectedGroupIds([]);
+                  setSelectedManagerIds([]);
+                  setPeriodPreset('today');
+                  setPipelineId('');
+                  setSelectedStageIds([]);
+                  setSelectedQueueKeys([]);
+                  setPriorityFilter('all');
+                  setSearchQuery('');
+                }}
+              >
+                Сбросить
+              </button>
+            </div>
+            <div className="rop-filter-grid">
+              <label className="rop-filter-block">
+                <span className="rop-filter-title">Период</span>
+                <select className="rop-control" value={periodPreset} onChange={(event) => setPeriodPreset(event.target.value as RopPeriodPreset)}>
+                  {ROP_PERIOD_OPTIONS.map((option) => (
+                    <option key={option.id} value={option.id}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="rop-filter-block">
+                <span className="rop-filter-title">Поиск</span>
+                <input
+                  className="rop-control"
+                  value={searchQuery}
+                  onChange={(event) => setSearchQuery(event.target.value)}
+                  placeholder="Менеджер, сделка, этап или причина"
+                />
+              </label>
+              <label className="rop-filter-block">
+                <span className="rop-filter-title">Воронка</span>
+                <select className="rop-control" value={pipelineId} onChange={(event) => setPipelineId(event.target.value)} disabled={pipelineOptions.length === 0}>
+                  <option value="">Все воронки</option>
+                  {pipelineOptions.map((pipeline) => (
+                    <option key={pipeline.id} value={pipeline.id}>{pipeline.name}</option>
+                  ))}
+                </select>
+              </label>
+              <RopFilterPicker
+                title="Отдел"
+                allLabel="Все отделы"
+                emptyText="Продажи и CSM не пришли из API."
+                options={departmentOptions}
+                selectedIds={selectedDepartmentIds}
+                onChange={setSelectedDepartmentIds}
+              />
+              <RopFilterPicker
+                title="Группа"
+                allLabel="Все группы"
+                emptyText="Нет групп в выбранных отделах."
+                options={groupOptions}
+                selectedIds={selectedGroupIds}
+                onChange={setSelectedGroupIds}
+              />
+              <RopFilterPicker
+                title="Менеджеры"
+                allLabel="Все менеджеры"
+                emptyText="Нет активных менеджеров под выбранные фильтры."
+                options={managerOptionsForFilters}
+                selectedIds={selectedManagerIds}
+                onChange={setSelectedManagerIds}
+              />
+              <RopFilterPicker
+                title="Этап"
+                allLabel="Все этапы"
+                emptyText={pipelineId ? 'В выбранной воронке нет этапов с открытыми сделками.' : 'Нет этапов с открытыми сделками.'}
+                options={stageOptions}
+                selectedIds={selectedStageIds}
+                onChange={setSelectedStageIds}
+              />
+              <RopFilterPicker
+                title="Тип проблемы"
+                allLabel="Все типы проблем"
+                emptyText="Типы проблем не загружены."
+                options={queueTypeOptions}
+                selectedIds={selectedQueueKeys}
+                onChange={setSelectedQueueKeys}
+              />
+              <label className="rop-filter-block">
+                <span className="rop-filter-title">Срочность</span>
+                <select className="rop-control" value={priorityFilter} onChange={(event) => setPriorityFilter(event.target.value as RopPriorityFilter)}>
+                  {ROP_PRIORITY_FILTER_OPTIONS.map((option) => (
+                    <option key={option.id} value={option.id}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
+            </div>
+          </section>
+
+          <RopTeamSummary summary={summary} periodLabel={data.filters.period?.label ?? ROP_PERIOD_OPTIONS.find((option) => option.id === periodPreset)?.label ?? 'Сегодня'} onQueueSelect={setActiveQueueKey} />
+
+          {displayedDepartments.map((department) => (
+            <RopManagersTable
+              key={department.id}
+              department={department}
+              selectedManagerId={selectedManagerId}
+              onSelectManager={setSelectedManagerId}
+            />
+          ))}
+
+          {selectedManager && (
+            <RopManagerDetail row={selectedManager} actions={selectedManagerActions} onClose={() => setSelectedManagerId('')} />
+          )}
+
+          <section className="card">
+            <div className="card-header rop-card-header">
+              <div>
+                <div className="card-title">Очереди действий</div>
+              </div>
+              <div className="rop-queue-tabs" role="tablist" aria-label="Очереди действий">
+                {ROP_ACTION_QUEUE_CONFIG.map((queue) => (
+                  <button
+                    key={queue.key}
+                    className={`rop-queue-tab ${activeQueueKey === queue.key ? 'active' : ''}`}
+                    type="button"
+                    onClick={() => setActiveQueueKey(queue.key)}
+                  >
+                    {queue.label}
+                    <span className="mono-num">{formatNumber(filteredQueues[queue.key]?.length ?? 0)}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+            <RopActionQueueTable queueKey={activeQueue.key} rows={filteredQueues[activeQueue.key] ?? []} emptyText={activeQueue.emptyText} />
+          </section>
+
+          <RopStageBottlenecksTable pipelineId={pipelineId} pipelines={pipelineOptions} rows={funnelRows} onPipelineChange={setPipelineId} />
+          <RopStageSlaSettingsPanel
+            loading={slaLoading}
+            rows={slaRows}
+            draft={slaDraft}
+            error={slaError}
+            savingKey={slaSavingKey}
+            onDraftChange={setSlaDraft}
+            onSave={saveStageSla}
+          />
+        </>
+      )}
+    </section>
+  );
+}
+
+function RopTeamSummary({
+  summary,
+  periodLabel,
+  onQueueSelect,
+}: {
+  summary: ReturnType<typeof ropBuildSummary>;
+  periodLabel: string;
+  onQueueSelect: (queueKey: RopActionQueueKey) => void;
+}) {
+  return (
+    <section className="card">
+      <div className="card-header rop-card-header">
+        <div>
+          <div className="card-title">Сводка по команде</div>
+          <p className="rop-card-note">Срез: {periodLabel}</p>
+        </div>
+      </div>
+      <div className="rop-summary-grid">
+        <div className="rop-summary-item">
+          <span>Менеджеров</span>
+          <strong className="mono-num">{formatNumber(summary.managers)}</strong>
+        </div>
+        <div className="rop-summary-item">
+          <span>Задачи периода</span>
+          <strong className="mono-num">{formatNumber(summary.tasksDone)} / {formatNumber(summary.tasksTotal)}</strong>
+        </div>
+        <button className="rop-summary-item" type="button" onClick={() => onQueueSelect('overdueTasks')}>
+          <span>Просрочено</span>
+          <strong className="mono-num">{formatNumber(summary.overdueTasks)}</strong>
+        </button>
+        <div className="rop-summary-item">
+          <span>Переносы задач</span>
+          <strong className="mono-num">{formatNumber(summary.taskReschedules)}</strong>
+        </div>
+        <button className="rop-summary-item" type="button" onClick={() => onQueueSelect('noNextStep')}>
+          <span>Без следующего шага</span>
+          <strong className="mono-num">{formatNumber(summary.noNextStep)}</strong>
+        </button>
+        <button className="rop-summary-item" type="button" onClick={() => onQueueSelect('stuckDeals')}>
+          <span>Зависшие сделки</span>
+          <strong className="mono-num">{formatNumber(summary.stuckDeals)}</strong>
+        </button>
+        <button className="rop-summary-item" type="button" onClick={() => onQueueSelect('crmIssues')}>
+          <span>CRM-ошибки</span>
+          <strong className="mono-num">{formatNumber(summary.crmIssues)}</strong>
+        </button>
+        <button className="rop-summary-item" type="button" onClick={() => onQueueSelect('riskDeals')}>
+          <span>Рисковые сделки</span>
+          <strong className="mono-num">{formatNumber(summary.riskDeals)}</strong>
+        </button>
+        <div className="rop-summary-item">
+          <span>Качество CRM</span>
+          <strong className="mono-num">{formatPercent(summary.crmQualityPercent)}</strong>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function RopManagerDetail({
+  row,
+  actions,
+  onClose,
+}: {
+  row: RopManagerRow;
+  actions: Array<RopActionQueueItem & { queueLabel: string; queueKey: RopActionQueueKey }>;
+  onClose: () => void;
+}) {
+  const visibleActions = actions.slice(0, 30);
+  return (
+    <section className="card">
+      <div className="card-header rop-card-header">
+        <div>
+          <div className="card-title">Карточка менеджера: {row.managerName}</div>
+          <p className="rop-card-note">{ropGroupLabel(row.groupName) || ropDepartmentLabel({ id: row.departmentId, key: row.departmentKey, name: row.departmentName })}</p>
+        </div>
+        <button className="btn" type="button" onClick={onClose}>
+          Закрыть
+        </button>
+      </div>
+      <div className="rop-manager-detail-grid">
+        <InfoRow label="Активные сделки" value={`${formatNumber(ropMetric(row.openDeals))} / ${formatMoney(ropMetric(row.openAmount))}`} />
+        <InfoRow label="Задачи периода" value={`${formatNumber(ropMetric(row.tasksTodayDone))} / ${formatNumber(ropMetric(row.tasksTodayTotal))}`} />
+        <InfoRow label="Просрочено" value={formatNumber(ropMetric(row.overdueTasks))} />
+        <InfoRow label="Переносы задач" value={formatNumber(ropMetric(row.taskReschedules))} />
+        <InfoRow label="Без следующего шага" value={formatNumber(ropMetric(row.noNextStep))} />
+        <InfoRow label="Зависшие сделки" value={formatNumber(ropMetric(row.stuckDeals))} />
+        <InfoRow label="Качество CRM" value={formatPercent(ropMetric(row.crmQualityPercent))} />
+      </div>
+      {visibleActions.length === 0 ? (
+        <div className="card-body text-sm text-[var(--pb-text-secondary)]">По выбранным фильтрам у менеджера нет строк в очередях действий.</div>
+      ) : (
+        <div className="rop-table-wrap">
+          <table className="table rop-manager-detail-table">
+            <thead>
+              <tr>
+                <th>Очередь</th>
+                <th>Срочность</th>
+                <th>Что сделать</th>
+                <th>Сделка</th>
+                <th>Воронка / этап</th>
+                <th>Возраст / срок</th>
+                <th>Сумма</th>
+              </tr>
+            </thead>
+            <tbody>
+              {visibleActions.map((action) => (
+                <tr key={`${action.queueKey}:${action.id}`}>
+                  <td>{action.queueLabel}</td>
+                  <td><span className={`rop-priority ${ropPriorityClass(action.priority)}`}>{ropPriorityLabel(action.priority)}</span></td>
+                  <td>
+                    <span className="rop-primary">{action.action || action.title || ropQueueDefaultAction(action.queueKey)}</span>
+                    {action.reason && <span className="rop-secondary">{action.reason}</span>}
+                  </td>
+                  <td>
+                    {action.dealUrl ? (
+                      <a className="rop-link" href={action.dealUrl} target="_blank" rel="noreferrer">{action.dealTitle || 'Сделка'}</a>
+                    ) : (
+                      <span>{action.dealTitle || '-'}</span>
+                    )}
+                  </td>
+                  <td>
+                    <span className="rop-primary">{action.stageName || '-'}</span>
+                    {action.pipelineName && <span className="rop-secondary">{action.pipelineName}</span>}
+                  </td>
+                  <td className="mono-num">{formatRopActionAge(action)}</td>
+                  <td className="mono-num">{formatMoney(ropMetric(action.amount))}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function RopManagersTable({
+  department,
+  selectedManagerId,
+  onSelectManager,
+}: {
+  department: RopDepartmentDashboard;
+  selectedManagerId: string;
+  onSelectManager: (managerId: string) => void;
+}) {
+  const rows = department.managerRows;
+  return (
+    <section className="card">
+      <div className="card-header">
+        <div>
+          <div className="card-title">{ropDepartmentLabel(department)}</div>
+        </div>
+      </div>
+      {rows.length === 0 ? (
+        <div className="card-body text-sm text-[var(--pb-text-secondary)]">Нет активных менеджеров под выбранные фильтры.</div>
+      ) : (
+        <div className="rop-table-wrap">
+          <table className="table rop-manager-table">
+            <thead>
+              <tr>
+                <th>Менеджер</th>
+                <th>Статус</th>
+                <th>Задачи периода</th>
+                <th>Просроченные задачи</th>
+                <th>Переносы задач</th>
+                <th>Без следующего шага</th>
+                <th>Письма без ответа</th>
+                <th>КП без касания</th>
+                <th>Рисковые сделки</th>
+                <th>CRM-ошибки</th>
+                <th>Качество CRM</th>
+                <th>Зависшие сделки</th>
+                <th>Сделки</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <tr key={row.managerId} className={selectedManagerId === row.managerId ? 'rop-row-selected' : ''}>
+                  <th>
+                    <button className="rop-manager-button" type="button" onClick={() => onSelectManager(row.managerId)}>
+                      <span className="rop-primary">{row.managerName}</span>
+                      {ropGroupLabel(row.groupName) && <span className="rop-secondary">{ropGroupLabel(row.groupName)}</span>}
+                    </button>
+                  </th>
+                  <td><span className={`rop-status ${ropManagerStatusClass(row)}`}>{ropManagerStatusLabel(row)}</span></td>
+                  <td className="mono-num">{formatNumber(ropMetric(row.tasksTodayDone))} / {formatNumber(ropMetric(row.tasksTodayTotal))}</td>
+                  <td className="mono-num rop-danger">{formatNumber(ropMetric(row.overdueTasks))}</td>
+                  <td className="mono-num">{formatNumber(ropMetric(row.taskReschedules))}</td>
+                  <td className="mono-num rop-danger">{formatNumber(ropMetric(row.noNextStep))}</td>
+                  <td className="mono-num">{formatNumber(ropMetric(row.pendingEmails))}</td>
+                  <td className="mono-num">{formatNumber(ropMetric(row.offerTouches))}</td>
+                  <td className="mono-num">{formatNumber(ropMetric(row.riskDeals))}</td>
+                  <td className="mono-num">{formatNumber(ropMetric(row.crmIssues))}</td>
+                  <td className="mono-num">{formatPercent(ropMetric(row.crmQualityPercent))}</td>
+                  <td className="mono-num">{formatNumber(ropMetric(row.stuckDeals))}</td>
+                  <td>
+                    <span className="mono-num">{formatNumber(ropMetric(row.openDeals))}</span>
+                    <span className="rop-secondary">{formatMoney(ropMetric(row.openAmount))}</span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function RopActionQueueTable({ queueKey, rows, emptyText }: { queueKey: RopActionQueueKey; rows: RopActionQueueItem[]; emptyText: string }) {
+  if (rows.length === 0) {
+    return <div className="card-body text-sm text-[var(--pb-text-secondary)]">{emptyText}</div>;
+  }
+
+  return (
+    <div className="rop-table-wrap">
+      <table className="table rop-action-table">
+        <thead>
+          <tr>
+            <th>Срочность</th>
+            <th>Что сделать</th>
+            <th>Сделка</th>
+            <th>Менеджер</th>
+            <th>Воронка / этап</th>
+            <th>Возраст / срок</th>
+            <th>Сумма</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={row.id}>
+              <td><span className={`rop-priority ${ropPriorityClass(row.priority)}`}>{ropPriorityLabel(row.priority)}</span></td>
+              <td>
+                <span className="rop-primary">{row.action || row.title || ropQueueDefaultAction(queueKey)}</span>
+                {row.reason && <span className="rop-secondary">{row.reason}</span>}
+              </td>
+              <td>
+                {row.dealUrl ? (
+                  <a className="rop-link" href={row.dealUrl} target="_blank" rel="noreferrer">{row.dealTitle || 'Сделка'}</a>
+                ) : (
+                  <span>{row.dealTitle || '-'}</span>
+                )}
+              </td>
+              <td>
+                <span className="rop-primary">{row.managerName || '-'}</span>
+                {ropGroupLabel(row.groupName) && <span className="rop-secondary">{ropGroupLabel(row.groupName)}</span>}
+              </td>
+              <td>
+                <span className="rop-primary">{row.stageName || '-'}</span>
+                {row.pipelineName && <span className="rop-secondary">{row.pipelineName}</span>}
+              </td>
+              <td className="mono-num">{formatRopActionAge(row)}</td>
+              <td className="mono-num">{formatMoney(ropMetric(row.amount))}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function RopStageBottlenecksTable({
+  pipelineId,
+  pipelines,
+  rows,
+  onPipelineChange,
+}: {
+  pipelineId: string;
+  pipelines: Array<{ id: string; name: string }>;
+  rows: RopFunnelStageRow[];
+  onPipelineChange: (pipelineId: string) => void;
+}) {
+  return (
+    <section className="card">
+      <div className="card-header rop-card-header">
+        <div>
+          <div className="card-title">Зависания воронки</div>
+          <p className="rop-card-note">Этап считается зависшим, если сделки лежат на нём дольше SLA этого этапа.</p>
+        </div>
+        <label className="rop-select-label">
+          <span>Воронка</span>
+          <select value={pipelineId} onChange={(event) => onPipelineChange(event.target.value)} disabled={pipelines.length === 0}>
+            {pipelines.length === 0 ? (
+              <option value="">Нет воронок</option>
+            ) : (
+              <>
+                <option value="">Все воронки</option>
+                {pipelines.map((pipeline) => (
+                  <option key={pipeline.id} value={pipeline.id}>
+                    {pipeline.name}
+                  </option>
+                ))}
+              </>
+            )}
+          </select>
+        </label>
+      </div>
+      {rows.length === 0 ? (
+        <div className="card-body text-sm text-[var(--pb-text-secondary)]">По выбранной воронке и менеджерам зависших этапов нет.</div>
+      ) : (
+        <div className="rop-table-wrap">
+          <table className="table rop-stage-table">
+            <thead>
+              <tr>
+                <th>Этап</th>
+                <th>Открыто</th>
+                <th>Зависло</th>
+                <th>Сумма зависших</th>
+                <th>Средний возраст</th>
+                <th>SLA</th>
+                <th>Первые сделки</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <tr key={`${row.pipelineId}:${ropStageId(row)}`}>
+                  <th>
+                    <span className="rop-primary">{ropStageName(row)}</span>
+                    <span className="rop-secondary">{row.pipelineName}</span>
+                    {row.reason && <span className="rop-secondary">{row.reason}</span>}
+                  </th>
+                  <td className="mono-num">{formatNumber(ropMetric(row.openDeals))}</td>
+                  <td className="mono-num rop-danger">{formatNumber(ropMetric(row.stuckDeals))}</td>
+                  <td className="mono-num">{formatMoney(ropMetric(row.stuckAmount))}</td>
+                  <td className="mono-num">{formatRopDays(row.avgStageAgeDays)}</td>
+                  <td className="mono-num">{formatRopSla(row)}</td>
+                  <td><RopDealLinks deals={row.topDeals ?? []} /></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function RopStageSlaSettingsPanel({
+  draft,
+  error,
+  loading,
+  rows,
+  savingKey,
+  onDraftChange,
+  onSave,
+}: {
+  draft: Record<string, RopStageSlaDraft>;
+  error: string;
+  loading: boolean;
+  rows: Array<RopStageSlaRuleRow & { departmentLabel: string }>;
+  savingKey: string;
+  onDraftChange: Dispatch<SetStateAction<Record<string, RopStageSlaDraft>>>;
+  onSave: (row: RopStageSlaRuleRow) => Promise<void>;
+}) {
+  return (
+    <section className="card">
+      <div className="card-header rop-card-header">
+        <div>
+          <div className="card-title">SLA этапов</div>
+          <p className="rop-card-note">Эти пороги определяют, когда сделка попадает в «Зависшие сделки» и «Зависания воронки».</p>
+        </div>
+      </div>
+      {error && <div className="alert alert-error rop-inline-alert"><AlertCircle size={17} />{error}</div>}
+      {loading ? (
+        <div className="card-body text-sm text-[var(--pb-text-secondary)]">Загрузка SLA этапов...</div>
+      ) : rows.length === 0 ? (
+        <div className="card-body text-sm text-[var(--pb-text-secondary)]">В выбранной воронке нет активных этапов продаж или CSM.</div>
+      ) : (
+        <div className="rop-table-wrap">
+          <table className="table rop-sla-table">
+            <thead>
+              <tr>
+                <th>Отдел</th>
+                <th>Этап</th>
+                <th>Открыто</th>
+                <th>SLA</th>
+                <th>Дней</th>
+                <th>Причина</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => {
+                const key = ropStageSlaKey(row);
+                const current = draft[key] ?? {
+                  isEnabled: row.isEnabled,
+                  slaDays: row.slaDays === null || row.slaDays === undefined ? '' : String(row.slaDays),
+                  reason: row.reason ?? '',
+                };
+                return (
+                  <tr key={key}>
+                    <td><span className="rop-primary">{row.departmentLabel}</span></td>
+                    <th>
+                      <span className="rop-primary">{row.stageName}</span>
+                      <span className="rop-secondary">{row.pipelineName}</span>
+                    </th>
+                    <td className="mono-num">{formatNumber(ropMetric(row.openDeals))}</td>
+                    <td>
+                      <label className="rop-sla-toggle">
+                        <input
+                          type="checkbox"
+                          checked={current.isEnabled}
+                          onChange={(event) =>
+                            onDraftChange((items) => ({
+                              ...items,
+                              [key]: { ...current, isEnabled: event.target.checked },
+                            }))
+                          }
+                        />
+                        <span>{current.isEnabled ? 'включён' : 'не применяется'}</span>
+                      </label>
+                    </td>
+                    <td>
+                      <input
+                        className="field rop-sla-days"
+                        type="number"
+                        min={1}
+                        max={365}
+                        disabled={!current.isEnabled}
+                        value={current.slaDays}
+                        onChange={(event) =>
+                          onDraftChange((items) => ({
+                            ...items,
+                            [key]: { ...current, slaDays: event.target.value },
+                          }))
+                        }
+                      />
+                    </td>
+                    <td>
+                      <input
+                        className="field"
+                        value={current.reason}
+                        onChange={(event) =>
+                          onDraftChange((items) => ({
+                            ...items,
+                            [key]: { ...current, reason: event.target.value },
+                          }))
+                        }
+                      />
+                    </td>
+                    <td>
+                      <button className="btn" type="button" onClick={() => void onSave(row)} disabled={savingKey === key}>
+                        <Save size={15} />
+                        Сохранить
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function RopFilterPicker({
+  title,
+  allLabel,
+  emptyText,
+  options,
+  selectedIds,
+  onChange,
+}: {
+  title: string;
+  allLabel: string;
+  emptyText: string;
+  options: RopFilterOption[];
+  selectedIds: string[];
+  onChange: Dispatch<SetStateAction<string[]>>;
+}) {
+  const optionIds = options.map((option) => option.id);
+  const allSelected = selectedIds.length === 0 || optionIds.every((id) => selectedIds.includes(id));
+  const selectedLabel = selectedIds.length === 0 ? allLabel : `${formatNumber(selectedIds.length)} выбрано`;
+
+  return (
+    <div className="rop-filter-block">
+      <div className="rop-filter-title">{title}</div>
+      {options.length === 0 ? (
+        <div className="rop-filter-empty">{emptyText}</div>
+      ) : (
+        <details className="rop-filter-menu">
+          <summary>{selectedLabel}</summary>
+          <div className="multi-picker rop-multi-picker">
+            <label className="check-row">
+              <input type="checkbox" checked={allSelected} onChange={() => onChange([])} />
+              <span>{allLabel}</span>
+            </label>
+            {options.map((option) => (
+              <label className="check-row" key={option.id}>
+                <input
+                  type="checkbox"
+                  checked={selectedIds.length === 0 || selectedIds.includes(option.id)}
+                  onChange={() => onChange((current) => toggleRopSelection(optionIds, current, option.id))}
+                />
+                <span>
+                  {option.name}
+                  {option.secondary && <span className="rop-filter-secondary">{option.secondary}</span>}
+                </span>
+              </label>
+            ))}
+          </div>
+        </details>
+      )}
+    </div>
+  );
+}
+
+function RopDealLinks({ deals }: { deals: RopActionQueueItem[] }) {
+  if (deals.length === 0) return <span className="rop-secondary">Нет сделок в выбранном срезе</span>;
+  const visibleDeals = deals.slice(0, 4);
+  const hiddenCount = deals.length - visibleDeals.length;
+  return (
+    <div className="rop-deal-list">
+      {visibleDeals.map((deal, index) =>
+        deal.dealUrl ? (
+          <a className="rop-link" key={deal.id || `${deal.dealExternalId}-${index}`} href={deal.dealUrl} target="_blank" rel="noreferrer">
+            {deal.dealTitle || `Сделка ${index + 1}`}
+          </a>
+        ) : (
+          <span className="rop-primary" key={deal.id || `${deal.dealExternalId}-${index}`}>
+            {deal.dealTitle || `Сделка ${index + 1}`}
+          </span>
+        ),
+      )}
+      {hiddenCount > 0 && <span className="rop-secondary">Ещё {formatNumber(hiddenCount)}</span>}
+    </div>
+  );
+}
+
+function ropStageId(row: RopFunnelStageRow) {
+  return row.stageId || row.stage?.id || '';
+}
+
+function ropStageName(row: RopFunnelStageRow) {
+  return row.stageName || row.stage?.name || '-';
+}
+
+function ropStagePosition(row: RopFunnelStageRow) {
+  return row.stagePosition ?? row.stage?.position ?? 0;
+}
+
+function formatRopSla(row: RopFunnelStageRow) {
+  if (row.slaApplies === false || row.slaDays === null) return 'не применяется';
+  return formatRopDays(row.slaDays);
+}
+
+function ropPriorityLabel(priority: RopActionPriority | null | undefined) {
+  if (priority === 'critical') return 'Срочно';
+  if (priority === 'warning') return 'Сегодня';
+  return 'Низко';
+}
+
+function ropPriorityClass(priority: RopActionPriority | null | undefined) {
+  if (priority === 'critical') return 'rop-priority-critical';
+  if (priority === 'warning') return 'rop-priority-warning';
+  return 'rop-priority-info';
+}
+
+function ropManagerStatusLabel(row: RopManagerRow) {
+  if (row.statusLabel?.trim()) return row.statusLabel.trim();
+  if (ropMetric(row.noNextStep) > 0) return 'Нет следующего шага';
+  if (ropMetric(row.overdueTasks) > 0 || ropMetric(row.crmIssues) > 0) return 'Сначала просрочка и CRM';
+  if (ropMetric(row.taskReschedules) > 0) return 'Проверить переносы';
+  if (ropMetric(row.riskDeals) > 0 || ropMetric(row.stuckDeals) > 0) return 'Помочь по сделкам';
+  if (ropMetric(row.pendingEmails) > 0 || ropMetric(row.offerTouches) > 0) return 'Нужен контакт';
+  return 'Без срочных проблем';
+}
+
+function ropManagerStatusClass(row: RopManagerRow) {
+  if (ropMetric(row.noNextStep) > 0 || ropMetric(row.overdueTasks) > 0 || ropMetric(row.crmIssues) > 0) return 'rop-status-attention';
+  if (ropMetric(row.taskReschedules) > 0) return 'rop-status-warning';
+  if (ropMetric(row.riskDeals) > 0 || ropMetric(row.stuckDeals) > 0) return 'rop-status-warning';
+  if (ropMetric(row.pendingEmails) > 0 || ropMetric(row.offerTouches) > 0) return 'rop-status-neutral';
+  return 'rop-status-ok';
+}
+
+function formatRopActionAge(row: RopActionQueueItem) {
+  if (row.dueAt) return formatMoscowDateTime(row.dueAt);
+  if (row.ageDays !== null && row.ageDays !== undefined) return formatRopDays(row.ageDays);
+  if (row.ageHours !== null && row.ageHours !== undefined) return formatRopHours(row.ageHours);
+  return '-';
+}
+
+function formatRopDays(days: number | null | undefined) {
+  if (days === null || days === undefined) return '-';
+  const value = Number(days);
+  if (!Number.isFinite(value)) return '-';
+  if (value < 1) return formatRopHours(value * 24);
+  return `${formatNumber(Math.round(value))} дн.`;
+}
+
+function formatRopHours(hours: number | null | undefined) {
+  if (hours === null || hours === undefined) return '-';
+  const value = Number(hours);
+  if (!Number.isFinite(value)) return '-';
+  if (value >= 24) return `${formatNumber(Math.round(value / 24))} дн.`;
+  return `${formatNumber(Math.round(value))} ч`;
+}
+
+function ropMetric(value: number | null | undefined) {
+  const next = Number(value ?? 0);
+  return Number.isFinite(next) ? next : 0;
+}
+
+function ropQueueDefaultAction(queueKey: RopActionQueueKey) {
+  return ROP_ACTION_QUEUE_CONFIG.find((queue) => queue.key === queueKey)?.defaultAction ?? 'Разобрать';
+}
+
+function ropActionMatchesManagerScope(row: RopActionQueueItem, managerIds: Set<string>, shouldApplyManagerScope: boolean) {
+  if (!shouldApplyManagerScope) return true;
+  return Boolean(row.managerId && managerIds.has(row.managerId));
 }
 
 function LeadSlaTab() {
@@ -6464,7 +8036,7 @@ function InfoRow({ label, value }: { label: string; value: ReactNode }) {
   return (
     <div className="flex min-w-0 items-start justify-between gap-4 border-b border-[var(--pb-border)] py-2 last:border-b-0">
       <span className="text-[var(--pb-text-secondary)]">{label}</span>
-      <span className="min-w-0 max-w-[60%] truncate text-right font-semibold" title={typeof value === 'string' ? value : undefined}>
+      <span className="min-w-0 max-w-[60%] text-right font-semibold [overflow-wrap:anywhere]" title={typeof value === 'string' ? value : undefined}>
         {value}
       </span>
     </div>
