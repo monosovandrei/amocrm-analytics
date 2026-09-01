@@ -80,7 +80,9 @@ const line = fs.readFileSync(process.argv[1], "utf8").split(/\r?\n/).find((item)
 if (!line) process.exit(2);
 let value = line.slice("DATABASE_URL=".length).trim();
 if ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("\x27") && value.endsWith("\x27"))) value = value.slice(1, -1);
-process.stdout.write(value);
+const databaseUrl = new URL(value);
+databaseUrl.searchParams.delete("schema");
+process.stdout.write(databaseUrl.toString());
 ' "$RELEASE/.env")"
 BACKUP_FILE="$BACKUPS_DIR/pre-$COMMIT-$STAMP.dump"
 pg_dump "$DATABASE_URL_VALUE" --format=custom --file="$BACKUP_FILE"
