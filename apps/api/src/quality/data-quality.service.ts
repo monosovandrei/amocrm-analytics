@@ -63,7 +63,7 @@ export class DataQualityService {
     );
     const freshnessLagMs = latestSourceAt ? Math.max(0, now - latestSourceAt.getTime()) : Number.POSITIVE_INFINITY;
 
-    const [workers, pendingRaw, failedRaw, oldestRaw, reportFailures, oldestReportJob, activeDeals, factDeals, factCoverage] = await Promise.all([
+    const [workers, pendingRaw, failedRaw, oldestRaw, reportFailureSnapshots, oldestReportJob, activeDeals, factDeals, factCoverage] = await Promise.all([
       this.prisma.workerRuntime.findMany({ orderBy: { role: 'asc' } }),
       connection
         ? this.prisma.rawAmoEventInbox.count({
@@ -80,7 +80,17 @@ export class DataQualityService {
             select: { receivedAt: true },
           })
         : null,
-      this.prisma.reportSnapshotJob.count({ where: { status: 'ERROR', finishedAt: { gte: new Date(now - 60 * 60_000) } } }),
+      this.prisma.reportSnapshot.findMany({
+        where: {
+          refreshStatus: 'ERROR',
+          OR: [
+            { refreshRequestedAt: { gte: new Date(now - 60 * 60_000) } },
+            { lastAccessedAt: { gte: new Date(now - 60 * 60_000) } },
+          ],
+        },
+        select: { name: true },
+        distinct: ['name'],
+      }),
       this.prisma.reportSnapshotJob.findFirst({
         where: { status: { in: ['QUEUED', 'RUNNING'] } },
         orderBy: { requestedAt: 'asc' },
@@ -118,6 +128,10 @@ export class DataQualityService {
     const dealMismatches = Number(factCoverage[0]?.deal_mismatches ?? 0);
     const historyRows = Number(factCoverage[0]?.history_rows ?? 0);
     const transitionRows = Number(factCoverage[0]?.transition_rows ?? 0);
+    const reportFailures = reportFailureSnapshots.length;
+    const failedReportNames = reportFailureSnapshots
+      .map((snapshot) => snapshot.name)
+      .filter((name): name is string => Boolean(name));
 
     const rawLagMs = oldestRaw ? now - oldestRaw.receivedAt.getTime() : 0;
     const reportLagMs = oldestReportJob ? now - oldestReportJob.requestedAt.getTime() : 0;
@@ -166,8 +180,8 @@ export class DataQualityService {
         message: 'Снимки отчётов не обновляются вовремя',
         severity: 'CRITICAL',
         immediate: reportLagMs >= FRESHNESS_BLOCK_MS,
-        scope: { global: true },
-        details: { reportFailures, lagSeconds: Math.floor(reportLagMs / 1000) },
+        scope: failedReportNames.length ? { reportNames: failedReportNames } : { global: true },
+        details: { reportFailures, reportNames: failedReportNames, lagSeconds: Math.floor(reportLagMs / 1000) },
       });
     }
     if (staleWorkers.length > 0) {
