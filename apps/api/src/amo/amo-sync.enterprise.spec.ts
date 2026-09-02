@@ -32,6 +32,15 @@ describe('AmoSyncService full snapshot safeguards', () => {
     expect(service.pullResumeStage({ startedAt: null, cursor: { step: 'events' } })).toBeNull();
   });
 
+  it('restores the exact event stream and time window from a saved cursor', () => {
+    const service = createService({});
+
+    expect(service.eventResumePosition({ step: 'events:stream:2:window:1785150546:page:41:fetched:100' }))
+      .toEqual({ streamIndex: 2, windowFrom: 1785150546 });
+    expect(service.eventResumePosition({ step: 'events:window:1785150546:page:41' }))
+      .toEqual({ streamIndex: 0, windowFrom: 1785150546 });
+  });
+
   it('streams events into storage and deduplicates repeated event categories', async () => {
     const service = createService({
       crmEvent: {
@@ -124,6 +133,26 @@ describe('AmoSyncService full snapshot safeguards', () => {
 
     expect(attemptedRanges.some((range) => range > 30)).toBe(true);
     expect(attemptedRanges.filter((range) => range <= 30)).toHaveLength(8);
+  });
+
+  it('skips completed event streams when a full sync resumes', async () => {
+    const service = createService({ crmEvent: { count: jest.fn().mockResolvedValue(0) } });
+    service.backfillStageHistoryFromStoredEvents = jest.fn().mockResolvedValue(undefined);
+    service.touchJob = jest.fn().mockResolvedValue(undefined);
+    const requested: any[] = [];
+    const client = {
+      paginateBatch: jest.fn(async (_path: string, _key: string, params: any) => {
+        requested.push(params);
+      }),
+    };
+    const from = Math.floor(Date.now() / 1000) - 60;
+
+    await service.syncEvents(client, {}, {}, from, 'job-1', {
+      step: `events:stream:2:window:${from + 30}:page:1:fetched:0:inserted:0`,
+    });
+
+    expect(requested).toHaveLength(2);
+    expect(requested[0]['filter[created_at][from]']).toBe(from + 30);
   });
 
   it('marks deals absent from a complete amoCRM snapshot as deleted and verifies parity', async () => {

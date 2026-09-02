@@ -938,7 +938,7 @@ export class AmoSyncService {
       if (this.shouldRunPullStage('events', resumeStage)) {
         await this.touchJob(jobId, 'events');
         this.logger.log(`amoCRM sync job ${jobId}: syncing events`);
-        await this.syncEvents(client, maps, stats, updatedSince, jobId);
+        await this.syncEvents(client, maps, stats, updatedSince, jobId, job.cursor);
       }
       if (this.shouldRunPullStage('tasks', resumeStage)) {
         await this.touchJob(jobId, 'tasks');
@@ -3005,6 +3005,7 @@ export class AmoSyncService {
     stats: Record<string, number>,
     updatedSince?: number,
     jobId?: string,
+    resumeCursor?: Prisma.JsonValue | null,
   ) {
     const params: Record<string, string | number> = {};
     if (updatedSince) {
@@ -3015,7 +3016,7 @@ export class AmoSyncService {
 
     let fetchedEvents = 0;
     let insertedEvents = 0;
-    const ingest = async (baseEventParams: Record<string, string | number>) => {
+    const ingest = async (baseEventParams: Record<string, string | number>, streamIndex: number) => {
       const ingestWindow = async (eventParams: Record<string, string | number>): Promise<void> => {
         const windowFrom = Number(eventParams['filter[created_at][from]']);
         const windowTo = Number(eventParams['filter[created_at][to]']);
@@ -3039,7 +3040,7 @@ export class AmoSyncService {
             if (page % 20 === 1) {
               this.logger.log(`syncEvents: processed window ${windowFrom}-${windowTo}, page ${page} (${fetchedEvents} fetched, ${insertedEvents} inserted)`);
             }
-            if (jobId) await this.touchJob(jobId, `events:window:${windowFrom}:page:${page}:fetched:${fetchedEvents}:inserted:${insertedEvents}`);
+            if (jobId) await this.touchJob(jobId, `events:stream:${streamIndex}:window:${windowFrom}:page:${page}:fetched:${fetchedEvents}:inserted:${insertedEvents}`);
           });
         } catch (error: any) {
           if (!this.isAmoTooManyDataError(error) || windowTo <= windowFrom) throw error;
@@ -3055,9 +3056,17 @@ export class AmoSyncService {
       }
     };
 
-    await ingest(params);
-    for (const type of this.extraEventTypes()) {
-      await ingest({ ...params, 'filter[type]': type });
+    const streams: Array<Record<string, string | number>> = [
+      params,
+      ...this.extraEventTypes().map((type) => ({ ...params, 'filter[type]': type })),
+    ];
+    const resume = this.eventResumePosition(resumeCursor);
+    for (let streamIndex = 0; streamIndex < streams.length; streamIndex += 1) {
+      if (resume && streamIndex < resume.streamIndex) continue;
+      const streamParams = resume && streamIndex === resume.streamIndex
+        ? { ...streams[streamIndex], 'filter[created_at][from]': Math.max(Number(streams[streamIndex]['filter[created_at][from]']), resume.windowFrom) }
+        : streams[streamIndex];
+      await ingest(streamParams, streamIndex);
     }
 
     const eventFrom = Number(params['filter[created_at][from]']);
@@ -3097,6 +3106,17 @@ export class AmoSyncService {
   private isAmoTooManyDataError(error: unknown) {
     const message = error instanceof Error ? error.message : String(error ?? '');
     return message.includes('amoCRM API 408') && message.toLowerCase().includes('too many data');
+  }
+
+  private eventResumePosition(cursor: Prisma.JsonValue | null | undefined) {
+    if (!cursor || typeof cursor !== 'object' || Array.isArray(cursor)) return null;
+    const step = (cursor as Record<string, unknown>).step;
+    if (typeof step !== 'string') return null;
+    const current = step.match(/^events:stream:(\d+):window:(\d+):/);
+    if (current) return { streamIndex: Number(current[1]), windowFrom: Number(current[2]) };
+    const legacy = step.match(/^events:window:(\d+):/);
+    if (legacy) return { streamIndex: 0, windowFrom: Number(legacy[1]) };
+    return null;
   }
 
   private async syncWebhookRelatedEvents(
