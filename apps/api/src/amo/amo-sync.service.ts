@@ -22,6 +22,19 @@ type WebhookEventGroup = {
 };
 
 const WEBHOOK_EVENT_BATCH_SIZE = 100;
+const PULL_STAGE_ORDER = [
+  'metadata',
+  'deals',
+  'notes',
+  'events',
+  'tasks',
+  'contacts_companies',
+  'email_thread_state',
+  'entity_links',
+  'fact_marts',
+  'notifications',
+] as const;
+type PullStage = (typeof PULL_STAGE_ORDER)[number];
 
 @Injectable()
 export class AmoSyncService {
@@ -888,11 +901,15 @@ export class AmoSyncService {
         ? new Date(lastPullSyncAt.getTime() - 5 * 60_000)
         : syncStartedAt;
       const isFullSync = job.type === SyncJobType.FULL;
+      const resumeStage = this.pullResumeStage(job);
+      if (resumeStage) {
+        this.logger.warn(`amoCRM sync job ${jobId}: resuming from ${resumeStage}`);
+      }
 
       await this.syncAccount(client, stats);
       await this.syncOptional('webhookSubscription', stats, () => this.ensureWebhookSubscription(client, job.connection, stats));
       const maps = this.emptyMaps();
-      if (isFullSync) {
+      if (isFullSync && this.shouldRunPullStage('metadata', resumeStage)) {
         const freshMaps = await this.syncMetadata(client, stats);
         this.mergeMaps(maps, freshMaps);
         await this.syncOptional('sources', stats, () => this.syncSources(client, maps, stats));
@@ -905,36 +922,53 @@ export class AmoSyncService {
         stats.metadataFromCache = 1;
       }
       await this.hydrateExistingEntityMaps(maps);
-      await this.touchJob(jobId, 'deals');
-      this.logger.log(`amoCRM sync job ${jobId}: syncing deals`);
-      await this.syncDeals(client, maps, stats, updatedSince, jobId, isFullSync);
-      if (isFullSync) {
-        await this.backfillLossReasonsFromRaw(stats);
+      if (this.shouldRunPullStage('deals', resumeStage)) {
+        await this.touchJob(jobId, 'deals');
+        this.logger.log(`amoCRM sync job ${jobId}: syncing deals`);
+        await this.syncDeals(client, maps, stats, updatedSince, jobId, isFullSync);
+        if (isFullSync) {
+          await this.backfillLossReasonsFromRaw(stats);
+        }
       }
-      await this.touchJob(jobId, 'notes');
-      this.logger.log(`amoCRM sync job ${jobId}: syncing notes`);
-      await this.syncNotes(client, stats, updatedSince, jobId);
-      await this.touchJob(jobId, 'events');
-      this.logger.log(`amoCRM sync job ${jobId}: syncing events`);
-      await this.syncEvents(client, maps, stats, updatedSince, jobId);
-      await this.touchJob(jobId, 'tasks');
-      this.logger.log(`amoCRM sync job ${jobId}: syncing tasks`);
-      await this.syncTasks(client, maps, stats, updatedSince, jobId);
-      await this.touchJob(jobId, 'contacts_companies');
-      this.logger.log(`amoCRM sync job ${jobId}: syncing contacts and companies`);
-      await this.syncContacts(client, maps, stats, updatedSince);
-      await this.syncCompanies(client, maps, stats, updatedSince);
-      await this.syncOptional('customers', stats, () => this.syncCustomers(client, maps, stats, updatedSince));
-      await this.touchJob(jobId, 'email_thread_state');
-      await this.rebuildEmailThreadStates(stats);
-      if (isFullSync) {
+      if (this.shouldRunPullStage('notes', resumeStage)) {
+        await this.touchJob(jobId, 'notes');
+        this.logger.log(`amoCRM sync job ${jobId}: syncing notes`);
+        await this.syncNotes(client, stats, updatedSince, jobId);
+      }
+      if (this.shouldRunPullStage('events', resumeStage)) {
+        await this.touchJob(jobId, 'events');
+        this.logger.log(`amoCRM sync job ${jobId}: syncing events`);
+        await this.syncEvents(client, maps, stats, updatedSince, jobId);
+      }
+      if (this.shouldRunPullStage('tasks', resumeStage)) {
+        await this.touchJob(jobId, 'tasks');
+        this.logger.log(`amoCRM sync job ${jobId}: syncing tasks`);
+        await this.syncTasks(client, maps, stats, updatedSince, jobId);
+      }
+      if (this.shouldRunPullStage('contacts_companies', resumeStage)) {
+        await this.touchJob(jobId, 'contacts_companies');
+        this.logger.log(`amoCRM sync job ${jobId}: syncing contacts and companies`);
+        await this.syncContacts(client, maps, stats, updatedSince);
+        await this.syncCompanies(client, maps, stats, updatedSince);
+        await this.syncOptional('customers', stats, () => this.syncCustomers(client, maps, stats, updatedSince));
+      }
+      if (this.shouldRunPullStage('email_thread_state', resumeStage)) {
+        await this.touchJob(jobId, 'email_thread_state');
+        await this.rebuildEmailThreadStates(stats);
+      }
+      if (isFullSync && this.shouldRunPullStage('entity_links', resumeStage)) {
+        await this.touchJob(jobId, 'entity_links');
         await this.syncOptional('entityLinks', stats, () => this.syncEntityLinks(client, stats));
         await this.recalculateStageProbabilities();
       }
-      await this.touchJob(jobId, 'fact_marts');
-      await this.refreshFactMartsForPullJob(isFullSync, stats);
-      await this.touchJob(jobId, 'notifications');
-      await this.processCrmNotifications(stats, notificationSince, client.domain);
+      if (this.shouldRunPullStage('fact_marts', resumeStage)) {
+        await this.touchJob(jobId, 'fact_marts');
+        await this.refreshFactMartsForPullJob(isFullSync, stats);
+      }
+      if (this.shouldRunPullStage('notifications', resumeStage)) {
+        await this.touchJob(jobId, 'notifications');
+        await this.processCrmNotifications(stats, notificationSince, client.domain);
+      }
 
       const syncFinishedAt = new Date();
       await this.prisma.syncJob.update({
@@ -1085,6 +1119,19 @@ export class AmoSyncService {
     if (type === 'FULL') return undefined;
     if (!lastPullSyncAt) return Math.floor((Date.now() - 5 * 60_000) / 1000);
     return Math.floor((lastPullSyncAt.getTime() - 5 * 60_000) / 1000);
+  }
+
+  private pullResumeStage(job: SyncJobWithConnection): PullStage | null {
+    if (!job.startedAt || !job.cursor || typeof job.cursor !== 'object' || Array.isArray(job.cursor)) return null;
+    const step = (job.cursor as Record<string, unknown>).step;
+    if (typeof step !== 'string') return null;
+    const stage = step.split(':', 1)[0] as PullStage;
+    return PULL_STAGE_ORDER.includes(stage) ? stage : null;
+  }
+
+  private shouldRunPullStage(stage: PullStage, resumeStage: PullStage | null) {
+    if (!resumeStage) return true;
+    return PULL_STAGE_ORDER.indexOf(stage) >= PULL_STAGE_ORDER.indexOf(resumeStage);
   }
 
   private emptyMaps(): AmoSyncMaps {
@@ -2966,12 +3013,23 @@ export class AmoSyncService {
       params['filter[created_at][from]'] = Math.floor(Date.now() / 1000) - 90 * 86400;
     }
 
-    const eventsById = new Map<string, any>();
+    const seenEventIds = new Set<string>();
+    let savedEvents = 0;
     const ingest = async (eventParams: Record<string, string | number>) => {
       await client.paginateBatch<any>('/events', 'events', eventParams, async (events, page) => {
-        for (const event of events) eventsById.set(String(event.id), event);
+        for (const event of events) {
+          const externalId = String(event.id);
+          if (seenEventIds.has(externalId)) continue;
+          seenEventIds.add(externalId);
+          await this.upsertCrmEvent(event, maps);
+          savedEvents += 1;
+          if (savedEvents === 1 || savedEvents % 5000 === 0) {
+            this.logger.log(`syncEvents: saved ${savedEvents} unique events`);
+            if (jobId) await this.touchJob(jobId, `events:saved:${savedEvents}`);
+          }
+        }
         if (page % 20 === 1) {
-          this.logger.log(`syncEvents: processed page ${page} (${eventsById.size} unique events so far)`);
+          this.logger.log(`syncEvents: processed page ${page} (${savedEvents} unique events so far)`);
           if (jobId) await this.touchJob(jobId, `events:page${page}`);
         }
       });
@@ -2982,17 +3040,7 @@ export class AmoSyncService {
       await ingest({ ...params, 'filter[type]': type });
     }
 
-    const events = [...eventsById.values()];
-    let savedEvents = 0;
-    for (const event of events) {
-      await this.upsertCrmEvent(event, maps);
-      savedEvents += 1;
-      if (savedEvents === 1 || savedEvents % 5000 === 0) {
-        this.logger.log(`syncEvents: saved ${savedEvents}/${events.length} events`);
-        if (jobId) await this.touchJob(jobId, `events:saved:${savedEvents}`);
-      }
-    }
-    stats.events = events.length;
+    stats.events = seenEventIds.size;
     await this.backfillStageHistoryFromStoredEvents(maps, stats, updatedSince);
   }
 

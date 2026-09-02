@@ -13,6 +13,49 @@ function createService(prisma: Record<string, any>) {
 }
 
 describe('AmoSyncService full snapshot safeguards', () => {
+  it('resumes a failed pull from the interrupted stage and skips completed stages', () => {
+    const service = createService({});
+    const resumeStage = service.pullResumeStage({
+      startedAt: new Date('2026-09-01T10:00:00.000Z'),
+      cursor: { step: 'events:saved:565000' },
+    });
+
+    expect(resumeStage).toBe('events');
+    expect(service.shouldRunPullStage('notes', resumeStage)).toBe(false);
+    expect(service.shouldRunPullStage('events', resumeStage)).toBe(true);
+    expect(service.shouldRunPullStage('fact_marts', resumeStage)).toBe(true);
+  });
+
+  it('starts a fresh pull from the beginning', () => {
+    const service = createService({});
+
+    expect(service.pullResumeStage({ startedAt: null, cursor: { step: 'events' } })).toBeNull();
+  });
+
+  it('streams events into storage and deduplicates repeated event categories', async () => {
+    const service = createService({});
+    service.upsertCrmEvent = jest.fn().mockResolvedValue(undefined);
+    service.backfillStageHistoryFromStoredEvents = jest.fn().mockResolvedValue(undefined);
+    service.touchJob = jest.fn().mockResolvedValue(undefined);
+    const client = {
+      paginateBatch: jest.fn(async (_path: string, _key: string, _params: unknown, onPage: any) => {
+        await onPage([
+          { id: 1, payload: 'first' },
+          { id: 2, payload: 'second' },
+        ], 1);
+      }),
+    };
+    const stats: Record<string, number> = {};
+
+    await service.syncEvents(client, {}, stats, undefined, 'job-1');
+
+    expect(service.upsertCrmEvent).toHaveBeenCalledTimes(2);
+    expect(service.upsertCrmEvent).toHaveBeenNthCalledWith(1, expect.objectContaining({ id: 1 }), {});
+    expect(service.upsertCrmEvent).toHaveBeenNthCalledWith(2, expect.objectContaining({ id: 2 }), {});
+    expect(stats.events).toBe(2);
+    expect(service.backfillStageHistoryFromStoredEvents).toHaveBeenCalled();
+  });
+
   it('marks deals absent from a complete amoCRM snapshot as deleted and verifies parity', async () => {
     const prisma = {
       deal: {
