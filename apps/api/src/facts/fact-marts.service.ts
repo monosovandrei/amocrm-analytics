@@ -419,7 +419,7 @@ export class FactMartsService {
 
   private async withRefreshLock<T>(work: (tx: Prisma.TransactionClient) => Promise<T>) {
     return this.prisma.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext('amocrm-analytics:fact-marts-refresh'))`;
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext('amocrm-analytics:fact-marts-refresh'))::text AS lock_result`;
       return work(tx);
     }, { timeout: FACT_REFRESH_TRANSACTION_TIMEOUT_MS });
   }
