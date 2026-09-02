@@ -3016,30 +3016,42 @@ export class AmoSyncService {
     let fetchedEvents = 0;
     let insertedEvents = 0;
     const ingest = async (baseEventParams: Record<string, string | number>) => {
-      for (const eventParams of this.eventTimeWindows(baseEventParams)) {
+      const ingestWindow = async (eventParams: Record<string, string | number>): Promise<void> => {
         const windowFrom = Number(eventParams['filter[created_at][from]']);
         const windowTo = Number(eventParams['filter[created_at][to]']);
-        await client.paginateBatch<any>('/events', 'events', eventParams, async (events, page) => {
-          const uniqueEvents = [...new Map(events.map((event) => [String(event.id), event])).values()];
-          const externalIds = uniqueEvents.map((event) => String(event.id));
-          const existingEvents = externalIds.length > 0
-            ? await this.prisma.crmEvent.findMany({
-                where: { externalId: { in: externalIds } },
-                select: { externalId: true },
-              })
-            : [];
-          const existingIds = new Set(existingEvents.map((event) => event.externalId));
-          fetchedEvents += uniqueEvents.length;
-          for (const event of uniqueEvents) {
-            if (existingIds.has(String(event.id))) continue;
-            await this.upsertCrmEvent(event, maps);
-            insertedEvents += 1;
-          }
-          if (page % 20 === 1) {
-            this.logger.log(`syncEvents: processed window ${windowFrom}-${windowTo}, page ${page} (${fetchedEvents} fetched, ${insertedEvents} inserted)`);
-          }
-          if (jobId) await this.touchJob(jobId, `events:window:${windowFrom}:page:${page}:fetched:${fetchedEvents}:inserted:${insertedEvents}`);
-        });
+        try {
+          await client.paginateBatch<any>('/events', 'events', eventParams, async (events, page) => {
+            const uniqueEvents = [...new Map(events.map((event) => [String(event.id), event])).values()];
+            const externalIds = uniqueEvents.map((event) => String(event.id));
+            const existingEvents = externalIds.length > 0
+              ? await this.prisma.crmEvent.findMany({
+                  where: { externalId: { in: externalIds } },
+                  select: { externalId: true },
+                })
+              : [];
+            const existingIds = new Set(existingEvents.map((event) => event.externalId));
+            fetchedEvents += uniqueEvents.length;
+            for (const event of uniqueEvents) {
+              if (existingIds.has(String(event.id))) continue;
+              await this.upsertCrmEvent(event, maps);
+              insertedEvents += 1;
+            }
+            if (page % 20 === 1) {
+              this.logger.log(`syncEvents: processed window ${windowFrom}-${windowTo}, page ${page} (${fetchedEvents} fetched, ${insertedEvents} inserted)`);
+            }
+            if (jobId) await this.touchJob(jobId, `events:window:${windowFrom}:page:${page}:fetched:${fetchedEvents}:inserted:${insertedEvents}`);
+          });
+        } catch (error: any) {
+          if (!this.isAmoTooManyDataError(error) || windowTo <= windowFrom) throw error;
+          const midpoint = Math.floor((windowFrom + windowTo) / 2);
+          this.logger.warn(`syncEvents: splitting oversized window ${windowFrom}-${windowTo} at ${midpoint}`);
+          await ingestWindow({ ...eventParams, 'filter[created_at][to]': midpoint });
+          await ingestWindow({ ...eventParams, 'filter[created_at][from]': midpoint + 1 });
+        }
+      };
+
+      for (const eventParams of this.eventTimeWindows(baseEventParams)) {
+        await ingestWindow(eventParams);
       }
     };
 
@@ -3080,6 +3092,11 @@ export class AmoSyncService {
       });
     }
     return windows;
+  }
+
+  private isAmoTooManyDataError(error: unknown) {
+    const message = error instanceof Error ? error.message : String(error ?? '');
+    return message.includes('amoCRM API 408') && message.toLowerCase().includes('too many data');
   }
 
   private async syncWebhookRelatedEvents(

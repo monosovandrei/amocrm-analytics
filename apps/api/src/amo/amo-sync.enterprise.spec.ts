@@ -101,6 +101,31 @@ describe('AmoSyncService full snapshot safeguards', () => {
     ]);
   });
 
+  it('recursively splits an event window rejected by amoCRM as too large', async () => {
+    const service = createService({
+      crmEvent: {
+        findMany: jest.fn().mockResolvedValue([]),
+        count: jest.fn().mockResolvedValue(0),
+      },
+    });
+    service.backfillStageHistoryFromStoredEvents = jest.fn().mockResolvedValue(undefined);
+    service.touchJob = jest.fn().mockResolvedValue(undefined);
+    const attemptedRanges: number[] = [];
+    const client = {
+      paginateBatch: jest.fn(async (_path: string, _key: string, params: any, onPage: any) => {
+        const range = Number(params['filter[created_at][to]']) - Number(params['filter[created_at][from]']);
+        attemptedRanges.push(range);
+        if (range > 30) throw new Error('amoCRM API 408: {"response":{"error":"Too many data"}}');
+        await onPage([], 1);
+      }),
+    };
+
+    await service.syncEvents(client, {}, {}, Math.floor(Date.now() / 1000) - 60, 'job-1');
+
+    expect(attemptedRanges.some((range) => range > 30)).toBe(true);
+    expect(attemptedRanges.filter((range) => range <= 30)).toHaveLength(8);
+  });
+
   it('marks deals absent from a complete amoCRM snapshot as deleted and verifies parity', async () => {
     const prisma = {
       deal: {
