@@ -15,10 +15,10 @@ export class FactMartsService {
 
   async refreshAll() {
     const startedAt = Date.now();
-    await this.prisma.$transaction(async (tx) => {
+    await this.withRefreshLock(async (tx) => {
       await this.refreshDealFacts(undefined, tx);
       await this.refreshEmailThreadFacts(undefined, tx);
-    }, { timeout: FACT_REFRESH_TRANSACTION_TIMEOUT_MS });
+    });
     const counts = await this.factCounts();
     this.logger.log(`Fact marts full refresh completed in ${Date.now() - startedAt}ms`);
     return counts;
@@ -55,10 +55,10 @@ export class FactMartsService {
   async refreshDeals(dealIds: string[]) {
     const ids = [...new Set(dealIds.filter(Boolean))];
     if (ids.length === 0) return { dealCurrent: 0, stageTransitions: 0, stageIntervals: 0, emailThreads: 0 };
-    await this.prisma.$transaction(async (tx) => {
+    await this.withRefreshLock(async (tx) => {
       await this.refreshDealFacts(ids, tx);
       await this.refreshEmailThreadFacts(ids, tx);
-    }, { timeout: FACT_REFRESH_TRANSACTION_TIMEOUT_MS });
+    });
     return this.factCounts(ids);
   }
 
@@ -81,9 +81,9 @@ export class FactMartsService {
   async refreshEmailThreadFactsOnly(dealIds?: string[]) {
     const ids = dealIds === undefined ? undefined : [...new Set(dealIds.filter(Boolean))];
     if (ids?.length === 0) return { emailThreads: 0 };
-    await this.prisma.$transaction(async (tx) => {
+    await this.withRefreshLock(async (tx) => {
       await this.refreshEmailThreadFacts(ids, tx);
-    }, { timeout: FACT_REFRESH_TRANSACTION_TIMEOUT_MS });
+    });
     return {
       emailThreads: await this.prisma.factEmailThreadState.count(
         ids ? { where: { dealId: { in: ids } } } : undefined,
@@ -415,5 +415,12 @@ export class FactMartsService {
 
   private normalizedIds(ids?: string[]) {
     return [...new Set((ids ?? []).filter(Boolean))];
+  }
+
+  private async withRefreshLock<T>(work: (tx: Prisma.TransactionClient) => Promise<T>) {
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext('amocrm-analytics:fact-marts-refresh'))`;
+      return work(tx);
+    }, { timeout: FACT_REFRESH_TRANSACTION_TIMEOUT_MS });
   }
 }
