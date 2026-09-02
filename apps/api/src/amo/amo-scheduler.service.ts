@@ -59,6 +59,12 @@ export class AmoSchedulerService {
     const syncIntervalMinutes = this.getSyncIntervalMinutes();
     if (syncIntervalMinutes <= 0) return;
 
+    // A minute-by-minute incremental sync can otherwise win the scheduler race
+    // forever and prevent the independent source parity check from ever running.
+    // Leave this tick free when reconciliation is due; its own interval handler
+    // will claim the worker as soon as no pull job is active.
+    if (this.isRecentReconcileDue(connection)) return;
+
     const lastSync = connection.lastPullSyncAt ?? connection.lastIncrementalSyncAt ?? connection.lastFullSyncAt;
     const syncType = lastSync ? SyncJobType.INCREMENTAL : SyncJobType.FULL;
     if (!pullSyncJobTypes.includes(syncType)) return;
@@ -150,9 +156,7 @@ export class AmoSchedulerService {
     });
     if (!connection?.lastFullSyncAt) return;
 
-    const lastReconciledAt = this.getConfigDate(connection.config, 'recentReconcileAt');
-    const due = !lastReconciledAt || Date.now() - lastReconciledAt.getTime() >= intervalSeconds * 1000;
-    if (!due) return;
+    if (!this.isRecentReconcileDue(connection)) return;
 
     await this.sync.expireStaleJobs(connection.id);
     const running = await this.prisma.syncJob.count({
@@ -284,6 +288,19 @@ export class AmoSchedulerService {
 
     const parsed = Number(rawInterval);
     return Number.isFinite(parsed) ? Math.max(30, parsed) : 60;
+  }
+
+  private isRecentReconcileDue(connection: { lastFullSyncAt?: Date | null; config?: unknown }) {
+    if (!connection.lastFullSyncAt) return false;
+    const intervalSeconds = this.getRecentReconcileIntervalSeconds();
+    if (intervalSeconds <= 0) return false;
+
+    const lastSuccess = this.getConfigDate(connection.config, 'recentReconcileAt');
+    const lastFailure = this.getConfigDate(connection.config, 'recentReconcileErrorAt');
+    const lastAttemptAt = [lastSuccess, lastFailure]
+      .filter((value): value is Date => Boolean(value))
+      .sort((left, right) => right.getTime() - left.getTime())[0] ?? null;
+    return !lastAttemptAt || Date.now() - lastAttemptAt.getTime() >= intervalSeconds * 1000;
   }
 
   private getLeadSlaReconcileIntervalSeconds() {

@@ -33,4 +33,64 @@ describe('AmoSchedulerService worker roles', () => {
   it('does not run lead SLA fallback reconcile unless explicitly configured', () => {
     expect(service().getLeadSlaReconcileIntervalSeconds()).toBe(0);
   });
+
+  it('gives an overdue source reconciliation priority over a scheduled incremental sync', async () => {
+    process.env.WORKER_ROLE = 'sync';
+    const connection = {
+      id: 'connection-1',
+      status: 'ACTIVE',
+      lastFullSyncAt: new Date(),
+      lastPullSyncAt: new Date(Date.now() - 2 * 60_000),
+      config: {},
+    };
+    const prisma = {
+      amoConnection: { findFirst: jest.fn().mockResolvedValue(connection) },
+      syncJob: {
+        findFirst: jest.fn().mockResolvedValue(null),
+        count: jest.fn().mockResolvedValue(0),
+      },
+    } as any;
+    const sync = {
+      expireStaleJobs: jest.fn().mockResolvedValue(undefined),
+      trigger: jest.fn().mockResolvedValue(undefined),
+    } as any;
+    const config = {
+      get: jest.fn((key: string) => key === 'AMOCRM_RECENT_RECONCILE_INTERVAL_SECONDS' ? '60' : '1'),
+    } as any;
+    const scheduler = new AmoSchedulerService(prisma, sync, config);
+
+    await scheduler.tick();
+
+    expect(sync.trigger).not.toHaveBeenCalled();
+  });
+
+  it('allows scheduled incremental sync after a recent successful reconciliation', async () => {
+    process.env.WORKER_ROLE = 'sync';
+    const connection = {
+      id: 'connection-1',
+      status: 'ACTIVE',
+      lastFullSyncAt: new Date(),
+      lastPullSyncAt: new Date(Date.now() - 2 * 60_000),
+      config: { recentReconcileAt: new Date().toISOString() },
+    };
+    const prisma = {
+      amoConnection: { findFirst: jest.fn().mockResolvedValue(connection) },
+      syncJob: {
+        findFirst: jest.fn().mockResolvedValue(null),
+        count: jest.fn().mockResolvedValue(0),
+      },
+    } as any;
+    const sync = {
+      expireStaleJobs: jest.fn().mockResolvedValue(undefined),
+      trigger: jest.fn().mockResolvedValue(undefined),
+    } as any;
+    const config = {
+      get: jest.fn((key: string) => key === 'AMOCRM_RECENT_RECONCILE_INTERVAL_SECONDS' ? '60' : '1'),
+    } as any;
+    const scheduler = new AmoSchedulerService(prisma, sync, config);
+
+    await scheduler.tick();
+
+    expect(sync.trigger).toHaveBeenCalledWith(SyncJobType.INCREMENTAL);
+  });
 });
