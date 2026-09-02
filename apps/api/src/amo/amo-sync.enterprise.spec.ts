@@ -47,13 +47,27 @@ describe('AmoSyncService full snapshot safeguards', () => {
     };
     const stats: Record<string, number> = {};
 
-    await service.syncEvents(client, {}, stats, undefined, 'job-1');
+    await service.syncEvents(client, {}, stats, Math.floor(Date.now() / 1000) - 60, 'job-1');
 
     expect(service.upsertCrmEvent).toHaveBeenCalledTimes(2);
     expect(service.upsertCrmEvent).toHaveBeenNthCalledWith(1, expect.objectContaining({ id: 1 }), {});
     expect(service.upsertCrmEvent).toHaveBeenNthCalledWith(2, expect.objectContaining({ id: 2 }), {});
     expect(stats.events).toBe(2);
     expect(service.backfillStageHistoryFromStoredEvents).toHaveBeenCalled();
+  });
+
+  it('splits large event archives into bounded daily windows accepted by amoCRM', () => {
+    const service = createService({});
+    const windows = service.eventTimeWindows({
+      'filter[created_at][from]': 100,
+      'filter[created_at][to]': 172_900,
+    });
+
+    expect(windows).toEqual([
+      expect.objectContaining({ limit: 100, 'filter[created_at][from]': 100, 'filter[created_at][to]': 86_499 }),
+      expect.objectContaining({ limit: 100, 'filter[created_at][from]': 86_500, 'filter[created_at][to]': 172_899 }),
+      expect.objectContaining({ limit: 100, 'filter[created_at][from]': 172_900, 'filter[created_at][to]': 172_900 }),
+    ]);
   });
 
   it('marks deals absent from a complete amoCRM snapshot as deleted and verifies parity', async () => {

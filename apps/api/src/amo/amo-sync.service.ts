@@ -3015,24 +3015,27 @@ export class AmoSyncService {
 
     const seenEventIds = new Set<string>();
     let savedEvents = 0;
-    const ingest = async (eventParams: Record<string, string | number>) => {
-      await client.paginateBatch<any>('/events', 'events', eventParams, async (events, page) => {
-        for (const event of events) {
-          const externalId = String(event.id);
-          if (seenEventIds.has(externalId)) continue;
-          seenEventIds.add(externalId);
-          await this.upsertCrmEvent(event, maps);
-          savedEvents += 1;
-          if (savedEvents === 1 || savedEvents % 5000 === 0) {
-            this.logger.log(`syncEvents: saved ${savedEvents} unique events`);
-            if (jobId) await this.touchJob(jobId, `events:saved:${savedEvents}`);
+    const ingest = async (baseEventParams: Record<string, string | number>) => {
+      for (const eventParams of this.eventTimeWindows(baseEventParams)) {
+        const windowFrom = Number(eventParams['filter[created_at][from]']);
+        const windowTo = Number(eventParams['filter[created_at][to]']);
+        await client.paginateBatch<any>('/events', 'events', eventParams, async (events, page) => {
+          for (const event of events) {
+            const externalId = String(event.id);
+            if (seenEventIds.has(externalId)) continue;
+            seenEventIds.add(externalId);
+            await this.upsertCrmEvent(event, maps);
+            savedEvents += 1;
+            if (savedEvents === 1 || savedEvents % 5000 === 0) {
+              this.logger.log(`syncEvents: saved ${savedEvents} unique events`);
+            }
           }
-        }
-        if (page % 20 === 1) {
-          this.logger.log(`syncEvents: processed page ${page} (${savedEvents} unique events so far)`);
-          if (jobId) await this.touchJob(jobId, `events:page${page}`);
-        }
-      });
+          if (page % 20 === 1) {
+            this.logger.log(`syncEvents: processed window ${windowFrom}-${windowTo}, page ${page} (${savedEvents} unique events so far)`);
+          }
+          if (jobId) await this.touchJob(jobId, `events:window:${windowFrom}:page:${page}:saved:${savedEvents}`);
+        });
+      }
     };
 
     await ingest(params);
@@ -3042,6 +3045,31 @@ export class AmoSyncService {
 
     stats.events = seenEventIds.size;
     await this.backfillStageHistoryFromStoredEvents(maps, stats, updatedSince);
+  }
+
+  private eventTimeWindows(params: Record<string, string | number>) {
+    const fromKey = 'filter[created_at][from]';
+    const toKey = 'filter[created_at][to]';
+    const from = Number(params[fromKey]);
+    const requestedTo = params[toKey] === undefined
+      ? Math.floor(Date.now() / 1000)
+      : Number(params[toKey]);
+    if (!Number.isFinite(from) || !Number.isFinite(requestedTo) || requestedTo < from) {
+      return [{ ...params, limit: 100 }];
+    }
+
+    const windowSeconds = 24 * 60 * 60;
+    const windows: Array<Record<string, string | number>> = [];
+    for (let windowFrom = from; windowFrom <= requestedTo; windowFrom += windowSeconds) {
+      const windowTo = Math.min(requestedTo, windowFrom + windowSeconds - 1);
+      windows.push({
+        ...params,
+        limit: 100,
+        [fromKey]: windowFrom,
+        [toKey]: windowTo,
+      });
+    }
+    return windows;
   }
 
   private async syncWebhookRelatedEvents(

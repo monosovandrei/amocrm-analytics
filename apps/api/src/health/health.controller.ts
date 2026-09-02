@@ -6,6 +6,8 @@ import { METRIC_VERSION, RELEASE_BUILD_ID } from '../quality/release-info';
 
 const MB = 1024 * 1024;
 const PROCESS_STARTED_AT = new Date();
+const REPORT_ACTIVITY_WINDOW_MS = 60 * 60_000;
+const REQUIRED_WORKER_ROLES = ['sync', 'report', 'notification', 'export', 'bootstrap'];
 
 @Controller('health')
 export class HealthController {
@@ -50,6 +52,7 @@ export class HealthController {
   async health() {
     await this.prisma.$queryRaw`SELECT 1`;
     const now = Date.now();
+    const reportActivityCutoff = new Date(now - REPORT_ACTIVITY_WINDOW_MS);
     const connection = await this.prisma.amoConnection.findFirst({
       orderBy: { createdAt: 'desc' },
       select: {
@@ -109,7 +112,12 @@ export class HealthController {
       this.prisma.reportSnapshotJob.groupBy({
         by: ['status'],
         _count: { _all: true },
-        where: { status: { in: ['QUEUED', 'RUNNING', 'ERROR'] } },
+        where: {
+          OR: [
+            { status: { in: ['QUEUED', 'RUNNING'] } },
+            { status: 'ERROR', requestedAt: { gte: reportActivityCutoff } },
+          ],
+        },
       }),
       this.prisma.reportSnapshotJob.findFirst({
         where: { status: { in: ['QUEUED', 'RUNNING'] } },
@@ -118,8 +126,17 @@ export class HealthController {
       }),
       this.prisma.reportSnapshot.count({
         where: {
-          refreshStatus: { in: ['QUEUED', 'RUNNING', 'ERROR'] },
           refreshRequestedAt: { lt: new Date(Date.now() - 120_000) },
+          OR: [
+            { refreshStatus: { in: ['QUEUED', 'RUNNING'] } },
+            {
+              refreshStatus: 'ERROR',
+              OR: [
+                { refreshRequestedAt: { gte: reportActivityCutoff } },
+                { lastAccessedAt: { gte: reportActivityCutoff } },
+              ],
+            },
+          ],
         },
       }),
       this.prisma.workerRuntime.findMany({
@@ -147,8 +164,9 @@ export class HealthController {
       staleSnapshots,
       oldest: oldestReportJob,
     };
-    const workerRestartedRecently = workers.some((worker) => now - worker.startedAt.getTime() <= 10 * 60_000);
-    const staleWorkerHeartbeat = workers.some((worker) => now - worker.heartbeatAt.getTime() > 60_000);
+    const requiredWorkers = workers.filter((worker) => REQUIRED_WORKER_ROLES.includes(worker.role));
+    const workerRestartedRecently = requiredWorkers.some((worker) => now - worker.startedAt.getTime() <= 10 * 60_000);
+    const staleWorkerHeartbeat = requiredWorkers.some((worker) => now - worker.heartbeatAt.getTime() > 60_000);
     const redConditions = {
       syncLag: syncLagSeconds > 120,
       reportLag: reportLagSeconds > 120,
@@ -194,7 +212,7 @@ export class HealthController {
       workers: {
         restartedLast10Minutes: workerRestartedRecently,
         staleHeartbeat: staleWorkerHeartbeat,
-        items: workers.map((worker) => ({
+        items: requiredWorkers.map((worker) => ({
           role: worker.role,
           pid: worker.processId,
           startedAt: worker.startedAt,
