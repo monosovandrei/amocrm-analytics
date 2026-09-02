@@ -34,6 +34,32 @@ describe('AmoSchedulerService worker roles', () => {
     expect(service().getLeadSlaReconcileIntervalSeconds()).toBe(0);
   });
 
+  it('respects an explicitly disabled scheduled pull sync', async () => {
+    process.env.WORKER_ROLE = 'sync';
+    const prisma = {
+      amoConnection: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'connection-1',
+          status: 'ACTIVE',
+          lastFullSyncAt: new Date(),
+          lastPullSyncAt: new Date(Date.now() - 2 * 60_000),
+          config: {},
+        }),
+      },
+      syncJob: { findFirst: jest.fn().mockResolvedValue(null) },
+    } as any;
+    const sync = {
+      expireStaleJobs: jest.fn().mockResolvedValue(undefined),
+      trigger: jest.fn().mockResolvedValue(undefined),
+    } as any;
+    const config = { get: jest.fn(() => '0') } as any;
+    const scheduler = new AmoSchedulerService(prisma, sync, config);
+
+    await scheduler.tick();
+
+    expect(sync.trigger).not.toHaveBeenCalled();
+  });
+
   it('gives an overdue source reconciliation priority over a scheduled incremental sync', async () => {
     process.env.WORKER_ROLE = 'sync';
     const connection = {

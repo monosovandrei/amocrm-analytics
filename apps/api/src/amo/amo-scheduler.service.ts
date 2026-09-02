@@ -263,7 +263,7 @@ export class AmoSchedulerService {
     if (!rawInterval) return 1;
 
     const parsed = Number(rawInterval);
-    return Number.isFinite(parsed) ? Math.max(1, parsed) : 1;
+    return Number.isFinite(parsed) ? Math.max(0, parsed) : 1;
   }
 
   private getWebhookSubscriptionCheckMinutes() {
