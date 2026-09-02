@@ -33,7 +33,14 @@ describe('AmoSyncService full snapshot safeguards', () => {
   });
 
   it('streams events into storage and deduplicates repeated event categories', async () => {
-    const service = createService({});
+    const service = createService({
+      crmEvent: {
+        findMany: jest.fn()
+          .mockResolvedValueOnce([])
+          .mockResolvedValue([{ externalId: '1' }, { externalId: '2' }]),
+        count: jest.fn().mockResolvedValue(2),
+      },
+    });
     service.upsertCrmEvent = jest.fn().mockResolvedValue(undefined);
     service.backfillStageHistoryFromStoredEvents = jest.fn().mockResolvedValue(undefined);
     service.touchJob = jest.fn().mockResolvedValue(undefined);
@@ -53,7 +60,31 @@ describe('AmoSyncService full snapshot safeguards', () => {
     expect(service.upsertCrmEvent).toHaveBeenNthCalledWith(1, expect.objectContaining({ id: 1 }), {});
     expect(service.upsertCrmEvent).toHaveBeenNthCalledWith(2, expect.objectContaining({ id: 2 }), {});
     expect(stats.events).toBe(2);
+    expect(stats.eventsInserted).toBe(2);
     expect(service.backfillStageHistoryFromStoredEvents).toHaveBeenCalled();
+  });
+
+  it('does not rewrite immutable events that are already stored', async () => {
+    const service = createService({
+      crmEvent: {
+        findMany: jest.fn().mockResolvedValue([{ externalId: '1' }, { externalId: '2' }]),
+        count: jest.fn().mockResolvedValue(2),
+      },
+    });
+    service.upsertCrmEvent = jest.fn().mockResolvedValue(undefined);
+    service.backfillStageHistoryFromStoredEvents = jest.fn().mockResolvedValue(undefined);
+    service.touchJob = jest.fn().mockResolvedValue(undefined);
+    const client = {
+      paginateBatch: jest.fn(async (_path: string, _key: string, _params: unknown, onPage: any) => {
+        await onPage([{ id: 1 }, { id: 2 }], 1);
+      }),
+    };
+    const stats: Record<string, number> = {};
+
+    await service.syncEvents(client, {}, stats, Math.floor(Date.now() / 1000) - 60, 'job-1');
+
+    expect(service.upsertCrmEvent).not.toHaveBeenCalled();
+    expect(stats).toEqual(expect.objectContaining({ events: 2, eventsInserted: 0 }));
   });
 
   it('splits large event archives into bounded daily windows accepted by amoCRM', () => {

@@ -3013,27 +3013,32 @@ export class AmoSyncService {
       params['filter[created_at][from]'] = Math.floor(Date.now() / 1000) - 90 * 86400;
     }
 
-    const seenEventIds = new Set<string>();
-    let savedEvents = 0;
+    let fetchedEvents = 0;
+    let insertedEvents = 0;
     const ingest = async (baseEventParams: Record<string, string | number>) => {
       for (const eventParams of this.eventTimeWindows(baseEventParams)) {
         const windowFrom = Number(eventParams['filter[created_at][from]']);
         const windowTo = Number(eventParams['filter[created_at][to]']);
         await client.paginateBatch<any>('/events', 'events', eventParams, async (events, page) => {
-          for (const event of events) {
-            const externalId = String(event.id);
-            if (seenEventIds.has(externalId)) continue;
-            seenEventIds.add(externalId);
+          const uniqueEvents = [...new Map(events.map((event) => [String(event.id), event])).values()];
+          const externalIds = uniqueEvents.map((event) => String(event.id));
+          const existingEvents = externalIds.length > 0
+            ? await this.prisma.crmEvent.findMany({
+                where: { externalId: { in: externalIds } },
+                select: { externalId: true },
+              })
+            : [];
+          const existingIds = new Set(existingEvents.map((event) => event.externalId));
+          fetchedEvents += uniqueEvents.length;
+          for (const event of uniqueEvents) {
+            if (existingIds.has(String(event.id))) continue;
             await this.upsertCrmEvent(event, maps);
-            savedEvents += 1;
-            if (savedEvents === 1 || savedEvents % 5000 === 0) {
-              this.logger.log(`syncEvents: saved ${savedEvents} unique events`);
-            }
+            insertedEvents += 1;
           }
           if (page % 20 === 1) {
-            this.logger.log(`syncEvents: processed window ${windowFrom}-${windowTo}, page ${page} (${savedEvents} unique events so far)`);
+            this.logger.log(`syncEvents: processed window ${windowFrom}-${windowTo}, page ${page} (${fetchedEvents} fetched, ${insertedEvents} inserted)`);
           }
-          if (jobId) await this.touchJob(jobId, `events:window:${windowFrom}:page:${page}:saved:${savedEvents}`);
+          if (jobId) await this.touchJob(jobId, `events:window:${windowFrom}:page:${page}:fetched:${fetchedEvents}:inserted:${insertedEvents}`);
         });
       }
     };
@@ -3043,7 +3048,12 @@ export class AmoSyncService {
       await ingest({ ...params, 'filter[type]': type });
     }
 
-    stats.events = seenEventIds.size;
+    const eventFrom = Number(params['filter[created_at][from]']);
+    stats.events = await this.prisma.crmEvent.count({
+      where: Number.isFinite(eventFrom) ? { createdAt: { gte: new Date(eventFrom * 1000) } } : undefined,
+    });
+    stats.eventsFetched = fetchedEvents;
+    stats.eventsInserted = insertedEvents;
     await this.backfillStageHistoryFromStoredEvents(maps, stats, updatedSince);
   }
 
