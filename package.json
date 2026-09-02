@@ -28,6 +28,9 @@
   "devDependencies": {
     "typescript": "^5.5.0"
   },
+  "overrides": {
+    "fast-uri": "3.1.7"
+  },
   "engines": {
     "node": ">=20.0.0"
   }

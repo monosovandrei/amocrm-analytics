@@ -1,9 +1,11 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Interval } from '@nestjs/schedule';
+import { ReportRefreshProcessService } from './report-refresh-process.service';
 import { ReportsService } from './reports.service';
 
 const DEFAULT_STALE_QUEUE_BATCH_SIZE = 0;
-const DEFAULT_REFRESH_BATCH_SIZE = 1;
+const DEFAULT_REFRESH_BATCH_SIZE = 3;
+const MAX_REFRESH_BATCH_SIZE = 4;
 const DEFAULT_REFRESH_INTERVAL_MS = 10_000;
 
 @Injectable()
@@ -13,7 +15,10 @@ export class ReportsSchedulerService {
   private cacheRefreshBusy = false;
   private nextCacheRefreshAt = 0;
 
-  constructor(private readonly reports: ReportsService) {}
+  constructor(
+    private readonly reports: ReportsService,
+    private readonly reportRefreshProcess: ReportRefreshProcessService,
+  ) {}
 
   @Interval(10_000)
   async processExportJobs() {
@@ -38,7 +43,7 @@ export class ReportsSchedulerService {
     this.cacheRefreshBusy = true;
     this.nextCacheRefreshAt = now + this.resolveRefreshIntervalMs();
     try {
-      const refreshed = await this.reports.processReportCacheRefreshJobs(this.resolveRefreshBatchSize());
+      const refreshed = await this.reportRefreshProcess.process(this.resolveRefreshBatchSize());
       const staleQueueBatchSize = this.resolveStaleQueueBatchSize();
       const stale =
         refreshed.processed === 0 && staleQueueBatchSize > 0
@@ -65,7 +70,9 @@ export class ReportsSchedulerService {
     const raw = process.env.REPORT_CACHE_REFRESH_BATCH_SIZE;
     if (raw === undefined || raw.trim() === '') return DEFAULT_REFRESH_BATCH_SIZE;
     const value = Number(raw);
-    return Number.isFinite(value) && value > 0 ? Math.floor(value) : DEFAULT_REFRESH_BATCH_SIZE;
+    return Number.isFinite(value) && value > 0
+      ? Math.min(MAX_REFRESH_BATCH_SIZE, Math.floor(value))
+      : DEFAULT_REFRESH_BATCH_SIZE;
   }
 
   private resolveRefreshIntervalMs() {

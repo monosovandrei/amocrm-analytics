@@ -24,7 +24,7 @@ describe('ReportsSchedulerService report cache refresh defaults', () => {
   });
 
   function service() {
-    return new ReportsSchedulerService({} as any) as any;
+    return new ReportsSchedulerService({} as any, {} as any) as any;
   }
 
   it('disables proactive stale report queueing by default', () => {
@@ -45,23 +45,29 @@ describe('ReportsSchedulerService report cache refresh defaults', () => {
     expect(service().resolveStaleQueueBatchSize()).toBe(0);
   });
 
-  it('processes one memory-bounded report at a time by default', () => {
+  it('processes three isolated reports per pass by default', () => {
     delete process.env.REPORT_CACHE_REFRESH_BATCH_SIZE;
 
-    expect(service().resolveRefreshBatchSize()).toBe(1);
+    expect(service().resolveRefreshBatchSize()).toBe(3);
+  });
+
+  it('caps the refresh batch to four isolated processes', () => {
+    process.env.REPORT_CACHE_REFRESH_BATCH_SIZE = '100';
+
+    expect(service().resolveRefreshBatchSize()).toBe(4);
   });
 
   it('does not enqueue stale reports while active refresh jobs are waiting', async () => {
     delete process.env.REPORT_CACHE_REFRESH_BATCH_SIZE;
     process.env.WORKER_ROLE = 'report';
     const reports = {
-      processReportCacheRefreshJobs: jest.fn().mockResolvedValue({ processed: 2 }),
       enqueueStaleReportCacheRefreshJobs: jest.fn(),
     };
+    const refreshProcess = { process: jest.fn().mockResolvedValue({ processed: 2 }) };
 
-    await (new ReportsSchedulerService(reports as any) as any).processReportCacheRefreshJobs();
+    await (new ReportsSchedulerService(reports as any, refreshProcess as any) as any).processReportCacheRefreshJobs();
 
-    expect(reports.processReportCacheRefreshJobs).toHaveBeenCalledWith(1);
+    expect(refreshProcess.process).toHaveBeenCalledWith(3);
     expect(reports.enqueueStaleReportCacheRefreshJobs).not.toHaveBeenCalled();
   });
 
@@ -69,11 +75,11 @@ describe('ReportsSchedulerService report cache refresh defaults', () => {
     process.env.REPORT_CACHE_STALE_QUEUE_BATCH_SIZE = '3';
     process.env.WORKER_ROLE = 'report';
     const reports = {
-      processReportCacheRefreshJobs: jest.fn().mockResolvedValue({ processed: 0 }),
       enqueueStaleReportCacheRefreshJobs: jest.fn().mockResolvedValue({ queued: 3 }),
     };
+    const refreshProcess = { process: jest.fn().mockResolvedValue({ processed: 0 }) };
 
-    await (new ReportsSchedulerService(reports as any) as any).processReportCacheRefreshJobs();
+    await (new ReportsSchedulerService(reports as any, refreshProcess as any) as any).processReportCacheRefreshJobs();
 
     expect(reports.enqueueStaleReportCacheRefreshJobs).toHaveBeenCalledWith(3);
   });

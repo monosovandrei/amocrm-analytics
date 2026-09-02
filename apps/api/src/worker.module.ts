@@ -5,6 +5,7 @@ import { PrismaModule } from './prisma/prisma.module';
 import { AuditModule } from './audit/audit.module';
 import { ReportsModule } from './reports/reports.module';
 import { ReportsSchedulerService } from './reports/reports-scheduler.service';
+import { ReportRefreshProcessService } from './reports/report-refresh-process.service';
 import { PlatformModule } from './platform/platform.module';
 import { PlatformSchedulerService } from './platform/platform-scheduler.service';
 import { AmoModule } from './amo/amo.module';
@@ -24,6 +25,13 @@ import { DataQualitySchedulerService } from './quality/data-quality-scheduler.se
     AmoModule,
     QualityModule,
   ],
-  providers: [AmoSchedulerService, PlatformSchedulerService, ReportsSchedulerService, WorkerRuntimeService, DataQualitySchedulerService],
+  providers: [
+    AmoSchedulerService,
+    PlatformSchedulerService,
+    ReportsSchedulerService,
+    ReportRefreshProcessService,
+    WorkerRuntimeService,
+    DataQualitySchedulerService,
+  ],
 })
 export class WorkerModule {}
