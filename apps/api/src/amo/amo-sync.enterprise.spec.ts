@@ -32,6 +32,16 @@ describe('AmoSyncService full snapshot safeguards', () => {
     expect(service.pullResumeStage({ startedAt: null, cursor: { step: 'events' } })).toBeNull();
   });
 
+  it('bounds a stale reconciliation cursor by the configured recent lookback', () => {
+    const service = createService({});
+    const startedAt = new Date('2026-09-02T13:00:00.000Z');
+
+    expect(service.recentReconcileFrom(startedAt, new Date('2026-08-20T10:00:00.000Z')))
+      .toEqual(new Date('2026-09-02T12:30:00.000Z'));
+    expect(service.recentReconcileFrom(startedAt, new Date('2026-09-02T12:50:00.000Z')))
+      .toEqual(new Date('2026-09-02T12:48:00.000Z'));
+  });
+
   it('restores the exact event stream and time window from a saved cursor', () => {
     const service = createService({});
 

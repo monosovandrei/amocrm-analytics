@@ -432,11 +432,7 @@ export class AmoSyncService {
     const startedAt = new Date();
     const connectionConfig = this.connectionConfig(connection);
     const previousCursor = this.parseConfigDate(connectionConfig.recentReconcileAt);
-    const lookbackMs = this.getRecentReconcileLookbackMinutes() * 60_000;
-    const overlapMs = this.getRecentReconcileOverlapMinutes() * 60_000;
-    const earliestAllowed = startedAt.getTime() - lookbackMs;
-    const cursorFrom = previousCursor ? previousCursor.getTime() - overlapMs : earliestAllowed;
-    const syncFrom = new Date(cursorFrom);
+    const syncFrom = this.recentReconcileFrom(startedAt, previousCursor);
     const updatedSince = Math.floor(syncFrom.getTime() / 1000);
     const stats: Record<string, number> = {};
 
@@ -1119,6 +1115,14 @@ export class AmoSyncService {
     if (type === 'FULL') return undefined;
     if (!lastPullSyncAt) return Math.floor((Date.now() - 5 * 60_000) / 1000);
     return Math.floor((lastPullSyncAt.getTime() - 5 * 60_000) / 1000);
+  }
+
+  private recentReconcileFrom(startedAt: Date, previousCursor: Date | null) {
+    const lookbackMs = this.getRecentReconcileLookbackMinutes() * 60_000;
+    const overlapMs = this.getRecentReconcileOverlapMinutes() * 60_000;
+    const earliestAllowed = startedAt.getTime() - lookbackMs;
+    const requestedFrom = previousCursor ? previousCursor.getTime() - overlapMs : earliestAllowed;
+    return new Date(Math.max(earliestAllowed, requestedFrom));
   }
 
   private pullResumeStage(job: SyncJobWithConnection): PullStage | null {
