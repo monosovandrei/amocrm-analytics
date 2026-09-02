@@ -11,6 +11,7 @@ Environment=NODE_OPTIONS=--max-old-space-size=512
 Environment=REPORT_CACHE_REFRESH_BATCH_SIZE=3
 Environment=REPORT_CACHE_STALE_QUEUE_BATCH_SIZE=0
 Environment=REPORT_REFRESH_PROCESS_TIMEOUT_MS=300000
+Environment=REPORT_MAX_RANGE_DAYS=1827
 Environment=WORKER_RECYCLE_RSS_MB=650
 ExecStart=/usr/bin/node --expose-gc dist/report-worker.js
 Restart=always

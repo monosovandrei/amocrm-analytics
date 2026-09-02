@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { ForbiddenException, Injectable, Logger, NotFoundException, Optional, ServiceUnavailableException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, Injectable, Logger, NotFoundException, Optional, ServiceUnavailableException } from '@nestjs/common';
 import { ExportJobStatus, Prisma, ReportSourceType, UserRole } from '../generated/prisma';
 import {
   absoluteDurationDays,
@@ -125,8 +125,11 @@ const DEFAULT_WORKER_RECYCLE_RSS_MB = 650;
 const DEFAULT_REPORT_CACHE_STALE_TOLERANCE_SECONDS = 90;
 const DEFAULT_REPORT_SNAPSHOT_STALE_ENQUEUE_LIMIT = 4;
 const DEFAULT_REPORT_SNAPSHOT_STALE_REQUEUE_COOLDOWN_SECONDS = 300;
+const DEFAULT_REPORT_MAX_RANGE_DAYS = 1_827;
+const MAX_REPORT_MAX_RANGE_DAYS = 3_653;
 const EXPORTS_DIR = process.env.REPORT_EXPORT_DIR || '/tmp/amocrm-analytics-exports';
 const MB = 1024 * 1024;
+const DAY_MS = 86_400_000;
 
 function normalizeCustomFieldName(value: unknown) {
   return String(value ?? '').trim().toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ');
@@ -158,6 +161,7 @@ export class ReportsService {
   ) {}
 
   async compute(dto: ReportQueryDto, user: { id: string; role: UserRole }) {
+    this.assertReportPeriod(dto);
     const cacheKey = this.reportCacheKey(dto, user);
     const latestSyncAt = await this.latestReportSourceSyncAt();
     const cached = await this.getCachedReport(cacheKey);
@@ -176,6 +180,7 @@ export class ReportsService {
   }
 
   async snapshots(dtos: ReportQueryDto[], user: { id: string; role: UserRole }) {
+    for (const dto of dtos) this.assertReportPeriod(dto);
     await this.ensureReportCacheTable();
     const latestSyncAt = await this.latestReportSourceSyncAt();
     const reports = dtos.map((dto, index) => ({
@@ -289,6 +294,7 @@ export class ReportsService {
   }
 
   private async computeFresh(dto: ReportQueryDto, user: { id: string; role: UserRole }) {
+    this.assertReportPeriod(dto);
     return this.withFreshComputeSlot(async () => {
       const filters = dto.filters as ReportFilters;
       const config = dto.config as ReportConfig;
@@ -1637,6 +1643,7 @@ export class ReportsService {
   }
 
   async saveTemplate(dto: SaveReportTemplateDto, userId: string) {
+    this.assertReportPeriod(dto);
     const existing = dto.id ? await this.db.reportTemplate.findUnique({ where: { id: dto.id } }) : null;
     if (existing?.userId && existing.userId !== userId) {
       const actor = await this.db.user.findUnique({ where: { id: userId }, select: { role: true } });
@@ -1733,6 +1740,7 @@ export class ReportsService {
   }
 
   async enqueueExport(dto: ReportQueryDto, user: { id: string; role: UserRole }) {
+    this.assertReportPeriod(dto);
     await this.assertReportAvailable(dto, await this.latestReportSourceSyncAt());
     const job = await this.prisma.exportJob.create({
       data: {
@@ -5459,6 +5467,37 @@ ${sheets}
     if (filters.dateFrom) range.gte = this.parseFilterDate(filters.dateFrom, false);
     if (filters.dateTo) range.lte = this.parseFilterDate(filters.dateTo, true);
     return Object.keys(range).length ? range : undefined;
+  }
+
+  private assertReportPeriod(dto: Pick<ReportQueryDto, 'filters'>) {
+    const filters = dto.filters as ReportFilters;
+    const hasFrom = Boolean(filters.dateFrom);
+    const hasTo = Boolean(filters.dateTo);
+    if (!hasFrom && !hasTo) return;
+    if (hasFrom !== hasTo) {
+      throw new BadRequestException('Для периода отчёта нужны обе даты: начало и конец');
+    }
+
+    const from = this.parseFilterDate(filters.dateFrom!, false);
+    const to = this.parseFilterDate(filters.dateTo!, true);
+    if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) {
+      throw new BadRequestException('Период отчёта содержит некорректную дату');
+    }
+    if (from > to) {
+      throw new BadRequestException('Начало периода отчёта не может быть позже конца');
+    }
+
+    const rangeDays = Math.ceil((to.getTime() - from.getTime()) / DAY_MS);
+    const maxRangeDays = this.reportMaxRangeDays();
+    if (rangeDays > maxRangeDays) {
+      throw new BadRequestException(`Период отчёта не может превышать ${maxRangeDays} дней`);
+    }
+  }
+
+  private reportMaxRangeDays() {
+    const value = Number(process.env.REPORT_MAX_RANGE_DAYS);
+    if (!Number.isFinite(value) || value <= 0) return DEFAULT_REPORT_MAX_RANGE_DAYS;
+    return Math.min(MAX_REPORT_MAX_RANGE_DAYS, Math.floor(value));
   }
 
   private legacyStageFilters(metric: DataContractMetric, filters: ReportFilters): ReportFilters | null {

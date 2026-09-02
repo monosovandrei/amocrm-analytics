@@ -264,6 +264,22 @@ describe('ReportsService data contract', () => {
     expect(range.lte.toISOString()).toBe('2026-07-20T20:59:59.999Z');
   });
 
+  it('rejects an excessive report period before querying data', () => {
+    expect(() =>
+      (service as any).assertReportPeriod({
+        filters: { dateFrom: '0002-06-01', dateTo: '2026-08-27' },
+      }),
+    ).toThrow('Период отчёта не может превышать 1827 дней');
+  });
+
+  it('requires both report period boundaries', () => {
+    expect(() =>
+      (service as any).assertReportPeriod({
+        filters: { dateFrom: '2026-08-01' },
+      }),
+    ).toThrow('Для периода отчёта нужны обе даты');
+  });
+
   it('queues stale cached report refresh instead of recomputing inside API', async () => {
     const cachedPayload = { rows: [{ id: 'cached-row' }] };
     const db = {

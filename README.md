@@ -69,6 +69,7 @@ cp .env.example .env
 - `REPORT_CACHE_REFRESH_BATCH_SIZE` - сколько изолированных процессов пересчёта report-worker запускает последовательно за тик; для production `3`, максимум `4`.
 - `REPORT_CACHE_REFRESH_INTERVAL_MS` - пауза между тиками report-worker; для production рекомендуется `10000`.
 - `REPORT_REFRESH_PROCESS_TIMEOUT_MS` - максимальное время одного изолированного пересчёта; для production `300000`.
+- `REPORT_MAX_RANGE_DAYS` - максимальная длина периода отчёта; для production `1827` дней, чтобы ошибочная дата не запускала многолетний расчёт.
 - `REPORT_SNAPSHOT_STALE_ENQUEUE_LIMIT` - сколько уже закэшированных stale-отчётов один запрос страницы может поставить на пересчёт; для production рекомендуется `4`.
 - `REPORT_SNAPSHOT_STALE_REQUEUE_COOLDOWN_SECONDS` - минимальная пауза перед повторной постановкой уже пересчитанного stale-отчёта; для production рекомендуется `300`.
 - `WORKER_RECYCLE_RSS_MB` - мягкий перезапуск после завершения текущего отчёта; для production `650`, ниже systemd `MemoryMax`.
