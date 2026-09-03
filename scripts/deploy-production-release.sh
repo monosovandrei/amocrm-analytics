@@ -12,6 +12,7 @@ HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:4000/api/v1/health}"
 METRIC_VERSION_VALUE="${METRIC_VERSION:-2026-08-31.1}"
 
 SERVICES=(
+  analytics-tcp-mtu.service
   analytics.service
   analytics-sync-worker.service
   analytics-report-worker.service
@@ -93,6 +94,10 @@ npm run db:deploy
 for unit in "$RELEASE"/deploy/systemd/*.service; do
   install -m 0644 "$unit" "/etc/systemd/system/$(basename "$unit")"
 done
+for sysctl_config in "$RELEASE"/deploy/sysctl/*.conf; do
+  install -m 0644 "$sysctl_config" "/etc/sysctl.d/$(basename "$sysctl_config")"
+done
+sysctl -p /etc/sysctl.d/99-amocrm-tcp-mtu.conf >/dev/null
 systemctl daemon-reload
 systemctl enable "${SERVICES[@]}" >/dev/null
 
