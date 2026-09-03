@@ -8,7 +8,10 @@ Before=analytics.service
 Type=oneshot
 RemainAfterExit=yes
 ExecStartPre=-/usr/sbin/iptables -t mangle -D PREROUTING -p tcp --dport 443 --tcp-flags SYN,RST SYN -m tcpmss --mss 1381:65535 -j TCPMSS --set-mss 1380
+ExecStartPre=-/usr/sbin/iptables -t mangle -D POSTROUTING -p tcp --sport 443 --tcp-flags SYN,RST SYN -m tcpmss --mss 1381:65535 -j TCPMSS --set-mss 1380
 ExecStart=/usr/sbin/iptables -t mangle -A PREROUTING -p tcp --dport 443 --tcp-flags SYN,RST SYN -m tcpmss --mss 1381:65535 -j TCPMSS --set-mss 1380
+ExecStart=/usr/sbin/iptables -t mangle -A POSTROUTING -p tcp --sport 443 --tcp-flags SYN,RST SYN -m tcpmss --mss 1381:65535 -j TCPMSS --set-mss 1380
+ExecStop=-/usr/sbin/iptables -t mangle -D POSTROUTING -p tcp --sport 443 --tcp-flags SYN,RST SYN -m tcpmss --mss 1381:65535 -j TCPMSS --set-mss 1380
 ExecStop=-/usr/sbin/iptables -t mangle -D PREROUTING -p tcp --dport 443 --tcp-flags SYN,RST SYN -m tcpmss --mss 1381:65535 -j TCPMSS --set-mss 1380
 
 [Install]
