@@ -31,7 +31,8 @@ export class FactMartsService {
       FROM (
         SELECT deal."id" AS deal_id
         FROM "Deal" deal
-        WHERE deal."updatedAt" >= ${cutoff}
+        WHERE deal."syncedAt" >= ${cutoff}
+           OR deal."updatedAt" >= ${cutoff}
            OR deal."deletedAt" >= ${cutoff}
            OR deal."closedAt" >= ${cutoff}
 
@@ -39,7 +40,15 @@ export class FactMartsService {
 
         SELECT history."dealId" AS deal_id
         FROM "DealStageHistory" history
-        WHERE history."movedAt" >= ${cutoff}
+        WHERE history."ingestedAt" >= ${cutoff}
+           OR history."movedAt" >= ${cutoff}
+
+        UNION ALL
+
+        SELECT deal."id" AS deal_id
+        FROM "Deal" deal
+        JOIN "Contact" contact ON contact."id" = deal."contactId"
+        WHERE contact."updatedAt" >= ${cutoff}
 
         UNION ALL
 

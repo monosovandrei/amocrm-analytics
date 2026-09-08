@@ -495,6 +495,7 @@ model Deal {
   createdAt       DateTime
   updatedAt       DateTime
   deletedAt       DateTime?
+  syncedAt        DateTime @default(now()) @updatedAt
 
   pipeline    Pipeline      @relation(fields: [pipelineId], references: [id], onDelete: Restrict)
   stage       PipelineStage @relation(fields: [stageId], references: [id], onDelete: Restrict)
@@ -513,6 +514,7 @@ model Deal {
   @@index([responsibleId])
   @@index([closedAt])
   @@index([updatedAt])
+  @@index([syncedAt])
 }
 
 model DealStageHistory {
@@ -524,6 +526,7 @@ model DealStageHistory {
   movedById   String?
   source      String   @default("sync")
   raw         Json     @default("{}")
+  ingestedAt  DateTime @default(now())
 
   deal      Deal           @relation(fields: [dealId], references: [id], onDelete: Cascade)
   fromStage PipelineStage? @relation("FromStage", fields: [fromStageId], references: [id], onDelete: SetNull)
@@ -531,6 +534,7 @@ model DealStageHistory {
 
   @@index([dealId, movedAt])
   @@index([toStageId, movedAt])
+  @@index([ingestedAt])
 }
 
 model DealResponsibleHistory {

@@ -22,4 +22,25 @@ describe('FactMartsService refresh serialization', () => {
     expect(tx.$queryRaw.mock.invocationCallOrder[0])
       .toBeLessThan(service.refreshDealFacts.mock.invocationCallOrder[0]);
   });
+
+  it('selects delayed CRM changes by local ingestion time', async () => {
+    const prisma = {
+      $queryRaw: jest.fn().mockResolvedValue([]),
+    };
+    const service = new FactMartsService(prisma as any) as any;
+    service.refreshDeals = jest.fn().mockResolvedValue({
+      dealCurrent: 0,
+      stageTransitions: 0,
+      stageIntervals: 0,
+      emailThreads: 0,
+    });
+
+    await service.refreshRecentlyChanged(15);
+
+    const query = prisma.$queryRaw.mock.calls[0][0] as unknown as readonly string[];
+    const sql = Array.from(query).join(' ');
+    expect(sql).toContain('deal."syncedAt"');
+    expect(sql).toContain('history."ingestedAt"');
+    expect(sql).toContain('contact."updatedAt"');
+  });
 });
