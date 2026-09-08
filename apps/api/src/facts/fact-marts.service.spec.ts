@@ -43,4 +43,21 @@ describe('FactMartsService refresh serialization', () => {
     expect(sql).toContain('history."ingestedAt"');
     expect(sql).toContain('contact."updatedAt"');
   });
+
+  it('uses a full rebuild instead of exceeding the database bind limit', async () => {
+    const service = new FactMartsService({} as any) as any;
+    service.refreshAll = jest.fn().mockResolvedValue({
+      dealCurrent: 47_000,
+      stageTransitions: 90_000,
+      stageIntervals: 90_000,
+      emailThreads: 16_000,
+    });
+
+    const result = await service.refreshDeals(
+      Array.from({ length: 10_001 }, (_, index) => `deal-${index}`),
+    );
+
+    expect(service.refreshAll).toHaveBeenCalledTimes(1);
+    expect(result.dealCurrent).toBe(47_000);
+  });
 });

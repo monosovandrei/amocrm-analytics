@@ -4,6 +4,7 @@ import { PrismaService } from '../prisma/prisma.service';
 
 const RECENT_FACT_REFRESH_MINUTES = 15;
 const FACT_REFRESH_TRANSACTION_TIMEOUT_MS = 120_000;
+const MAX_INCREMENTAL_FACT_DEALS = 10_000;
 
 type FactMartDb = PrismaService | Prisma.TransactionClient;
 
@@ -64,6 +65,10 @@ export class FactMartsService {
   async refreshDeals(dealIds: string[]) {
     const ids = [...new Set(dealIds.filter(Boolean))];
     if (ids.length === 0) return { dealCurrent: 0, stageTransitions: 0, stageIntervals: 0, emailThreads: 0 };
+    if (ids.length > MAX_INCREMENTAL_FACT_DEALS) {
+      this.logger.warn(`Incremental fact refresh received ${ids.length} deals; switching to a full refresh`);
+      return this.refreshAll();
+    }
     await this.withRefreshLock(async (tx) => {
       await this.refreshDealFacts(ids, tx);
       await this.refreshEmailThreadFacts(ids, tx);
