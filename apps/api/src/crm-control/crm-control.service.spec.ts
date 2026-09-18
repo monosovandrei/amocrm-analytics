@@ -1,6 +1,7 @@
 import { CrmControlService } from './crm-control.service';
 import { controlScheduleSlot, nextControlCaseState, observationCounts } from './crm-control.logic';
 import { CrmControlRuleInput, CrmControlRuleResult, DEFAULT_CRM_CONTROL_CONFIG } from './crm-control.types';
+import { CRM_CONTROL_RULE_VERSION, evaluateCrmControlDeal } from './crm-control.rules';
 
 const actor = { id: 'actor', email: 'owner@example.test', role: 'ADMIN' as const, businessRole: 'OWNER' as const };
 const result = (status: CrmControlRuleResult['status'], extra: Partial<CrmControlRuleResult> = {}): CrmControlRuleResult => ({
@@ -117,6 +118,32 @@ describe('CRM control immutable observations and case episodes', () => {
     expect(fixture.cases[1].status).toBe('REVIEW');
     expect(fixture.cases[1].confirmedAt).toBeUndefined();
   });
+
+  it('retires prior task-stage limits after an explicit unlimited policy even if current tasks cannot be read', async () => {
+    const fixture = memory();
+    const value = input();
+    value.scope.stageRules = { stage: { deadlineMode: 'unlimited' } };
+    value.sourceCompleteness.tasks = false;
+    await fixture.persist('policy-change', value, evaluateCrmControlDeal(value));
+    expect(fixture.tx.crmControlCase.updateMany).toHaveBeenCalledWith({
+      where: { dealId: value.deal.id, ruleCode: 'task_stage_deadline', activeKey: { not: null } },
+      data: { status: 'RESOLVED', activeKey: null, resolvedAt: observedAt, latestObservationId: fixture.observations[0].id },
+    });
+    expect(fixture.results.find((row) => row.ruleCode === 'task_deadline').status).toBe('UNKNOWN');
+    expect(fixture.results.find((row) => row.ruleCode === 'task_stage_deadline').status).toBe('NA');
+  });
+
+  it('keeps an existing violation open when a stage is configured as absent', async () => {
+    const fixture = memory();
+    await fixture.persist('before', input(), [result('FAIL', { ruleCode: 'intake_stage' })]);
+    const caseId = fixture.cases[0].id;
+    const value = input();
+    value.scope.assignedStageId = null;
+    await fixture.persist('mapping-change', value, evaluateCrmControlDeal(value));
+    expect(fixture.cases.find((item) => item.id === caseId).status).toBe('OPEN');
+    expect(fixture.results[0].status).toBe('FAIL');
+    expect(fixture.results.find((item) => item.observationId !== fixture.results[0].observationId && item.ruleCode === 'intake_stage').status).toBe('NA');
+  });
 });
 
 describe('CRM control source coverage, access and scheduling', () => {
@@ -155,6 +182,22 @@ describe('CRM control source coverage, access and scheduling', () => {
     expect(controlScheduleSlot(new Date('2026-09-18T16:05:00Z'), config)).toBe('2026-09-18');
     expect(controlScheduleSlot(new Date('2026-09-19T16:05:00Z'), config)).toBeNull();
     expect(controlScheduleSlot(new Date('2026-09-18T16:05:00Z'), { ...config, enabled: false })).toBeNull();
+  });
+
+  it('records the new rule version for both manual and scheduled runs', async () => {
+    const config = { ...DEFAULT_CRM_CONTROL_CONFIG, enabled: true, scopes: [{ department: 'sales', pipelineId: 'pipeline' }] };
+    const prisma = {
+      user: { findUnique: jest.fn().mockResolvedValue({ id: actor.id, name: 'Владелец', isActive: true, businessRole: 'OWNER' }) },
+      crmControlSettings: { findUnique: jest.fn().mockResolvedValue({ version: 7, config }) },
+      crmControlRun: { upsert: jest.fn(async ({ create }) => ({ id: 'new-run', ...create })) },
+    };
+    const service = new CrmControlService(prisma as any, {} as any, {} as any);
+    const run = await service.enqueue(actor);
+    expect(run.ruleVersion).toBe(CRM_CONTROL_RULE_VERSION);
+    await service.schedule(observedAt);
+    expect(prisma.crmControlRun.upsert).toHaveBeenLastCalledWith(expect.objectContaining({
+      create: expect.objectContaining({ ruleVersion: CRM_CONTROL_RULE_VERSION, configVersion: 7 }),
+    }));
   });
 
   it('does not execute another run while a durable global lease is held', async () => {
@@ -204,6 +247,61 @@ describe('CRM control source coverage, access and scheduling', () => {
     const service = new CrmControlService(prisma as any, {} as any, {} as any);
     await expect((service as any).validateConfig({ ...DEFAULT_CRM_CONTROL_CONFIG, scopes: [null] })).rejects.toMatchObject({ status: 400 });
     await expect((service as any).validateConfig({ ...DEFAULT_CRM_CONTROL_CONFIG, scopes: [{ pipelineId: 'pipeline', department: 'sales', stageRules: { stage: null } }] })).rejects.toMatchObject({ status: 400 });
+  });
+
+  it.each([
+    { deadlineMode: 'business_days', maxBusinessDays: 0 },
+    { deadlineMode: 'business_days', maxBusinessDays: 1.5 },
+    { deadlineMode: 'business_days', maxBusinessDays: 3651 },
+    { deadlineMode: 'business_days', maxBusinessDays: '3' },
+    { deadlineMode: 'business_days' },
+    { deadlineMode: 'business_days', maxBusinessDays: 1, maxDurationHours: 24 },
+    { deadlineMode: 'elapsed' },
+    { deadlineMode: 'elapsed', maxDurationHours: 24, maxBusinessDays: 1 },
+    { maxBusinessDays: 3 },
+    { deadlineMode: 'end_of_day', maxDurationHours: 24 },
+    { deadlineMode: 'unlimited', maxBusinessDays: 1 },
+    { deadlineMode: 'unknown' },
+  ])('rejects invalid or conflicting stage deadline settings: %j', async (rule) => {
+    const prisma = { pipeline: { findMany: jest.fn().mockResolvedValue([{ id: 'pipeline', stages: [{ id: 'stage' }] }]) } };
+    const service = new CrmControlService(prisma as any, {} as any, {} as any);
+    await expect((service as any).validateConfig({ ...DEFAULT_CRM_CONTROL_CONFIG,
+      scopes: [{ pipelineId: 'pipeline', department: 'sales', stageRules: { stage: rule } }] })).rejects.toMatchObject({ status: 400 });
+  });
+
+  it.each([
+    {}, { maxDurationHours: 24 }, { deadlineMode: 'elapsed', maxDurationHours: 0.5 },
+    { deadlineMode: 'business_days', maxBusinessDays: 3650 }, { deadlineMode: 'end_of_day' }, { deadlineMode: 'unlimited' },
+  ])('preserves supported stage deadline settings and per-scope age policy: %j', async (rule) => {
+    const prisma = { pipeline: { findMany: jest.fn().mockResolvedValue([{ id: 'pipeline', stages: [{ id: 'stage' }] }]) } };
+    const service = new CrmControlService(prisma as any, {} as any, {} as any);
+    const config = { ...DEFAULT_CRM_CONTROL_CONFIG,
+      scopes: [{ pipelineId: 'pipeline', department: 'sales', checkDealAge: false, stageRules: { stage: rule } }] };
+    await expect((service as any).validateConfig(config)).resolves.toEqual(config);
+    await expect((service as any).validateConfig({ ...config, scopes: [{ ...config.scopes[0], checkDealAge: 'false' }] })).rejects.toMatchObject({ status: 400 });
+  });
+
+  it('recognizes configured calendar and unlimited deadlines as complete settings', () => {
+    const service = new CrmControlService({} as any, {} as any, {} as any);
+    for (const rule of [{ deadlineMode: 'business_days', maxBusinessDays: 1 }, { deadlineMode: 'end_of_day' }, { deadlineMode: 'unlimited' }]) {
+      const config = { ...DEFAULT_CRM_CONTROL_CONFIG, scopes: [{ pipelineId: 'pipeline', department: 'sales', stageRules: { stage: rule } }] };
+      const issues = (service as any).configurationIssues(config, [{ id: 'pipeline', name: 'Продажи', stages: [{ id: 'stage' }] }]);
+      expect(issues).not.toContain('Продажи: сроки для части этапов не настроены.');
+    }
+  });
+
+  it('accepts explicit absent stage mappings without warnings while rejecting nonexistent IDs', async () => {
+    const pipeline = { id: 'pipeline', name: 'Закреплённые компании', stages: [{ id: 'stage' }] };
+    const prisma = { pipeline: { findMany: jest.fn().mockResolvedValue([pipeline]) } };
+    const service = new CrmControlService(prisma as any, {} as any, {} as any);
+    const scope = { pipelineId: 'pipeline', department: 'csm', assignedStageId: null, newClientStageId: null,
+      baseStageId: null, preparedProposalStageId: null, priceRequestedStageId: null, stageRules: { stage: { deadlineMode: 'unlimited' } } };
+    const config = { ...DEFAULT_CRM_CONTROL_CONFIG, scopes: [scope] };
+    await expect((service as any).validateConfig(config)).resolves.toEqual(config);
+    expect((service as any).configurationIssues(config, [pipeline]).some((issue: string) => issue.includes('не настроен этап'))).toBe(false);
+    const unconfigured = { ...config, scopes: [{ ...scope, newClientStageId: undefined }] };
+    expect((service as any).configurationIssues(unconfigured, [pipeline])).toContain('Закреплённые компании: не настроен этап «Новый клиент».');
+    await expect((service as any).validateConfig({ ...config, scopes: [{ ...scope, newClientStageId: 'missing' }] })).rejects.toMatchObject({ status: 400 });
   });
 });
 

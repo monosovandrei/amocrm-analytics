@@ -349,6 +349,12 @@
   max-width: 540px;
 }
 
+.crm-control .crm-deadline-editor {
+  display: grid;
+  gap: 14px;
+  max-width: 540px;
+}
+
 .crm-control .crm-checks {
   display: flex;
   flex-wrap: wrap;

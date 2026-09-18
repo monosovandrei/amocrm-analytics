@@ -5,7 +5,8 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AuthUser } from '../auth/jwt.strategy';
 import { AmoService } from '../amo/amo.service';
 import { CrmControlEvidenceService } from './crm-control-evidence.service';
-import { CRM_CONTROL_RULE_CATALOG, evaluateCrmControlDeal } from './crm-control.rules';
+import { CRM_CONTROL_RULE_CATALOG, CRM_CONTROL_RULE_VERSION, evaluateCrmControlDeal } from './crm-control.rules';
+import { hasStageDeadline, stageDeadlineConfigError } from './crm-control-deadline';
 import { CrmControlConfig, CrmControlCounts, CrmControlDecisionInput, CrmControlRuleInput, CrmControlRuleResult,
   CrmControlScope, DEFAULT_CRM_CONTROL_CONFIG } from './crm-control.types';
 import { addControlCounts, controlScheduleSlot, emptyControlCounts, nextControlCaseState, observationCounts } from './crm-control.logic';
@@ -106,10 +107,10 @@ export class CrmControlService {
       const pipeline = pipelines.find((item) => item.id === scope.pipelineId);
       if (!pipeline) { issues.push('Выбранная воронка больше недоступна.'); continue; }
       const needed = scope.department === 'sales' ? ['assignedStageId', 'preparedProposalStageId'] : ['newClientStageId', 'baseStageId', 'preparedProposalStageId', 'priceRequestedStageId'];
-      for (const field of needed) if (!(scope as any)[field]) issues.push(`${pipeline.name}: не настроен этап ${this.stageLabel(field)}.`);
+      for (const field of needed) if ((scope as any)[field] !== null && !(scope as any)[field]) issues.push(`${pipeline.name}: не настроен этап ${this.stageLabel(field)}.`);
       const openStages = pipeline.stages.filter((stage) => !stage.isWon && !stage.isLost && stage.id !== scope.baseStageId);
       if (openStages.some((stage) => !scope.stageRules?.[stage.id]?.allowedTaskTypeIds?.length)) issues.push(`${pipeline.name}: типы задач для части этапов не настроены.`);
-      if (openStages.some((stage) => !scope.stageRules?.[stage.id]?.maxDurationHours)) issues.push(`${pipeline.name}: сроки для части этапов не настроены.`);
+      if (openStages.some((stage) => !hasStageDeadline(scope.stageRules?.[stage.id]))) issues.push(`${pipeline.name}: сроки для части этапов не настроены.`);
     }
     return issues;
   }
@@ -143,6 +144,7 @@ export class CrmControlService {
       if (!scope || typeof scope !== 'object' || Array.isArray(scope) || typeof scope.pipelineId !== 'string') throw new BadRequestException('Неверные настройки воронки');
       const pipeline = pipelines.find((item) => item.id === scope.pipelineId);
       if (!pipeline || seen.has(scope.pipelineId) || !['sales', 'csm'].includes(scope.department)) throw new BadRequestException('Воронка отсутствует или выбрана повторно');
+      if (scope.checkDealAge !== undefined && typeof scope.checkDealAge !== 'boolean') throw new BadRequestException('Неверное правило возраста для воронки');
       seen.add(scope.pipelineId);
       for (const key of ['assignedStageId', 'newClientStageId', 'baseStageId', 'preparedProposalStageId', 'priceRequestedStageId']) {
         const id = (scope as any)[key];
@@ -152,7 +154,8 @@ export class CrmControlService {
       for (const [stageId, rule] of Object.entries(scope.stageRules ?? {})) {
         if (!rule || typeof rule !== 'object' || Array.isArray(rule)) throw new BadRequestException('Неверный норматив этапа');
         if (!pipeline.stages.some((stage) => stage.id === stageId)) throw new BadRequestException('Срок задан для чужого этапа');
-        if (rule.maxDurationHours != null && (!Number.isFinite(rule.maxDurationHours) || rule.maxDurationHours <= 0 || rule.maxDurationHours > 87600)) throw new BadRequestException('Срок этапа должен быть больше нуля');
+        const deadlineError = stageDeadlineConfigError(rule);
+        if (deadlineError) throw new BadRequestException(deadlineError);
         if (rule.allowedTaskTypeIds != null && (!Array.isArray(rule.allowedTaskTypeIds) || rule.allowedTaskTypeIds.some((id) => !Number.isInteger(id) || id < 1))) throw new BadRequestException('Неверные типы задач');
         for (const id of rule.allowedTaskTypeIds ?? []) selectedTaskTypes.add(id);
       }
@@ -177,7 +180,7 @@ export class CrmControlService {
     const requestKey = body.requestKey ? String(body.requestKey).slice(0, 120) : randomUUID();
     const run = await this.prisma.crmControlRun.upsert({ where: { requestKey: `manual:${actor.id}:${requestKey}` },
       create: { requestKey: `manual:${actor.id}:${requestKey}`, trigger: body.sourceRunId ? 'RECHECK' : 'MANUAL', requestedBy: actor.id,
-        sourceRunId: body.sourceRunId, scheduledFor: new Date(), config: json({ ...stored.config, _access: access }), configVersion: stored.version }, update: {} });
+        sourceRunId: body.sourceRunId, scheduledFor: new Date(), config: json({ ...stored.config, _access: access }), configVersion: stored.version, ruleVersion: CRM_CONTROL_RULE_VERSION }, update: {} });
     return this.publicRun(run, emptyControlCounts());
   }
 
@@ -186,7 +189,7 @@ export class CrmControlService {
     const slot = controlScheduleSlot(now, stored.config);
     if (!slot) return;
     await this.prisma.crmControlRun.upsert({ where: { requestKey: `daily:${slot}` }, update: {},
-      create: { requestKey: `daily:${slot}`, trigger: 'SCHEDULED', scheduledFor: now, config: json(stored.config), configVersion: stored.version } });
+      create: { requestKey: `daily:${slot}`, trigger: 'SCHEDULED', scheduledFor: now, config: json(stored.config), configVersion: stored.version, ruleVersion: CRM_CONTROL_RULE_VERSION } });
   }
 
   async runs(actor: AuthUser, cursor?: string) {
@@ -352,7 +355,7 @@ export class CrmControlService {
     if (!pending) return;
     let claimed: { count: number };
     try { claimed = await this.prisma.crmControlRun.updateMany({ where: { id: pending.id, status: 'QUEUED' },
-      data: { status: 'RUNNING', activeKey: 'global', startedAt: new Date(), heartbeatAt: new Date() } }); }
+      data: { status: 'RUNNING', activeKey: 'global', startedAt: new Date(), heartbeatAt: new Date(), ruleVersion: CRM_CONTROL_RULE_VERSION } }); }
     catch (error) { if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') return; throw error; }
     if (claimed.count !== 1) return;
     try { await this.executeRun(pending); }
@@ -566,6 +569,11 @@ export class CrmControlService {
         const activeIds = input.tasks.filter((task) => !task.isCompleted).map((task) => task.externalId || task.id);
         await tx.crmControlCase.updateMany({ where: { dealId: input.deal.id, ruleCode: { in: ['task_deadline', 'task_type', 'task_text', 'task_stage_deadline'] },
           subjectId: { not: '', notIn: activeIds }, status: { not: 'RESOLVED' } },
+          data: { status: 'RESOLVED', activeKey: null, resolvedAt: input.observedAt, latestObservationId: observation.id } });
+      }
+      // An explicit unlimited policy does not depend on receiving every current task.
+      if (input.sourceCompleteness.deal && results.some((result) => result.ruleCode === 'task_stage_deadline' && result.status === 'NA' && result.details?.resolvesAllSubjects === true)) {
+        await tx.crmControlCase.updateMany({ where: { dealId: input.deal.id, ruleCode: 'task_stage_deadline', activeKey: { not: null } },
           data: { status: 'RESOLVED', activeKey: null, resolvedAt: input.observedAt, latestObservationId: observation.id } });
       }
       if (results.some((result) => result.status === 'FAIL' || result.status === 'REVIEW')) {

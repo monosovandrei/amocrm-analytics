@@ -1,4 +1,7 @@
 import { CrmControlRuleInput, CrmControlRuleResult, CrmControlResultStatus } from './crm-control.types';
+import { civilTime, stageDeadline } from './crm-control-deadline';
+
+export const CRM_CONTROL_RULE_VERSION = '2';
 
 type RuleCode = keyof typeof RULE_NAMES;
 type ResultExtra = Pick<CrmControlRuleResult, 'subjectId' | 'details'> & { clauses?: string[] };
@@ -11,11 +14,12 @@ const RULE_NAMES = {
   task_type: 'Тип следующей задачи',
   task_text: 'Содержание следующей задачи',
   task_stage_deadline: 'Срок следующей задачи',
+  stage_duration: 'Срок нахождения на этапе',
   proposal_note: 'Обоснование переноса презентации КП',
   deal_age: 'Возраст сделки',
   offer_budget: 'Сумма предложения и бюджет',
   proposal_file: 'Последняя отправленная версия КП',
-  price_requested_duration: 'Срок получения цены',
+  price_requested_duration: 'Срок запроса цены',
 } as const;
 
 export const CRM_CONTROL_RULE_CATALOG: Array<{ code: string; name: string; clauses: string[]; mode: 'automatic' | 'review' }> = [
@@ -25,6 +29,7 @@ export const CRM_CONTROL_RULE_CATALOG: Array<{ code: string; name: string; claus
   { code: 'task_type', name: RULE_NAMES.task_type, clauses: ['ОПНК 5', 'ОППК 6'], mode: 'automatic' },
   { code: 'task_text', name: RULE_NAMES.task_text, clauses: ['ОПНК 5', 'ОППК 6'], mode: 'review' },
   { code: 'task_stage_deadline', name: RULE_NAMES.task_stage_deadline, clauses: ['ОПНК 5', 'ОППК 6'], mode: 'automatic' },
+  { code: 'stage_duration', name: RULE_NAMES.stage_duration, clauses: ['ОПНК 5', 'ОППК 6'], mode: 'automatic' },
   { code: 'proposal_note', name: RULE_NAMES.proposal_note, clauses: ['ОПНК 4', 'ОППК 5'], mode: 'review' },
   { code: 'deal_age', name: RULE_NAMES.deal_age, clauses: ['ОПНК 6', 'ОППК 7'], mode: 'automatic' },
   { code: 'offer_budget', name: RULE_NAMES.offer_budget, clauses: ['ОПНК 7', 'ОППК 8'], mode: 'review' },
@@ -51,15 +56,6 @@ function taskText(task: Task) {
   return task.title.trim();
 }
 
-function civilTime(date: Date, formatter: Intl.DateTimeFormat) {
-  const values: Record<string, number> = {};
-  for (const part of formatter.formatToParts(date)) {
-    if (part.type !== 'literal') values[part.type] = Number(part.value);
-  }
-  // This value compares wall-clock dates in one time zone; it is not a UTC instant.
-  return Date.UTC(values.year, values.month - 1, values.day, values.hour, values.minute, values.second, date.getUTCMilliseconds());
-}
-
 function nextCalendarMonth(civil: number) {
   const current = new Date(civil);
   const first = new Date(Date.UTC(current.getUTCFullYear(), current.getUTCMonth() + 1, 1));
@@ -81,6 +77,7 @@ export function evaluateCrmControlDeal(input: CrmControlRuleInput): CrmControlRu
     task_type: [taskClause],
     task_text: [taskClause],
     task_stage_deadline: [taskClause],
+    stage_duration: [taskClause],
     proposal_note: [`${department} ${sales ? 4 : 5}`],
     deal_age: [`${department} ${sales ? 6 : 7}`],
     offer_budget: [`${department} ${sales ? 7 : 8}`],
@@ -118,10 +115,17 @@ export function evaluateCrmControlDeal(input: CrmControlRuleInput): CrmControlRu
   const stageEnteredAt = sourceCompleteness.stageHistory && entry && entry <= observedAt ? entry : null;
   const base = !sales && !!scope.baseStageId && deal.stageId === scope.baseStageId;
   const stageRule = scope.stageRules?.[deal.stageId];
+  const limit = stageDeadline(stageRule, stageEnteredAt, formatter);
+  const deadlineDetails = { deadlineMode: limit.mode, timeZone: config.timeZone,
+    stageEnteredAt: stageEnteredAt?.toISOString() ?? null, maximumDueAt: limit.deadline?.toISOString() ?? null,
+    ...(stageRule?.maxDurationHours != null ? { maxDurationHours: stageRule.maxDurationHours } : {}),
+    ...(stageRule?.maxBusinessDays != null ? { maxBusinessDays: stageRule.maxBusinessDays } : {}) };
   const activeTasks = [...new Map(input.tasks.filter((task) => !task.isCompleted).map((task) => [taskSubject(task), task])).values()];
 
   const intakeStageId = sales ? scope.assignedStageId : scope.newClientStageId;
-  if (!intakeStageId) {
+  if (intakeStageId === null) {
+    add('intake_stage', 'NA', 'Владелец указал, что начального этапа для этой проверки в воронке нет.', { details: { configuredAbsent: true } });
+  } else if (!intakeStageId) {
     add('intake_stage', 'UNKNOWN', 'Не выбран начальный этап для проверки.');
   } else if (deal.stageId !== intakeStageId) {
     add('intake_stage', 'NA', 'Сделка находится на другом этапе.', { details: { resolvesPrior: true } });
@@ -141,7 +145,9 @@ export function evaluateCrmControlDeal(input: CrmControlRuleInput): CrmControlRu
 
   if (!sourceCompleteness.tasks) {
     for (const code of ['task_deadline', 'task_count', 'task_type', 'task_text', 'task_stage_deadline'] as const) {
-      add(code, 'UNKNOWN', 'Список задач неполный или не подтверждена его актуальность.');
+      if (code === 'task_stage_deadline' && limit.mode === 'unlimited' && !limit.reason) {
+        add(code, 'NA', 'Для этапа не установлен предельный срок.', { details: { ...deadlineDetails, resolvesPrior: true, resolvesAllSubjects: true } });
+      } else add(code, 'UNKNOWN', 'Список задач неполный или не подтверждена его актуальность.');
     }
   } else {
     const countCorrect = base ? activeTasks.length <= 1 : activeTasks.length === 1;
@@ -190,20 +196,16 @@ export function evaluateCrmControlDeal(input: CrmControlRuleInput): CrmControlRu
         ? 'Нужно проверить, описывает ли текст задачи следующий шаг по этой сделке.'
         : 'В открытой задаче отсутствует текст следующего действия.', { subjectId, details: taskDetails });
 
-      const duration = stageRule?.maxDurationHours;
-      if (duration === undefined || !Number.isFinite(duration) || duration <= 0) {
-        add('task_stage_deadline', 'UNKNOWN', 'Для этапа не утверждён предельный срок.', { subjectId, details: taskDetails });
-      } else if (!stageEnteredAt || !dueAt) {
-        add('task_stage_deadline', 'UNKNOWN', 'Неизвестно время входа в этап или срок задачи.', { subjectId, details: taskDetails });
+      const details = { ...taskDetails, ...deadlineDetails };
+      if (limit.mode === 'unlimited' && !limit.reason) {
+        add('task_stage_deadline', 'NA', 'Для этапа не установлен предельный срок.', { subjectId, details: { ...details, resolvesPrior: true } });
+      } else if (!limit.deadline || !dueAt) {
+        add('task_stage_deadline', 'UNKNOWN', limit.reason ?? 'Неизвестен срок задачи.', { subjectId, details });
       } else {
-        const limit = new Date(stageEnteredAt.getTime() + duration * 3_600_000);
-        if (!validDate(limit)) {
-          add('task_stage_deadline', 'UNKNOWN', 'Предельный срок этапа выходит за допустимый диапазон дат.', { subjectId, details: taskDetails });
-          continue;
-        }
-        const details = { ...taskDetails, stageEnteredAt: stageEnteredAt.toISOString(), maximumDueAt: limit.toISOString(), maxDurationHours: duration };
-        if (dueAt <= limit) {
+        if (dueAt <= limit.deadline) {
           add('task_stage_deadline', 'PASS', 'Срок задачи не превышает норматив этапа.', { subjectId, details });
+        } else if (limit.mode === 'end_of_day') {
+          add('task_stage_deadline', 'FAIL', 'Срок задачи позже 19:00 даты входа в этап. Примечания не отменяют этот норматив.', { subjectId, details });
         } else {
           const noteState = currentNotes(true);
           if (noteState.invalid || !sourceCompleteness.notes) {
@@ -229,7 +231,35 @@ export function evaluateCrmControlDeal(input: CrmControlRuleInput): CrmControlRu
     return { notes, invalid };
   }
 
-  if (!scope.preparedProposalStageId) {
+  if (!sales && scope.priceRequestedStageId && deal.stageId === scope.priceRequestedStageId) {
+    add('stage_duration', 'NA', 'Срок этого этапа учитывается в проверке «Срок запроса цены».',
+      { details: { delegatedTo: 'price_requested_duration', resolvesPrior: true } });
+  } else if (limit.mode === 'unlimited' && !limit.reason) {
+    add('stage_duration', 'NA', 'Для этапа не установлен предельный срок.', { details: { ...deadlineDetails, resolvesPrior: true } });
+  } else if (!limit.deadline) {
+    add('stage_duration', 'UNKNOWN', limit.reason!, { details: deadlineDetails });
+  } else {
+    const details = { ...deadlineDetails, elapsedHours: (observedAt.getTime() - stageEnteredAt!.getTime()) / 3_600_000 };
+    const exceeded = limit.mode === 'end_of_day' ? observedAt >= limit.deadline : observedAt > limit.deadline;
+    if (!exceeded) add('stage_duration', 'PASS', 'Предельный срок нахождения сделки на этапе ещё не превышен.', { details });
+    else if (limit.mode === 'end_of_day') {
+      add('stage_duration', 'FAIL', 'Сделка осталась на этапе в 19:00 даты входа или позже. Примечания не отменяют этот норматив.', { details });
+    } else {
+      const noteState = currentNotes(true);
+      if (noteState.invalid || !sourceCompleteness.notes) {
+        add('stage_duration', 'UNKNOWN', 'Срок нахождения на этапе превышен, но примечания об исключениях прочитаны не полностью.', { details });
+      } else if (!noteState.notes.length) {
+        add('stage_duration', 'FAIL', 'Срок нахождения на этапе превышен; актуального примечания менеджера о договорённости нет.', { details });
+      } else {
+        add('stage_duration', 'REVIEW', 'Срок нахождения на этапе превышен. Нужно проверить примечание и подтверждение договорённости с клиентом.',
+          { details: { ...details, noteIds: noteState.notes.map((note) => note.externalId || note.id) } });
+      }
+    }
+  }
+
+  if (scope.preparedProposalStageId === null) {
+    add('proposal_note', 'NA', 'Владелец указал, что этапа «КП подготовлено» в воронке нет.', { details: { configuredAbsent: true } });
+  } else if (!scope.preparedProposalStageId) {
     add('proposal_note', 'UNKNOWN', 'Не выбран этап «КП подготовлено».');
   } else if (deal.stageId !== scope.preparedProposalStageId) {
     add('proposal_note', 'NA', 'Сделка не на этапе «КП подготовлено».', { details: { resolvesPrior: true } });
@@ -252,7 +282,9 @@ export function evaluateCrmControlDeal(input: CrmControlRuleInput): CrmControlRu
     }
   }
 
-  if (base && config.excludeBaseFromAge) {
+  if (scope.checkDealAge === false) {
+    add('deal_age', 'NA', 'Для этой воронки ограничение возраста сделки отключено.', { details: { resolvesPrior: true } });
+  } else if (base && config.excludeBaseFromAge) {
     add('deal_age', 'NA', 'Этап «База» исключён из ограничения возраста сделки.', { details: { resolvesPrior: true } });
   } else if (!createdAt || createdAt > observedAt) {
     add('deal_age', 'UNKNOWN', 'Нет достоверной даты создания сделки.');
@@ -269,17 +301,26 @@ export function evaluateCrmControlDeal(input: CrmControlRuleInput): CrmControlRu
 
   if (sales) {
     add('price_requested_duration', 'NA', 'Пункт относится к ОППК.', { details: { resolvesPrior: true } });
+  } else if (scope.priceRequestedStageId === null) {
+    add('price_requested_duration', 'NA', 'Владелец указал, что этапа «Цена запрошена» в воронке нет.', { details: { configuredAbsent: true } });
   } else if (!scope.priceRequestedStageId) {
     add('price_requested_duration', 'UNKNOWN', 'Не выбран этап «Цена запрошена».');
   } else if (deal.stageId !== scope.priceRequestedStageId) {
     add('price_requested_duration', 'NA', 'Сделка не на этапе «Цена запрошена».', { details: { resolvesPrior: true } });
-  } else if (!stageEnteredAt) {
-    add('price_requested_duration', 'UNKNOWN', 'Неизвестно достоверное время входа в этап «Цена запрошена».');
   } else {
-    const elapsedHours = (observedAt.getTime() - stageEnteredAt.getTime()) / 3_600_000;
-    const details = { stageEnteredAt: stageEnteredAt.toISOString(), elapsedHours, allowedHours: 24 };
-    if (elapsedHours <= 24) {
-      add('price_requested_duration', 'PASS', 'С момента входа в «Цена запрошена» прошло не больше 24 часов.', { details });
+    const hasConfiguredLimit = stageRule?.deadlineMode !== undefined || stageRule?.maxDurationHours != null || stageRule?.maxBusinessDays != null;
+    const priceLimit = hasConfiguredLimit ? limit : stageDeadline({ maxDurationHours: 24 }, stageEnteredAt, formatter);
+    const details = { ...deadlineDetails, deadlineMode: priceLimit.mode, maximumDueAt: priceLimit.deadline?.toISOString() ?? null,
+      ...(!hasConfiguredLimit ? { maxDurationHours: 24 } : {}),
+      elapsedHours: stageEnteredAt ? (observedAt.getTime() - stageEnteredAt.getTime()) / 3_600_000 : null };
+    if (priceLimit.mode === 'unlimited' && !priceLimit.reason) {
+      add('price_requested_duration', 'NA', 'Для запроса цены явно отключён предельный срок.', { details: { ...details, resolvesPrior: true } });
+    } else if (!priceLimit.deadline || !stageEnteredAt) {
+      add('price_requested_duration', 'UNKNOWN', priceLimit.reason ?? 'Неизвестно достоверное время входа в этап «Цена запрошена».', { details });
+    } else if (priceLimit.mode === 'end_of_day' ? observedAt < priceLimit.deadline : observedAt <= priceLimit.deadline) {
+      add('price_requested_duration', 'PASS', 'Предельный срок запроса цены ещё не превышен.', { details });
+    } else if (priceLimit.mode === 'end_of_day') {
+      add('price_requested_duration', 'FAIL', 'Цена не получена к 19:00 даты входа в этап. Примечания не отменяют этот норматив.', { details });
     } else {
       const noteState = currentNotes(false);
       const communications = (input.communications ?? []).filter((item) => {
@@ -287,12 +328,12 @@ export function evaluateCrmControlDeal(input: CrmControlRuleInput): CrmControlRu
         return !!date && date >= stageEnteredAt && date <= observedAt;
       });
       if (noteState.notes.length || communications.length) {
-        add('price_requested_duration', 'REVIEW', 'Цена запрошена больше 24 часов назад. Нужно проверить, подтверждают ли приложенные записи допустимую задержку.',
+        add('price_requested_duration', 'REVIEW', 'Срок запроса цены превышен. Нужно проверить, подтверждают ли приложенные записи допустимую задержку.',
           { details: { ...details, noteIds: noteState.notes.map((note) => note.externalId || note.id), communicationIds: communications.map((item) => item.id) } });
       } else if (!sourceCompleteness.notes || !sourceCompleteness.communications || noteState.invalid || (input.communications ?? []).some((item) => !validDate(item.createdAt))) {
-        add('price_requested_duration', 'UNKNOWN', 'Прошло больше 24 часов, но доступность всех подтверждений задержки не установлена.', { details });
+        add('price_requested_duration', 'UNKNOWN', 'Срок запроса цены превышен, но доступность всех подтверждений задержки не установлена.', { details });
       } else {
-        add('price_requested_duration', 'FAIL', 'Цена запрошена больше 24 часов назад; подтверждения допустимой задержки не найдено.', { details });
+        add('price_requested_duration', 'FAIL', 'Срок запроса цены превышен; подтверждения допустимой задержки не найдено.', { details });
       }
     }
   }

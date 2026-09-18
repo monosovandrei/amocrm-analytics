@@ -58,6 +58,26 @@ describe('CRM control deterministic rules', () => {
     expect(result(input, 'intake_stage').status).toBe('UNKNOWN');
   });
 
+  it('distinguishes explicit absence from missing mappings without declaring old violations fixed', () => {
+    for (const [department, binding, rule] of [
+      ['sales', 'assignedStageId', 'intake_stage'], ['csm', 'newClientStageId', 'intake_stage'],
+      ['csm', 'preparedProposalStageId', 'proposal_note'], ['csm', 'priceRequestedStageId', 'price_requested_duration'],
+    ] as const) {
+      const input = department === 'sales' ? fixture() : csmFixture('working');
+      delete input.scope[binding];
+      expect(result(input, rule).status).toBe('UNKNOWN');
+      input.scope[binding] = '';
+      expect(result(input, rule).status).toBe('UNKNOWN');
+      input.scope[binding] = null;
+      expect(result(input, rule)).toMatchObject({ status: 'NA', details: { configuredAbsent: true } });
+      expect(result(input, rule).details?.resolvesPrior).not.toBe(true);
+    }
+    const input = csmFixture('working');
+    input.scope.baseStageId = null;
+    input.tasks = [];
+    expect(result(input, 'task_count').status).toBe('FAIL');
+  });
+
   it('marks proven non-applicability as resolving a prior case but never missing configuration or stale data', () => {
     const input = fixture();
     expect(result(input, 'intake_stage')).toMatchObject({ status: 'NA', details: { resolvesPrior: true } });
@@ -332,5 +352,93 @@ describe('CRM control deterministic rules', () => {
     input.config.timeZone = 'Europe/Moscow';
     input.scope.pipelineId = 'other';
     expect(evaluateCrmControlDeal(input).every((item) => item.status === 'UNKNOWN')).toBe(true);
+  });
+
+  it('checks actual dwell even when no task exists, allowing only current documented exceptions for review', () => {
+    const input = fixture();
+    input.tasks = [];
+    input.scope.stageRules!.working.maxDurationHours = 8;
+    input.observedAt = date('2026-09-18T16:00:00Z');
+    expect(result(input, 'stage_duration').status).toBe('PASS');
+    input.observedAt = date('2026-09-18T16:00:00.001Z');
+    expect(result(input, 'stage_duration').status).toBe('FAIL');
+    input.notes = [note('2026-09-17T10:00:00Z')];
+    expect(result(input, 'stage_duration').status).toBe('FAIL');
+    input.notes.push(note('2026-09-18T10:00:00Z'));
+    expect(result(input, 'stage_duration').status).toBe('REVIEW');
+    input.sourceCompleteness.notes = false;
+    expect(result(input, 'stage_duration').status).toBe('UNKNOWN');
+  });
+
+  it('shares the business deadline between actual dwell and task deadlines, independently of audit workdays', () => {
+    const input = fixture();
+    input.config.workdays = [7];
+    input.scope.stageRules!.working = { deadlineMode: 'business_days', maxBusinessDays: 3 };
+    input.observedAt = date('2026-09-23T08:00:00Z');
+    input.tasks[0].dueAt = input.observedAt;
+    expect(result(input, 'stage_duration')).toMatchObject({ status: 'PASS', details: { maximumDueAt: '2026-09-23T08:00:00.000Z' } });
+    expect(result(input, 'task_stage_deadline').status).toBe('PASS');
+    input.observedAt = date('2026-09-23T08:00:00.001Z');
+    input.tasks[0].dueAt = input.observedAt;
+    expect(result(input, 'stage_duration').status).toBe('FAIL');
+    expect(result(input, 'task_stage_deadline').status).toBe('FAIL');
+  });
+
+  it('enforces end of entry day strictly at 19:00 with no note exceptions, even when notes are unavailable', () => {
+    const input = fixture();
+    input.scope.stageRules!.working = { deadlineMode: 'end_of_day' };
+    input.notes = [note('2026-09-18T10:00:00Z')];
+    input.sourceCompleteness.notes = false;
+    input.observedAt = date('2026-09-18T15:59:59.999Z');
+    expect(result(input, 'stage_duration').status).toBe('PASS');
+    input.observedAt = date('2026-09-18T16:00:00Z');
+    expect(result(input, 'stage_duration').status).toBe('FAIL');
+    expect(result(input, 'task_stage_deadline').status).toBe('FAIL');
+    input.stageEnteredAt = date('2026-09-18T17:00:00Z');
+    input.observedAt = date('2026-09-18T17:01:00Z');
+    expect(result(input, 'stage_duration')).toMatchObject({ status: 'FAIL', details: { maximumDueAt: '2026-09-18T16:00:00.000Z' } });
+    input.stageEnteredAt = null;
+    expect(result(input, 'stage_duration').status).toBe('UNKNOWN');
+  });
+
+  it('keeps unlimited duration independent from task duties and age, without requiring stage or task history', () => {
+    const input = fixture();
+    input.scope.stageRules!.working = { deadlineMode: 'unlimited' };
+    input.stageEnteredAt = null;
+    input.deal.createdAt = date('2020-01-01T00:00:00Z');
+    expect(result(input, 'stage_duration')).toMatchObject({ status: 'NA', details: { resolvesPrior: true } });
+    expect(result(input, 'task_stage_deadline').status).toBe('NA');
+    expect(result(input, 'deal_age').status).toBe('FAIL');
+    input.tasks = [];
+    expect(result(input, 'task_count').status).toBe('FAIL');
+    input.sourceCompleteness.tasks = false;
+    expect(result(input, 'task_stage_deadline')).toMatchObject({ status: 'NA', details: { resolvesAllSubjects: true } });
+    expect(result(input, 'task_count').status).toBe('UNKNOWN');
+  });
+
+  it('disables the age limit for the whole configured scope while keeping the legacy default', () => {
+    const input = csmFixture('working');
+    input.deal.createdAt = date('2020-01-01T00:00:00Z');
+    expect(result(input, 'deal_age').status).toBe('FAIL');
+    input.scope.checkDealAge = false;
+    expect(result(input, 'deal_age')).toMatchObject({ status: 'NA', details: { resolvesPrior: true } });
+    input.scope.checkDealAge = true;
+    expect(result(input, 'deal_age').status).toBe('FAIL');
+  });
+
+  it('uses the configured business-day price deadline without duplicate dwell violations', () => {
+    const input = csmFixture('price');
+    input.stageEnteredAt = date('2026-09-18T08:00:00Z');
+    input.scope.stageRules = { price: { deadlineMode: 'business_days', maxBusinessDays: 1 } };
+    input.observedAt = date('2026-09-21T08:00:00Z');
+    expect(result(input, 'price_requested_duration')).toMatchObject({ status: 'PASS', details: { maximumDueAt: '2026-09-21T08:00:00.000Z', maxBusinessDays: 1 } });
+    input.observedAt = date('2026-09-21T08:00:00.001Z');
+    expect(result(input, 'price_requested_duration').status).toBe('FAIL');
+    expect(result(input, 'stage_duration')).toMatchObject({ status: 'NA', details: { delegatedTo: 'price_requested_duration' } });
+    input.communications = [{ id: 'message', createdAt: date('2026-09-21T07:00:00Z'), text: 'Завод ответит завтра' }];
+    expect(result(input, 'price_requested_duration').status).toBe('REVIEW');
+    input.scope.stageRules.price = { deadlineMode: 'unlimited' };
+    expect(result(input, 'price_requested_duration').status).toBe('NA');
+    expect(result(input, 'stage_duration').status).toBe('NA');
   });
 });

@@ -1,16 +1,25 @@
 export type ControlDepartment = 'sales' | 'csm';
 export type ControlResultStatus = 'PASS' | 'FAIL' | 'REVIEW' | 'UNKNOWN' | 'NA';
 export type ControlCaseStatus = 'OPEN' | 'REVIEW' | 'DISPUTED' | 'EXEMPTED' | 'RESOLVED' | 'SUPERSEDED';
+export type ControlDeadlineMode = 'elapsed' | 'business_days' | 'end_of_day' | 'unlimited';
+
+export interface ControlStageRule {
+  allowedTaskTypeIds?: number[];
+  deadlineMode?: ControlDeadlineMode;
+  maxDurationHours?: number;
+  maxBusinessDays?: number;
+}
 
 export interface ControlScope {
   department: ControlDepartment;
   pipelineId: string;
-  assignedStageId?: string;
-  newClientStageId?: string;
-  baseStageId?: string;
-  preparedProposalStageId?: string;
-  priceRequestedStageId?: string;
-  stageRules?: Record<string, { allowedTaskTypeIds?: number[]; maxDurationHours?: number }>;
+  checkDealAge?: boolean;
+  assignedStageId?: string | null;
+  newClientStageId?: string | null;
+  baseStageId?: string | null;
+  preparedProposalStageId?: string | null;
+  priceRequestedStageId?: string | null;
+  stageRules?: Record<string, ControlStageRule>;
 }
 
 export interface ControlConfig {

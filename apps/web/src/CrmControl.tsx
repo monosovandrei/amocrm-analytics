@@ -3,9 +3,9 @@ import type { FormEvent } from 'react';
 import { AlertCircle, CheckCircle2, ChevronDown, ChevronRight, ExternalLink, Play, RefreshCw, Settings, X } from 'lucide-react';
 import { api, apiUrl, getToken } from '@/lib/api';
 import type {
-  ControlConfig, ControlDecision, ControlDepartment, ControlEvidence, ControlManager,
+  ControlConfig, ControlDeadlineMode, ControlDecision, ControlDepartment, ControlEvidence, ControlManager,
   ControlObservation, ControlObservationDetail, ControlPage, ControlResult, ControlRun,
-  ControlRunDetail, ControlScope, ControlSettings,
+  ControlRunDetail, ControlScope, ControlSettings, ControlStageRule,
 } from './crm-control-types';
 import './crm-control.css';
 
@@ -19,6 +19,10 @@ const resultNames: Record<ControlResult['status'], string> = {
 };
 const caseNames = { OPEN: 'Не исправлено', REVIEW: 'На разборе', DISPUTED: 'Оспорено', EXEMPTED: 'Исключение согласовано', RESOLVED: 'Закрыто', SUPERSEDED: 'Условия изменились' };
 const decisionNames = { CONFIRM: 'Подтвердить нарушение', EXEMPT: 'Согласовать исключение', DISPUTE: 'Оспорить' };
+const deadlineModeLabels: Record<ControlDeadlineMode, string> = {
+  elapsed: 'Промежуток времени', business_days: 'Рабочие дни',
+  end_of_day: 'До 19:00 в день входа', unlimited: 'Без ограничения',
+};
 const weekdays = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
 const activeRun = (run: ControlRun | undefined) => run?.status === 'QUEUED' || run?.status === 'RUNNING';
 const effectiveStatus = (result: ControlResult) => result.effectiveStatus ?? result.status;
@@ -69,7 +73,7 @@ function SearchSelect({ label, value, choices, onChange, placeholder = 'Выбе
     {open && <div className="field-combobox-panel crm-option-panel" id={`${id}-options`}>
       <input className="field-combobox-search" aria-label={`Поиск: ${label}`} placeholder="Поиск" autoFocus value={query} onChange={event => setQuery(event.target.value)} />
       <div className="field-combobox-list">
-        {allowEmpty && <button type="button" className="field-combobox-option" onClick={() => { onChange(''); setOpen(false); buttonRef.current?.focus(); }}>Не задано</button>}
+        {allowEmpty && <button type="button" className="field-combobox-option" onClick={() => { onChange(''); setOpen(false); buttonRef.current?.focus(); }}>Выберите</button>}
         {filtered.map(choice => <button key={choice.value} type="button" className={`field-combobox-option ${choice.value === value ? 'active' : ''}`} onClick={() => { onChange(choice.value); setOpen(false); setQuery(''); buttonRef.current?.focus(); }}>{choice.label}</button>)}
         {!filtered.length && <p className="crm-note p-3">{choices.length ? 'Совпадений нет' : 'Справочник пока пуст'}</p>}
       </div>
@@ -360,6 +364,7 @@ function ObservationDetail({ observationId, resultId, settings, onClose, onDecis
 }
 
 const factLabels: Record<string, string> = {
+  deadlineMode: 'Правило срока', maxBusinessDays: 'Рабочих дней', checkDealAge: 'Проверка возраста сделки',
   taskText: 'Текст задачи', maximumDueAt: 'Предельный срок задачи', dueToday: 'Назначена на день проверки', overdue: 'Просрочена', allowedMinimum: 'Минимум задач', allowedMaximum: 'Максимум задач', cutoffLocalTime: 'Граница создания сделки', timeZone: 'Часовой пояс', agePolicy: 'Расчёт возраста',
   taskCount: 'Открытых задач', count: 'Количество', activeTaskCount: 'Открытых задач', taskId: 'Задача', taskTitle: 'Текст задачи', taskTypeId: 'Тип задачи', dueAt: 'Срок задачи', createdAt: 'Создана', createdBefore: 'Создана до', cutoff: 'Граница проверки', cutoffAt: 'Граница проверки', observedAt: 'Время проверки', ageDays: 'Возраст, дней', maxAgeDays: 'Допустимый возраст, дней', ageLimit: 'Допустимый возраст', threshold: 'Порог', thresholdAt: 'Граница возраста', stageEnteredAt: 'Вход на этап', durationHours: 'Время на этапе, ч', elapsedHours: 'Время на этапе, ч', maxDurationHours: 'Допустимое время, ч', allowedTaskTypeIds: 'Допустимые типы задач', noteCount: 'Примечаний', amount: 'Бюджет', source: 'Источник', reason: 'Причина', taskIds: 'Задачи', missing: 'Недостающие данные', limit: 'Ограничение', deadline: 'Предельный срок', taskDeadline: 'Срок задачи', notes: 'Примечания', task: 'Задача', tasks: 'Задачи', noteIds: 'Примечания', completeness: 'Полнота данных', expected: 'Ожидается', actual: 'Зафиксировано', maxHours: 'Предельный срок, ч', ageMode: 'Расчёт возраста', deadlineAt: 'Предельный срок', stageAgeHours: 'На этапе, ч', taskDueAt: 'Срок задачи', actualTypeId: 'Тип задачи', allowedTypeIds: 'Допустимые типы', noteText: 'Текст примечания', boundaryAt: 'Граница возраста', requires: 'Требуется', unsupported: 'Недоступно',
 };
@@ -369,7 +374,7 @@ function FactValue({ name, value, timeZone }: { name: string; value: unknown; ti
   if (!label) return null;
   const text = Array.isArray(value) ? value.filter(item => typeof item !== 'object').join(', ') : typeof value === 'boolean' ? (value ? 'Да' : 'Нет') : String(value);
   if (!text) return null;
-  const display = /^\d{4}-\d{2}-\d{2}T/.test(text) ? dateTime(text, timeZone) : text === 'calendar_month' ? 'Календарный месяц' : text === '30_days' ? '30 дней' : text;
+  const display = /^\d{4}-\d{2}-\d{2}T/.test(text) ? dateTime(text, timeZone) : text === 'calendar_month' ? 'Календарный месяц' : text === '30_days' ? '30 дней' : deadlineModeLabels[text as ControlDeadlineMode] || text;
   return <><dt>{label}</dt><dd>{display}</dd></>;
 }
 function SnapshotData({ snapshot, timeZone }: { snapshot: Record<string, unknown>; timeZone: string }) {
@@ -383,6 +388,8 @@ function SettingsEditor({ settings, onSaved, onClose }: { settings: ControlSetti
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [saved, setSaved] = useState(false);
+  const checksDealAge = draft.scopes.some(scope => scope.checkDealAge !== false);
+  const checksCsmAge = draft.scopes.some(scope => scope.department === 'csm' && scope.checkDealAge !== false);
   const update = (patch: Partial<ControlConfig>) => { setDraft(current => ({ ...current, ...patch })); setSaved(false); };
   const updateScope = (index: number, scope: ControlScope) => update({ scopes: draft.scopes.map((item, i) => i === index ? scope : item) });
   async function save(event: FormEvent) {
@@ -395,7 +402,16 @@ function SettingsEditor({ settings, onSaved, onClose }: { settings: ControlSetti
   }
   return <form className="crm-settings" onSubmit={event => void save(event)} aria-label="Настройки контроля CRM">
     <div className="crm-section-head"><h2>Настройки проверки</h2><button type="button" className="btn btn-ghost" onClick={onClose}><X size={15} aria-hidden="true" />Закрыть</button></div>
-    <fieldset className="crm-settings-group"><legend>Расписание</legend><div className="crm-form-grid crm-form-grid-three"><label><span className="label">Время запуска</span><input type="time" className="field" value={draft.timeOfDay} required onChange={event => update({ timeOfDay: event.target.value })} /></label><label><span className="label">Часовой пояс</span><input className="field" value={draft.timeZone} required onChange={event => update({ timeZone: event.target.value })} /><span className="crm-note">Например, Europe/Moscow</span></label><label><span className="label">Максимальный возраст сделки</span><select className="select" value={draft.maxDealAge} onChange={event => update({ maxDealAge: event.target.value as ControlConfig['maxDealAge'] })}><option value="calendar_month">Один календарный месяц</option><option value="30_days">30 дней</option></select></label></div><div className="crm-checks mt-4" role="group" aria-label="Дни проверки">{weekdays.map((day, index) => <label className="crm-check" key={day}><input type="checkbox" checked={draft.workdays.includes(index + 1)} onChange={event => update({ workdays: event.target.checked ? [...draft.workdays, index + 1].sort() : draft.workdays.filter(value => value !== index + 1) })} />{day}</label>)}</div><label className="crm-check mt-4"><input type="checkbox" checked={draft.excludeBaseFromAge} onChange={event => update({ excludeBaseFromAge: event.target.checked })} />Не проверять возраст сделок на этапе «База»</label></fieldset>
+    <fieldset className="crm-settings-group">
+      <legend>Расписание</legend>
+      <div className={`crm-form-grid ${checksDealAge ? 'crm-form-grid-three' : ''}`}>
+        <label><span className="label">Время запуска</span><input type="time" className="field" value={draft.timeOfDay} required onChange={event => update({ timeOfDay: event.target.value })} /></label>
+        <label><span className="label">Часовой пояс</span><input className="field" value={draft.timeZone} required onChange={event => update({ timeZone: event.target.value })} /><span className="crm-note">Например, Europe/Moscow</span></label>
+        {checksDealAge && <label><span className="label">Максимальный возраст сделки</span><select className="select" value={draft.maxDealAge} onChange={event => update({ maxDealAge: event.target.value as ControlConfig['maxDealAge'] })}><option value="calendar_month">Один календарный месяц</option><option value="30_days">30 дней</option></select></label>}
+      </div>
+      <div className="crm-checks mt-4" role="group" aria-label="Дни проверки">{weekdays.map((day, index) => <label className="crm-check" key={day}><input type="checkbox" checked={draft.workdays.includes(index + 1)} onChange={event => update({ workdays: event.target.checked ? [...draft.workdays, index + 1].sort() : draft.workdays.filter(value => value !== index + 1) })} />{day}</label>)}</div>
+      {checksCsmAge && <label className="crm-check mt-4"><input type="checkbox" checked={draft.excludeBaseFromAge} onChange={event => update({ excludeBaseFromAge: event.target.checked })} />Не проверять возраст сделок на этапе «База»</label>}
+    </fieldset>
     <fieldset className="crm-settings-group"><legend>Воронки и этапы amoCRM</legend><div className="crm-config-list">{draft.scopes.map((scope, index) => <ScopeEditor key={`${index}:${scope.pipelineId}`} scope={scope} settings={settings} onChange={next => updateScope(index, next)} onRemove={() => update({ scopes: draft.scopes.filter((_, i) => i !== index) })} />)}</div><div className="crm-actions mt-4"><button type="button" className="btn" onClick={() => update({ scopes: [...draft.scopes, { department: 'sales', pipelineId: '', stageRules: {} }] })}>Добавить воронку</button>{!draft.scopes.length && settings.suggestedScopes.length > 0 && <button type="button" className="btn" onClick={() => update({ scopes: structuredClone(settings.suggestedScopes) })}>Подставить найденные воронки</button>}</div>{!settings.options.pipelines.length && <p className="crm-note mt-3">Воронки появятся после подключения и синхронизации amoCRM.</p>}</fieldset>
     <fieldset className="crm-settings-group"><legend>Автоматический запуск</legend><label className="crm-check"><input type="checkbox" checked={draft.enabled} onChange={event => update({ enabled: event.target.checked })} />Проверять по расписанию</label><p className="crm-note mt-2">Для включения выберите воронки. Неуказанные этапы, сроки и типы задач попадут в «Не проверено»; остальные правила выполнятся.</p></fieldset>
     {error && <div role="alert" className="crm-status crm-status-error">{error}</div>}{saved && <p role="status" className="crm-success">Настройки сохранены.</p>}<div><button type="submit" className="btn btn-primary" disabled={busy}>{busy ? 'Сохранение…' : 'Сохранить настройки'}</button></div>
@@ -406,27 +422,50 @@ function ScopeEditor({ scope, settings, onChange, onRemove }: { scope: ControlSc
   const pipeline = settings.options.pipelines.find(item => item.id === scope.pipelineId);
   const stages = pipeline?.stages.filter(stage => !stage.isWon && !stage.isLost) || [];
   const choices = stages.map(stage => ({ value: stage.id, label: stage.name }));
+  const absentStageValue = '__absent';
+  const bindingChoices = [{ value: absentStageValue, label: 'Такого этапа нет' }, ...choices];
   const [newStage, setNewStage] = useState('');
   const stageFields: Array<{ key: 'assignedStageId' | 'newClientStageId' | 'baseStageId' | 'preparedProposalStageId' | 'priceRequestedStageId'; label: string }> = scope.department === 'sales'
     ? [{ key: 'assignedStageId', label: 'Назначен ответственный' }, { key: 'preparedProposalStageId', label: 'КП подготовлено' }]
     : [{ key: 'newClientStageId', label: 'Новый клиент' }, { key: 'baseStageId', label: 'База' }, { key: 'preparedProposalStageId', label: 'КП подготовлено' }, { key: 'priceRequestedStageId', label: 'Цена запрошена' }];
-  const changeRule = (stageId: string, rule: NonNullable<ControlScope['stageRules']>[string]) => onChange({ ...scope, stageRules: { ...scope.stageRules, [stageId]: rule } });
+  const changeRule = (stageId: string, rule: ControlStageRule) => onChange({ ...scope, stageRules: { ...scope.stageRules, [stageId]: rule } });
   return <section className="crm-stage-rule">
-    <div className="crm-config-row"><label><span className="label">Отдел</span><select className="select" value={scope.department} onChange={event => onChange({ department: event.target.value as ControlDepartment, pipelineId: scope.pipelineId, stageRules: scope.stageRules })}><option value="sales">ОПНК</option><option value="csm">ОППК</option></select></label><SearchSelect label="Воронка" value={scope.pipelineId} choices={settings.options.pipelines.map(item => ({ value: item.id, label: item.name }))} onChange={pipelineId => onChange({ department: scope.department, pipelineId, stageRules: {} })} /><button className="btn btn-ghost" type="button" onClick={onRemove}>Убрать воронку</button></div>
-    {!!scope.pipelineId && <><div className="crm-form-grid">{stageFields.map(field => <SearchSelect key={field.key} label={`Этап «${field.label}»`} choices={choices} value={scope[field.key] || ''} allowEmpty onChange={value => onChange({ ...scope, [field.key]: value || undefined })} />)}</div>
+    <div className="crm-config-row"><label><span className="label">Отдел</span><select className="select" value={scope.department} onChange={event => onChange({ department: event.target.value as ControlDepartment, pipelineId: scope.pipelineId, checkDealAge: scope.checkDealAge, stageRules: scope.stageRules })}><option value="sales">ОПНК</option><option value="csm">ОППК</option></select></label><SearchSelect label="Воронка" value={scope.pipelineId} choices={settings.options.pipelines.map(item => ({ value: item.id, label: item.name }))} onChange={pipelineId => onChange({ department: scope.department, pipelineId, checkDealAge: scope.checkDealAge, stageRules: {} })} /><button className="btn btn-ghost" type="button" onClick={onRemove}>Убрать воронку</button></div>
+    <label className="crm-check"><input type="checkbox" checked={scope.checkDealAge !== false} onChange={event => onChange({ ...scope, checkDealAge: event.target.checked })} />Проверять возраст сделок в этой воронке</label>
+    {scope.checkDealAge === false && <p className="crm-note">Общий возраст сделок не ограничен. Сроки на этапах продолжают проверяться.</p>}
+    {!!scope.pipelineId && <><div className="crm-form-grid">{stageFields.map(field => <SearchSelect key={field.key} label={`Этап «${field.label}»`} choices={bindingChoices} value={scope[field.key] === null ? absentStageValue : scope[field.key] || ''} allowEmpty onChange={value => onChange({ ...scope, [field.key]: value === absentStageValue ? null : value || undefined })} />)}</div>
       <details className="crm-disclosure"><summary>Сроки и типы задач по этапам</summary><div className="grid gap-4 mt-3">
-        <p className="crm-note">Срок отсчитывается от входа на этап. Без установленного срока или типа соответствующий пункт остаётся непроверенным.</p>
-        {Object.entries(scope.stageRules || {}).map(([stageId, rule]) => <div className="crm-stage-rule" key={stageId}><div className="crm-section-head"><h3>{stages.find(stage => stage.id === stageId)?.name || 'Этап больше недоступен'}</h3><button type="button" className="crm-link" onClick={() => { const next = { ...scope.stageRules }; delete next[stageId]; onChange({ ...scope, stageRules: next }); }}>Убрать регламент</button></div><StageDurationField value={rule.maxDurationHours} onChange={maxDurationHours => changeRule(stageId, { ...rule, maxDurationHours })} /><TaskTypePicker options={settings.options.taskTypes} selected={rule.allowedTaskTypeIds || []} onChange={allowedTaskTypeIds => changeRule(stageId, { ...rule, allowedTaskTypeIds })} /></div>)}
+        <p className="crm-note">Срок отсчитывается от входа на этап. Проверяется время на этапе и срок следующей задачи; остальные требования задаются отдельно.</p>
+        {Object.entries(scope.stageRules || {}).map(([stageId, rule]) => <div className="crm-stage-rule" key={stageId}><div className="crm-section-head"><h3>{stages.find(stage => stage.id === stageId)?.name || 'Этап больше недоступен'}</h3><button type="button" className="crm-link" onClick={() => { const next = { ...scope.stageRules }; delete next[stageId]; onChange({ ...scope, stageRules: next }); }}>Убрать регламент</button></div><StageDeadlineEditor rule={rule} onChange={next => changeRule(stageId, next)} /><TaskTypePicker options={settings.options.taskTypes} selected={rule.allowedTaskTypeIds || []} onChange={allowedTaskTypeIds => changeRule(stageId, { ...rule, allowedTaskTypeIds })} /></div>)}
         <div className="crm-config-row"><SearchSelect label="Этап для регламента" choices={choices.filter(choice => !scope.stageRules?.[choice.value])} value={newStage} onChange={setNewStage} /><button type="button" className="btn" disabled={!newStage} onClick={() => { changeRule(newStage, {}); setNewStage(''); }}>Добавить регламент</button></div>
       </div></details>
     </>}
   </section>;
 }
 
+function StageDeadlineEditor({ rule, onChange }: { rule: ControlStageRule; onChange: (rule: ControlStageRule) => void }) {
+  const id = useId();
+  const mode = rule.deadlineMode || 'elapsed';
+  const selectMode = (deadlineMode: ControlDeadlineMode) => {
+    const { maxDurationHours, maxBusinessDays, ...shared } = rule;
+    onChange({ ...shared, deadlineMode,
+      ...(deadlineMode === 'elapsed' && maxDurationHours !== undefined ? { maxDurationHours } : {}),
+      ...(deadlineMode === 'business_days' && maxBusinessDays !== undefined ? { maxBusinessDays } : {}),
+    });
+  };
+  return <div className="crm-deadline-editor">
+    <div><label className="label" htmlFor={`${id}-mode`}>Ограничение срока</label><select id={`${id}-mode`} className="select" value={mode} onChange={event => selectMode(event.target.value as ControlDeadlineMode)}>{(Object.keys(deadlineModeLabels) as ControlDeadlineMode[]).map(value => <option key={value} value={value}>{deadlineModeLabels[value]}</option>)}</select></div>
+    {mode === 'elapsed' && <StageDurationField value={rule.maxDurationHours} required={rule.deadlineMode === 'elapsed'} onChange={maxDurationHours => onChange({ ...rule, maxDurationHours })} />}
+    {mode === 'business_days' && <div><label className="label" htmlFor={`${id}-business-days`}>Количество рабочих дней</label><input id={`${id}-business-days`} className="field" type="number" min="1" max="3650" step="1" required value={rule.maxBusinessDays ?? ''} aria-describedby={`${id}-hint`} onChange={event => onChange({ ...rule, maxBusinessDays: event.target.value === '' ? undefined : Number(event.target.value) })} /><p id={`${id}-hint`} className="crm-note mt-2">Суббота и воскресенье не учитываются; праздники автоматически не исключаются. Срок истекает в то же время суток, в которое сделка вошла на этап.</p></div>}
+    {mode === 'end_of_day' && <p className="crm-note">Срок истекает в 19:00 в день входа на этап, по часовому поясу расписания проверки.</p>}
+    {mode === 'unlimited' && <p className="crm-note">Время на этапе и срок следующей задачи не ограничены. Остальные требования к задачам и настройка возраста воронки не меняются.</p>}
+  </div>;
+}
+
 const durationHoursPerUnit = { minutes: 1 / 60, hours: 1, days: 24 };
 type DurationUnit = keyof typeof durationHoursPerUnit;
 
-function StageDurationField({ value, onChange }: { value: number | undefined; onChange: (hours: number | undefined) => void }) {
+function StageDurationField({ value, required = false, onChange }: { value: number | undefined; required?: boolean; onChange: (hours: number | undefined) => void }) {
   const [unit, setUnit] = useState<DurationUnit>(() => value !== undefined && value > 0
     ? Number.isInteger(value / 24) ? 'days' : Number.isInteger(value) ? 'hours' : 'minutes'
     : 'hours');
@@ -437,8 +476,8 @@ function StageDurationField({ value, onChange }: { value: number | undefined; on
     inputRef.current?.setCustomValidity(value !== undefined && value <= 0 ? 'Укажите время больше нуля.' : '');
   }, [value]);
   return <div className="crm-duration-field">
-    <div><label className="label" htmlFor={`${id}-value`}>Максимальное время на этапе</label><input id={`${id}-value`} ref={inputRef} className="field" type="number" min="0" step="any" value={displayValue} onChange={event => onChange(event.target.value === '' ? undefined : Number(event.target.value) * durationHoursPerUnit[unit])} /></div>
-    <div><label className="label" htmlFor={`${id}-unit`}>Единица времени</label><select id={`${id}-unit`} className="select" value={unit} onChange={event => setUnit(event.target.value as DurationUnit)}><option value="minutes">Минуты</option><option value="hours">Часы</option><option value="days">Дни</option></select></div>
+    <div><label className="label" htmlFor={`${id}-value`}>Максимальное время на этапе</label><input id={`${id}-value`} ref={inputRef} className="field" type="number" min="0" step="any" required={required} value={displayValue} onChange={event => onChange(event.target.value === '' ? undefined : Number(event.target.value) * durationHoursPerUnit[unit])} /></div>
+    <div><label className="label" htmlFor={`${id}-unit`}>Единица времени</label><select id={`${id}-unit`} className="select" value={unit} onChange={event => setUnit(event.target.value as DurationUnit)}><option value="minutes">Минуты</option><option value="hours">Часы</option><option value="days">Сутки</option></select></div>
   </div>;
 }
 

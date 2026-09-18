@@ -2,15 +2,23 @@ export type CrmControlResultStatus = 'PASS' | 'FAIL' | 'REVIEW' | 'UNKNOWN' | 'N
 export type CrmControlEvidenceStatus = 'DISABLED' | 'PENDING' | 'RUNNING' | 'READY' | 'ERROR';
 export type CrmControlCaseStatus = 'OPEN' | 'REVIEW' | 'DISPUTED' | 'EXEMPTED' | 'RESOLVED' | 'SUPERSEDED';
 
+export interface CrmControlStageRule {
+  allowedTaskTypeIds?: number[];
+  deadlineMode?: 'elapsed' | 'business_days' | 'end_of_day' | 'unlimited';
+  maxDurationHours?: number;
+  maxBusinessDays?: number;
+}
+
 export interface CrmControlScope {
   department: 'sales' | 'csm';
   pipelineId: string;
-  assignedStageId?: string;
-  newClientStageId?: string;
-  baseStageId?: string;
-  preparedProposalStageId?: string;
-  priceRequestedStageId?: string;
-  stageRules?: Record<string, { allowedTaskTypeIds?: number[]; maxDurationHours?: number }>;
+  assignedStageId?: string | null;
+  newClientStageId?: string | null;
+  baseStageId?: string | null;
+  preparedProposalStageId?: string | null;
+  priceRequestedStageId?: string | null;
+  checkDealAge?: boolean;
+  stageRules?: Record<string, CrmControlStageRule>;
 }
 
 export interface CrmControlConfig {
