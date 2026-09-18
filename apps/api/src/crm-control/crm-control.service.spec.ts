@@ -303,12 +303,53 @@ describe('CRM control source coverage, access and scheduling', () => {
     expect((service as any).configurationIssues(unconfigured, [pipeline])).toContain('Закреплённые компании: не настроен этап «Новый клиент».');
     await expect((service as any).validateConfig({ ...config, scopes: [{ ...scope, newClientStageId: 'missing' }] })).rejects.toMatchObject({ status: 400 });
   });
+
+  it('excludes three unsorted buckets from completeness warnings without losing the 25 working stages', () => {
+    const pipelines = [8, 9, 8].map((count, index) => ({ id: `pipeline-${index}`, name: `Воронка ${index}`, stages: [
+      { id: `unsorted-${index}`, isWon: false, isLost: false, raw: { type: 1 } },
+      ...Array.from({ length: count }, (_, stage) => ({ id: `stage-${index}-${stage}`, isWon: false, isLost: false, raw: { type: 0 } })),
+    ] }));
+    const scopes = pipelines.map((pipeline, index) => ({ pipelineId: pipeline.id, department: index === 0 ? 'sales' : 'csm',
+      assignedStageId: null, newClientStageId: null, baseStageId: null, preparedProposalStageId: null, priceRequestedStageId: null,
+      stageRules: Object.fromEntries(pipeline.stages.slice(1).map((stage, stageIndex) => [stage.id, {
+        deadlineMode: 'business_days', maxBusinessDays: 1, ...(index < 2 && stageIndex === 0 ? {} : { allowedTaskTypeIds: [1] }),
+      }])),
+    }));
+    const service = new CrmControlService({} as any, {} as any, {} as any);
+    const config = { ...DEFAULT_CRM_CONTROL_CONFIG, scopes };
+    // Previous open-stage filtering treated all 3 buckets as missing task types + deadlines.
+    const previousOpenWarnings = pipelines.flatMap((pipeline, index) => [
+      pipeline.stages.some((stage) => !scopes[index].stageRules[stage.id]?.allowedTaskTypeIds?.length),
+      pipeline.stages.some((stage) => !scopes[index].stageRules[stage.id]?.maxBusinessDays),
+    ]).filter(Boolean);
+    expect(previousOpenWarnings).toHaveLength(6);
+    expect(scopes.reduce((count, scope) => count + Object.keys(scope.stageRules).length, 0)).toBe(25);
+    expect((service as any).configurationIssues(config, pipelines)).toEqual([
+      'Воронка 0: типы задач для части этапов не настроены.', 'Воронка 1: типы задач для части этапов не настроены.',
+    ]);
+  });
+
+  it('rejects bindings and norms on unsorted or terminal stages and flags existing invalid configuration', async () => {
+    const pipeline = { id: 'pipeline', name: 'Продажи', stages: [
+      { id: 'working', raw: { type: 0 } }, { id: 'unsorted', raw: { type: 1 } },
+      { id: 'won', isWon: true }, { id: 'lost', isLost: true },
+    ] };
+    const service = new CrmControlService({ pipeline: { findMany: jest.fn().mockResolvedValue([pipeline]) } } as any, {} as any, {} as any);
+    for (const stageId of ['unsorted', 'won', 'lost']) {
+      const scope = { pipelineId: 'pipeline', department: 'sales', assignedStageId: stageId };
+      await expect((service as any).validateConfig({ ...DEFAULT_CRM_CONTROL_CONFIG, scopes: [scope] })).rejects.toMatchObject({ status: 400 });
+      const ruleScope = { ...scope, assignedStageId: null, stageRules: { [stageId]: { deadlineMode: 'unlimited' } } };
+      await expect((service as any).validateConfig({ ...DEFAULT_CRM_CONTROL_CONFIG, scopes: [ruleScope] })).rejects.toMatchObject({ status: 400 });
+      expect((service as any).configurationIssues({ ...DEFAULT_CRM_CONTROL_CONFIG, scopes: [ruleScope] }, [pipeline])).toContain('Продажи: нормативы заданы для этапов вне проверки.');
+    }
+  });
 });
 
 describe('CRM control direct source reads', () => {
   function sourceFixture(total = 1) {
     const pipeline = { id: 'pipeline', externalId: '100', name: 'Продажи', stages: [
       { id: 'stage', externalId: '200', name: 'Назначен ответственный', isWon: false, isLost: false },
+      { id: 'unsorted', externalId: '199', name: 'Неразобранное', isWon: false, isLost: false, raw: { type: 1 } },
       { id: 'won', externalId: '201', name: 'Успешно', isWon: true, isLost: false },
     ] };
     const leads = Array.from({ length: total }, (_, index) => ({ id: index + 1, name: `Сделка ${index + 1}`, pipeline_id: 100, status_id: 200,
@@ -349,6 +390,36 @@ describe('CRM control direct source reads', () => {
     const evaluated = fixture.persist.mock.calls[0][2] as CrmControlRuleResult[];
     expect(passedInput.sourceCompleteness.tasks).toBe(false);
     expect(evaluated.find((row) => row.ruleCode === 'task_count')?.status).toBe('UNKNOWN');
+  });
+
+  it('never evaluates unsorted deals returned by the source despite the working-stage filter', async () => {
+    const fixture = sourceFixture(2);
+    fixture.leads[0].status_id = 199;
+    await (fixture.service as any).executeRun(fixture.run);
+    expect(fixture.persist).toHaveBeenCalledTimes(1);
+    expect((fixture.persist.mock.calls[0][1] as CrmControlRuleInput).deal.externalId).toBe('2');
+    expect(fixture.client.get).not.toHaveBeenCalledWith('/leads/1');
+    expect(fixture.client.paginateBatch).toHaveBeenCalledWith('/leads', 'leads', {
+      'order[id]': 'asc', 'filter[statuses][0][pipeline_id]': '100', 'filter[statuses][0][status_id]': '200',
+    }, expect.any(Function));
+  });
+
+  it.each(['binding', 'norm'])('refuses an old stored configuration that assigns an unsorted %s before reading any deals', async (kind) => {
+    const fixture = sourceFixture();
+    const scope = fixture.run.config.scopes[0] as any;
+    if (kind === 'binding') scope.assignedStageId = 'unsorted';
+    else scope.stageRules = { unsorted: { deadlineMode: 'unlimited' } };
+    await expect((fixture.service as any).executeRun(fixture.run)).rejects.toThrow('системный или закрытый этап');
+    expect(fixture.client.paginateBatch).not.toHaveBeenCalled();
+    expect(fixture.persist).not.toHaveBeenCalled();
+  });
+
+  it.each(['initial', 'final'])('does not evaluate a deal moved to unsorted during its %s source reread', async (phase) => {
+    const fixture = sourceFixture();
+    if (phase === 'final') fixture.client.get.mockResolvedValueOnce(fixture.leads[0]);
+    fixture.client.get.mockResolvedValueOnce({ ...fixture.leads[0], status_id: 199 });
+    await (fixture.service as any).executeRun(fixture.run);
+    expect(fixture.persist).not.toHaveBeenCalled();
   });
 
   it('does not write mixed source facts as an accusation when the lead changes during collection', async () => {
@@ -400,6 +471,18 @@ describe('CRM control complete task-type catalog', () => {
     expect(settings.capabilities.taskTypes).toBe(false);
     expect(settings.configurationIssues).toContain('Справочник типов задач amoCRM недоступен. Обновите страницу после восстановления подключения.');
     expect(fixture.prisma.task.findMany).not.toHaveBeenCalled();
+  });
+
+  it('offers only working stages, excluding unsorted and both terminal states', async () => {
+    const fixture = catalogFixture({ _embedded: { task_types: [] } });
+    fixture.prisma.pipeline.findMany.mockResolvedValue([{ id: 'pipeline', name: 'Продажи', stages: [
+      { id: 'stage', name: 'В работе', isWon: false, isLost: false, raw: { type: 0 } },
+      { id: 'unsorted', name: 'Неразобранное', isWon: false, isLost: false, raw: { type: 1 } },
+      { id: 'won', name: 'Успешно', isWon: true, isLost: false },
+      { id: 'lost', name: 'Отказ', isWon: false, isLost: true },
+    ] }] as any);
+    const settings = await fixture.service.settings(actor);
+    expect(settings.options.pipelines[0].stages.map((stage) => stage.id)).toEqual(['stage']);
   });
 
   it('rejects absent types using the account catalog and reports source failures explicitly', async () => {

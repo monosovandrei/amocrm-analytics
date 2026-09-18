@@ -13,6 +13,8 @@ import { addControlCounts, controlScheduleSlot, emptyControlCounts, nextControlC
 
 type Access = { role: 'OWNER' | 'ROP' | 'MANAGER'; managerId?: string; groupId?: string; actorId: string; actorName: string };
 type Pipeline = Prisma.PipelineGetPayload<{ include: { stages: true } }>;
+const isWorkingStage = (stage: Pipeline['stages'][number]) => !stage.isWon && !stage.isLost
+  && !(stage.raw && typeof stage.raw === 'object' && !Array.isArray(stage.raw) && stage.raw.type === 1);
 type Observation = Prisma.CrmControlObservationGetPayload<{ include: { results: { include: { case: { include: { decisions: true } } } }; evidence: true } }>;
 const observationInclude = { results: { include: { case: { include: { decisions: true } } } }, evidence: true } as const;
 type AssessedResult = { status: string; observationId: string; case?: { status: string; confirmedAt?: Date | null;
@@ -61,7 +63,7 @@ export class CrmControlService {
     return { ...stored, canManage: access.role === 'OWNER', canReview: access.role !== 'MANAGER', canDispute: true,
       capabilities: { ...capture, communications: false, proposalFiles: false, taskTypes: taskTypes.available },
       options: { pipelines: pipelines.map((pipeline) => ({ id: pipeline.id, name: pipeline.name,
-        stages: pipeline.stages.map(({ id, name, isWon, isLost }) => ({ id, name, isWon, isLost })) })),
+        stages: pipeline.stages.filter(isWorkingStage).map(({ id, name, isWon, isLost }) => ({ id, name, isWon, isLost })) })),
         taskTypes: taskTypes.items },
       suggestedScopes: this.suggestScopes(pipelines), configurationIssues: [...this.configurationIssues(stored.config, pipelines),
         ...(taskTypes.available ? [] : ['Справочник типов задач amoCRM недоступен. Обновите страницу после восстановления подключения.'])],
@@ -92,7 +94,7 @@ export class CrmControlService {
       const matches = pipelines.filter((pipeline) => aliases.includes(normal(pipeline.name)));
       if (matches.length !== 1) continue;
       const pipeline = matches[0];
-      const stage = (label: string) => { const matches = pipeline.stages.filter((item) => normal(item.name) === label); return matches.length === 1 ? matches[0].id : undefined; };
+      const stage = (label: string) => { const matches = pipeline.stages.filter((item) => isWorkingStage(item) && normal(item.name) === label); return matches.length === 1 ? matches[0].id : undefined; };
       result.push({ department: aliases[0] === 'продажи' ? 'sales' : 'csm', pipelineId: pipeline.id,
         assignedStageId: stage('назначен ответственный'), newClientStageId: stage('новый клиент'), baseStageId: stage('база'),
         preparedProposalStageId: stage('кп подготовлено'), priceRequestedStageId: stage('цена запрошена'), stageRules: {} });
@@ -107,8 +109,16 @@ export class CrmControlService {
       const pipeline = pipelines.find((item) => item.id === scope.pipelineId);
       if (!pipeline) { issues.push('Выбранная воронка больше недоступна.'); continue; }
       const needed = scope.department === 'sales' ? ['assignedStageId', 'preparedProposalStageId'] : ['newClientStageId', 'baseStageId', 'preparedProposalStageId', 'priceRequestedStageId'];
-      for (const field of needed) if ((scope as any)[field] !== null && !(scope as any)[field]) issues.push(`${pipeline.name}: не настроен этап ${this.stageLabel(field)}.`);
-      const openStages = pipeline.stages.filter((stage) => !stage.isWon && !stage.isLost && stage.id !== scope.baseStageId);
+      for (const field of needed) {
+        const id = (scope as any)[field];
+        if (id === null) continue;
+        if (!id) issues.push(`${pipeline.name}: не настроен этап ${this.stageLabel(field)}.`);
+        else if (!pipeline.stages.some((stage) => stage.id === id && isWorkingStage(stage))) issues.push(`${pipeline.name}: выбран недоступный рабочий этап ${this.stageLabel(field)}.`);
+      }
+      if (Object.keys(scope.stageRules ?? {}).some((id) => !pipeline.stages.some((stage) => stage.id === id && isWorkingStage(stage)))) {
+        issues.push(`${pipeline.name}: нормативы заданы для этапов вне проверки.`);
+      }
+      const openStages = pipeline.stages.filter((stage) => isWorkingStage(stage) && stage.id !== scope.baseStageId);
       if (openStages.some((stage) => !scope.stageRules?.[stage.id]?.allowedTaskTypeIds?.length)) issues.push(`${pipeline.name}: типы задач для части этапов не настроены.`);
       if (openStages.some((stage) => !hasStageDeadline(scope.stageRules?.[stage.id]))) issues.push(`${pipeline.name}: сроки для части этапов не настроены.`);
     }
@@ -148,12 +158,12 @@ export class CrmControlService {
       seen.add(scope.pipelineId);
       for (const key of ['assignedStageId', 'newClientStageId', 'baseStageId', 'preparedProposalStageId', 'priceRequestedStageId']) {
         const id = (scope as any)[key];
-        if (id != null && id !== '' && !pipeline.stages.some((stage) => stage.id === id && !stage.isWon && !stage.isLost)) throw new BadRequestException('Этап не относится к выбранной воронке');
+        if (id != null && id !== '' && !pipeline.stages.some((stage) => stage.id === id && isWorkingStage(stage))) throw new BadRequestException('Этап не относится к рабочим этапам выбранной воронки');
       }
       if (scope.stageRules != null && (typeof scope.stageRules !== 'object' || Array.isArray(scope.stageRules))) throw new BadRequestException('Неверные нормативы этапов');
       for (const [stageId, rule] of Object.entries(scope.stageRules ?? {})) {
         if (!rule || typeof rule !== 'object' || Array.isArray(rule)) throw new BadRequestException('Неверный норматив этапа');
-        if (!pipeline.stages.some((stage) => stage.id === stageId)) throw new BadRequestException('Срок задан для чужого этапа');
+        if (!pipeline.stages.some((stage) => stage.id === stageId && isWorkingStage(stage))) throw new BadRequestException('Норматив можно задать только для рабочего этапа выбранной воронки');
         const deadlineError = stageDeadlineConfigError(rule);
         if (deadlineError) throw new BadRequestException(deadlineError);
         if (rule.allowedTaskTypeIds != null && (!Array.isArray(rule.allowedTaskTypeIds) || rule.allowedTaskTypeIds.some((id) => !Number.isInteger(id) || id < 1))) throw new BadRequestException('Неверные типы задач');
@@ -379,10 +389,17 @@ export class CrmControlService {
       return pipeline ? [[pipeline.externalId, { scope, pipeline }] as const] : [];
     }));
     if (!scopeByExternalId.size) throw new Error('No configured source scope');
+    for (const { scope, pipeline } of scopeByExternalId.values()) {
+      const configuredIds = [scope.assignedStageId, scope.newClientStageId, scope.baseStageId, scope.preparedProposalStageId,
+        scope.priceRequestedStageId, ...Object.keys(scope.stageRules ?? {})];
+      if (pipeline.stages.some((stage) => configuredIds.includes(stage.id) && !isWorkingStage(stage))) {
+        throw new ControlRunError(`${pipeline.name}: в настройках выбран системный или закрытый этап. Выберите рабочие этапы перед запуском.`);
+      }
+    }
     const sourceStartedAt = new Date();
     const sourceParams: Record<string, string | number> = { 'order[id]': 'asc' };
     let statusIndex = 0;
-    for (const { pipeline } of scopeByExternalId.values()) for (const stage of pipeline.stages.filter((item) => !item.isWon && !item.isLost)) {
+    for (const { pipeline } of scopeByExternalId.values()) for (const stage of pipeline.stages.filter(isWorkingStage)) {
       sourceParams[`filter[statuses][${statusIndex}][pipeline_id]`] = pipeline.externalId;
       sourceParams[`filter[statuses][${statusIndex}][status_id]`] = stage.externalId;
       statusIndex += 1;
@@ -398,7 +415,7 @@ export class CrmControlService {
         if (!match) continue;
         let stage = match.pipeline.stages.find((item) => item.externalId === String(listedLead.status_id));
         if (!stage) { if (!issues.includes('Часть этапов отсутствует в справочнике. Обновите синхронизацию amoCRM.')) issues.push('Часть этапов отсутствует в справочнике. Обновите синхронизацию amoCRM.'); continue; }
-        if (stage.isWon || stage.isLost || listedLead.is_deleted) continue;
+        if (!isWorkingStage(stage) || listedLead.is_deleted) continue;
         const user = users.find((item) => item.externalId === String(listedLead.responsible_user_id));
         if (config._access?.role === 'MANAGER' && user?.id !== config._access.managerId) continue;
         if (config._access?.role === 'ROP' && user?.groupId !== config._access.groupId) continue;
@@ -410,7 +427,7 @@ export class CrmControlService {
         const currentMatch = scopeByExternalId.get(String(lead.pipeline_id));
         if (!currentMatch) continue;
         stage = currentMatch.pipeline.stages.find((item) => item.externalId === String(lead.status_id));
-        if (!stage || stage.isWon || stage.isLost || lead.is_deleted) continue;
+        if (!stage || !isWorkingStage(stage) || lead.is_deleted) continue;
         const responsible = users.find((item) => item.externalId === String(lead.responsible_user_id));
         if (config._access?.role === 'MANAGER' && responsible?.id !== config._access.managerId) continue;
         if (config._access?.role === 'ROP' && responsible?.groupId !== config._access.groupId) continue;
@@ -443,6 +460,8 @@ export class CrmControlService {
           if (!issues.includes('Часть сделок сменила ответственного во время обхода; нужен повтор.')) issues.push('Часть сделок сменила ответственного во время обхода; нужен повтор.');
           continue;
         }
+        const finalStage = finalLead && pipelines.find((pipeline) => pipeline.externalId === String(finalLead.pipeline_id))?.stages.find((item) => item.externalId === String(finalLead.status_id));
+        if (finalLead && (finalLead.is_deleted || (finalStage && !isWorkingStage(finalStage)))) continue;
         const observedAt = new Date();
         const input: CrmControlRuleInput = {
           deal: { id: dealId, externalId: String(lead.id), title: String(lead.name ?? ''), amount: Number(lead.price ?? 0),
@@ -496,6 +515,8 @@ export class CrmControlService {
         const pipeline = pipelines.find((candidate) => candidate.externalId === String(current?.pipeline_id));
         const stage = pipeline?.stages.find((candidate) => candidate.externalId === String(current?.status_id));
         const closed = Boolean(current && stage && (stage.isWon || stage.isLost));
+        // Moving into an intake system bucket is outside this audit, not proof of correction.
+        if (current && stage && !isWorkingStage(stage) && !closed) continue;
         const scope = config.scopes.find((scope) => scope.pipelineId === prior.pipelineId)!;
         const observedAt = new Date();
         const openCases = await this.prisma.crmControlCase.findMany({ where: { dealId: item.dealId, activeKey: { not: null } } });
