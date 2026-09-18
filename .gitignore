@@ -9,4 +9,5 @@ apps/api/src/generated/prisma/
 *.log
 .codex-run/
 tmp-*
+tmp/ssh/
 outputs/

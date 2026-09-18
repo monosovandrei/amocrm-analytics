@@ -43,6 +43,7 @@ import {
   Users,
 } from 'lucide-react';
 import { api, downloadExcel, downloadFile } from '@/lib/api';
+import CrmControl from './CrmControl';
 import type {
   BuilderOperator,
   ContractConversionDraft,
@@ -123,13 +124,14 @@ import {
   validateDraft,
 } from './report-utils';
 
-type AppTab = Tab | 'ropDashboard' | 'leadSla' | 'planFact' | 'emailThreads';
+type AppTab = Tab | 'ropDashboard' | 'leadSla' | 'planFact' | 'emailThreads' | 'crmControl';
 
 const navItems: Array<{ id: AppTab; label: string; icon: ReactNode }> = [
   { id: 'ropDashboard', label: 'Пульт РОПа', icon: <Users size={17} /> },
   { id: 'workspace', label: 'Отчёты', icon: <LayoutDashboard size={17} /> },
   { id: 'planFact', label: 'План-факт', icon: <BarChart3 size={17} /> },
   { id: 'leadSla', label: 'SLA лидов', icon: <Clock3 size={17} /> },
+  { id: 'crmControl', label: 'Контроль CRM', icon: <CheckCircle2 size={17} /> },
   { id: 'emailThreads', label: 'Почта', icon: <Mail size={17} /> },
   { id: 'platform', label: 'Telegram', icon: <Activity size={17} /> },
 ];
@@ -1017,6 +1019,10 @@ export default function HomePage() {
 
             {tab === 'leadSla' && (
               <LeadSlaTab />
+            )}
+
+            {tab === 'crmControl' && (
+              <CrmControl />
             )}
 
             {tab === 'emailThreads' && (

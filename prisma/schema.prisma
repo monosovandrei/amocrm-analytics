@@ -1350,3 +1350,151 @@ model AuditLog {
 
   @@index([createdAt])
 }
+
+model CrmControlSettings {
+  id        String   @id @default("default")
+  version   Int      @default(1)
+  config    Json     @default("{}")
+  updatedBy String?
+  updatedAt DateTime @updatedAt
+}
+
+model CrmControlRun {
+  id           String   @id @default(uuid())
+  requestKey   String   @unique
+  activeKey    String?  @unique
+  trigger      String
+  requestedBy  String?
+  sourceRunId  String?
+  status       String   @default("QUEUED")
+  scheduledFor DateTime
+  startedAt    DateTime?
+  heartbeatAt  DateTime?
+  finishedAt   DateTime?
+  sourceSyncAt DateTime?
+  config       Json
+  configVersion Int
+  ruleVersion  String   @default("1")
+  counts       Json     @default("{}")
+  issues       Json     @default("[]")
+  error        String?
+  createdAt    DateTime @default(now())
+
+  observations CrmControlObservation[]
+
+  @@index([status, createdAt])
+  @@index([scheduledFor])
+}
+
+model CrmControlObservation {
+  id             String   @id @default(uuid())
+  runId          String
+  dealId         String
+  dealExternalId String
+  dealTitle      String
+  dealUrl        String
+  managerId      String?
+  managerName    String?
+  groupId        String?
+  groupName      String?
+  department     String
+  pipelineId     String
+  pipelineName   String
+  stageId        String
+  stageName      String
+  observedAt     DateTime
+  snapshot       Json
+  snapshotHash   String
+  counts         Json
+
+  run      CrmControlRun @relation(fields: [runId], references: [id], onDelete: Restrict)
+  results  CrmControlResult[]
+  evidence CrmControlEvidence[]
+
+  @@unique([runId, dealId])
+  @@index([runId, managerId, id])
+  @@index([runId, groupId, id])
+  @@index([dealId, observedAt])
+}
+
+model CrmControlResult {
+  id            String @id @default(uuid())
+  observationId String
+  ruleCode      String
+  ruleName      String
+  subjectId     String @default("")
+  status        String
+  message       String
+  clauses       Json   @default("[]")
+  details       Json   @default("{}")
+  caseId        String?
+
+  observation CrmControlObservation @relation(fields: [observationId], references: [id], onDelete: Restrict)
+  case        CrmControlCase? @relation(fields: [caseId], references: [id], onDelete: Restrict)
+
+  @@unique([observationId, ruleCode, subjectId])
+  @@index([caseId])
+  @@index([status, observationId])
+}
+
+model CrmControlCase {
+  id              String   @id @default(uuid())
+  caseKey         String   @unique
+  activeKey       String?  @unique
+  dealId          String
+  ruleCode        String
+  subjectId       String   @default("")
+  status          String   @default("OPEN")
+  firstDetectedAt DateTime
+  lastDetectedAt  DateTime
+  resolvedAt      DateTime?
+  exemptionUntil  DateTime?
+  confirmedAt     DateTime?
+  assessmentHash  String
+  latestObservationId String
+
+  results   CrmControlResult[]
+  decisions CrmControlDecision[]
+
+  @@index([dealId, status])
+}
+
+model CrmControlDecision {
+  id         String   @id @default(uuid())
+  caseId     String
+  observationId String
+  actorId    String
+  actorName  String
+  managerId  String?
+  groupId    String?
+  action     String
+  reason     String
+  validUntil DateTime?
+  createdAt  DateTime @default(now())
+
+  case CrmControlCase @relation(fields: [caseId], references: [id], onDelete: Restrict)
+
+  @@index([caseId, createdAt])
+}
+
+model CrmControlEvidence {
+  id            String   @id @default(uuid())
+  observationId String   @unique
+  status        String   @default("PENDING")
+  sourceUrl     String
+  storageKey    String?
+  contentType   String?
+  sha256        String?
+  capturedAt    DateTime?
+  coverage      String?
+  startedAt     DateTime?
+  nextAttemptAt DateTime?
+  error         String?
+  attempts      Int      @default(0)
+  createdAt     DateTime @default(now())
+
+  observation CrmControlObservation @relation(fields: [observationId], references: [id], onDelete: Restrict)
+
+  @@index([status, createdAt])
+  @@index([status, nextAttemptAt, createdAt])
+}

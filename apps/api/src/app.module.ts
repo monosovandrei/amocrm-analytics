@@ -12,6 +12,7 @@ import { AuditModule } from './audit/audit.module';
 import { PlatformModule } from './platform/platform.module';
 import { ApiMemoryInterceptor } from './common/api-memory.interceptor';
 import { QualityModule } from './quality/quality.module';
+import { CrmControlModule } from './crm-control/crm-control.module';
 
 @Module({
   imports: [
@@ -26,6 +27,7 @@ import { QualityModule } from './quality/quality.module';
     AuditModule,
     PlatformModule,
     QualityModule,
+    CrmControlModule,
   ],
   providers: [
     {

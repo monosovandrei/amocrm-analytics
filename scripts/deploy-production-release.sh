@@ -104,8 +104,32 @@ systemctl enable "${SERVICES[@]}" >/dev/null
 ln -sfn "$RELEASE" "$LIVE_LINK.next"
 mv -Tf "$LIVE_LINK.next" "$LIVE_LINK"
 
-systemctl restart "${SERVICES[@]}"
-systemctl --no-pager --plain is-active "${SERVICES[@]}"
+restore_previous_release() {
+  if [[ -n "$PREVIOUS_RELEASE" && -d "$PREVIOUS_RELEASE" ]]; then
+    ln -sfn "$PREVIOUS_RELEASE" "$LIVE_LINK.next" || {
+      echo "Could not prepare previous release link; rollback stopped before service restart" >&2
+      return 1
+    }
+    mv -Tf "$LIVE_LINK.next" "$LIVE_LINK" || {
+      echo "Could not select previous release; rollback stopped before service restart" >&2
+      return 1
+    }
+    systemctl restart "${SERVICES[@]}" || {
+      echo "Previous release selected, but a service restart failed; inspect systemctl status" >&2
+      return 1
+    }
+    echo "Application restored to $PREVIOUS_RELEASE. Additive database migrations remain installed." >&2
+  else
+    echo "No previous application release is available for rollback" >&2
+    return 1
+  fi
+}
+
+if ! systemctl restart "${SERVICES[@]}" || ! systemctl --no-pager --plain is-active "${SERVICES[@]}"; then
+  echo "Release service startup failed; restoring previous application release" >&2
+  restore_previous_release || true
+  exit 1
+fi
 
 READY_BODY="$(mktemp)"
 HEALTH_BODY="$(mktemp)"
@@ -151,17 +175,16 @@ done
 
 if [[ "$DEPLOY_OK" != "1" ]]; then
   echo "Release health check failed; restoring previous application release" >&2
-  if [[ -n "$PREVIOUS_RELEASE" && -d "$PREVIOUS_RELEASE" ]]; then
-    ln -sfn "$PREVIOUS_RELEASE" "$LIVE_LINK.next"
-    mv -Tf "$LIVE_LINK.next" "$LIVE_LINK"
-    systemctl restart "${SERVICES[@]}"
-    echo "Application restored to $PREVIOUS_RELEASE. Database migration was additive and remains installed." >&2
-  fi
+  restore_previous_release || true
   cat "$READY_BODY" >&2 || true
   exit 1
 fi
 
 cat "$HEALTH_SUMMARY"
+
+RELEASES_ROOT="$(readlink -f "$RELEASES_DIR")"
+CURRENT_RELEASE="$(readlink -f "$LIVE_LINK")"
+DEPLOYED_RELEASE="$(readlink -f "$RELEASE")"
 
 mapfile -t OLD_RELEASES < <(
   find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' |
@@ -169,8 +192,21 @@ mapfile -t OLD_RELEASES < <(
     awk "NR>${KEEP_RELEASES} {sub(/^[^ ]+ /, \"\"); print}"
 )
 for old_release in "${OLD_RELEASES[@]}"; do
-  case "$old_release" in
-    "$RELEASES_DIR"/*) rm -rf -- "$old_release" ;;
+  resolved_release="$(readlink -f "$old_release")" || {
+    echo "Refusing to remove unresolved release path: $old_release" >&2
+    continue
+  }
+  if [[ "$resolved_release" == "$DEPLOYED_RELEASE" || "$resolved_release" == "$CURRENT_RELEASE" || "$resolved_release" == "$PREVIOUS_RELEASE" ]]; then
+    continue
+  fi
+  case "$resolved_release" in
+    "$RELEASES_ROOT"/*)
+      if [[ "$(dirname -- "$resolved_release")" == "$RELEASES_ROOT" ]]; then
+        rm -rf -- "$resolved_release"
+      else
+        echo "Refusing to remove nested release path: $old_release" >&2
+      fi
+      ;;
     *) echo "Refusing to remove unexpected release path: $old_release" >&2 ;;
   esac
 done

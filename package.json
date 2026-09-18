@@ -6,6 +6,7 @@
     "apps/*"
   ],
   "scripts": {
+    "crm-control:browser-login": "node scripts/crm-control-browser-login.cjs",
     "dev": "npm run dev --workspace=@amocrm-analytics/api",
     "dev:web": "npm run dev --workspace=@amocrm-analytics/web",
     "build": "npm run build --workspace=@amocrm-analytics/api && npm run build --workspace=@amocrm-analytics/web",
@@ -21,6 +22,7 @@
     "db:seed:rop-demo": "node prisma/seed-rop-demo.js"
   },
   "dependencies": {
+    "@nestjs/platform-fastify": "11.2.3",
     "@prisma/client": "^5.22.0",
     "jszip": "^3.10.1",
     "prisma": "^5.22.0"
@@ -29,7 +31,8 @@
     "typescript": "^5.5.0"
   },
   "overrides": {
-    "fast-uri": "3.1.7"
+    "fast-uri": "3.1.7",
+    "fastify": "5.12.1"
   },
   "engines": {
     "node": ">=20.0.0"

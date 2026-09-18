@@ -13,6 +13,8 @@ import { AmoSchedulerService } from './amo/amo-scheduler.service';
 import { WorkerRuntimeService } from './common/worker-runtime.service';
 import { QualityModule } from './quality/quality.module';
 import { DataQualitySchedulerService } from './quality/data-quality-scheduler.service';
+import { CrmControlModule } from './crm-control/crm-control.module';
+import { CrmControlScheduler } from './crm-control/crm-control.scheduler';
 
 @Module({
   imports: [
@@ -24,6 +26,7 @@ import { DataQualitySchedulerService } from './quality/data-quality-scheduler.se
     PlatformModule,
     AmoModule,
     QualityModule,
+    CrmControlModule,
   ],
   providers: [
     AmoSchedulerService,
@@ -32,6 +35,7 @@ import { DataQualitySchedulerService } from './quality/data-quality-scheduler.se
     ReportRefreshProcessService,
     WorkerRuntimeService,
     DataQualitySchedulerService,
+    CrmControlScheduler,
   ],
 })
 export class WorkerModule {}
