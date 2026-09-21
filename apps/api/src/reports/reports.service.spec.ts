@@ -1,4 +1,6 @@
 import { ReportsService } from './reports.service';
+import { createHash } from 'node:crypto';
+import { METRIC_VERSION } from '../quality/release-info';
 
 type Where = Record<string, any>;
 
@@ -1447,6 +1449,10 @@ describe('ReportsService data contract', () => {
         total: 1,
         totalPercent: 100,
         values: { [managers.first.id]: 0, [managers.second.id]: 1 },
+        samplesByManager: {
+          [managers.first.id]: [],
+          [managers.second.id]: [{ dealId: 'deal-5', dealExternalId: null, dealTitle: 'Отказ', amount: 5000, occurredAt: '2026-03-05T10:00:00.000Z' }],
+        },
         percentages: { [managers.first.id]: 0, [managers.second.id]: 100 },
       },
     ]);
@@ -1458,6 +1464,77 @@ describe('ReportsService data contract', () => {
         Всего: '1 (100%)',
       },
     ]);
+  });
+
+  it('uses exactly one sample per counted lost deal without truncating cells over 100 deals', async () => {
+    const db = createPrismaMock();
+    const localService = new ReportsService(db as any, audit as any);
+    const entries = Array.from({ length: 105 }, (_, index) => ({
+      deal_id: `lost-${index}`, deal_external_id: String(9000 + index), title: `Клиент ${index}`, amount: index + 0.5,
+      responsible_id: managers.first.id, moved_at: new Date('2026-03-02T10:00:00Z'),
+      custom_fields: { reason: { name: 'Причины отказа', value: 'Локализация' } },
+    }));
+    jest.spyOn(localService as any, 'lossReasonFactRows').mockResolvedValue([
+      ...entries,
+      { ...entries[0], moved_at: new Date('2026-03-03T10:00:00Z') },
+      { ...entries[0], deal_id: 'different-reason', responsible_id: managers.second.id, custom_fields: {} },
+      { ...entries[0], deal_id: 'hidden-manager', responsible_id: 'outside-visible-scope' },
+    ]);
+    const report = await (localService as any).computeLossReasonsReport({}, 'ADMIN');
+    const row = report.rows.find((item: any) => item.reasonId === 'custom:локализация');
+    const samples = row.samplesByManager[managers.first.id];
+    expect(row.values[managers.first.id]).toBe(105);
+    expect(samples).toHaveLength(105);
+    expect(new Set(samples.map((sample: any) => sample.dealId)).size).toBe(105);
+    expect(samples[0]).toEqual({ dealId: 'lost-0', dealExternalId: '9000', dealTitle: 'Клиент 0', amount: 0.5, occurredAt: '2026-03-02T10:00:00.000Z' });
+    expect(row.samplesByManager[managers.second.id]).toEqual([]);
+    expect(report.rows.find((item: any) => item.reasonId === 'custom:not_set').samplesByManager[managers.second.id][0].dealId).toBe('different-reason');
+    expect(report.summary.total).toBe(106);
+    for (const item of report.rows) for (const manager of report.managers) {
+      expect(item.samplesByManager[manager.id]).toHaveLength(item.values[manager.id]);
+    }
+  });
+
+  it('keeps loss detail samples inside the selected manager, group and transition period', async () => {
+    for (const filters of [
+      { dateFrom: '2026-01-01', dateTo: '2026-01-31' },
+      { dateFrom: '2026-03-01', dateTo: '2026-03-31', managerIds: [managers.first.id] },
+      { dateFrom: '2026-03-01', dateTo: '2026-03-31', groupIds: ['outside-group'] },
+    ]) {
+      const report = await (service as any).computeLossReasonsReport({ pipelineIds: ['pipe-sales'], ...filters }, 'ADMIN');
+      expect(report.rows).toEqual([]);
+      expect(report.summary.total).toBe(0);
+    }
+  });
+
+  it('applies all active loss report filters to the same SQL source used for counts and samples', async () => {
+    const db = { $queryRaw: jest.fn().mockResolvedValue([]) };
+    const localService = new ReportsService(db as any, audit as any);
+    const filters = { dateFrom: '2026-03-01', dateTo: '2026-03-31', pipelineIds: ['pipe-sales'], stageIds: [stages.lost.id],
+      excludeStageIds: [stages.paid.id], lossReasonIds: ['loss-price'], amountFrom: 10, amountTo: 5000,
+      tagIncludes: ['Приоритет'], customFields: [{ fieldId: 'source', operator: 'equals', value: 'Принят' }] };
+    await (localService as any).lossReasonFactRows(filters, [stages.lost.id], [managers.first.id], (localService as any).dateRange(filters));
+    const call = db.$queryRaw.mock.calls[0];
+    const sql = flattenSql(call[0], call.slice(1));
+    for (const fragment of ['deal."deleted_at" IS NULL', 'deal."responsible_id" IN', 'deal."pipeline_id" IN',
+      'deal."stage_id" IN', 'deal."stage_id" NOT IN', 'deal."loss_reason_id" IN',
+      'transition."moved_at" >=', 'transition."moved_at" <=', 'deal."amount" >=', 'deal."amount" <=', 'deal."tags" &&', 'deal."custom_fields"']) {
+      expect(sql.text).toContain(fragment);
+    }
+    expect(sql.values).toEqual(expect.arrayContaining(['pipe-sales', stages.lost.id, stages.paid.id, 'loss-price', managers.first.id,
+      10, 5000, 'Приоритет', 'source', '%принят%', new Date('2026-02-28T21:00:00.000Z'), new Date('2026-03-31T20:59:59.999Z')]));
+  });
+
+  it('invalidates only old loss-reason payloads so cached numbers cannot arrive without their samples', () => {
+    const user = { id: 'user-1', role: 'ADMIN' };
+    for (const metric of ['loss_reasons', 'count']) {
+      const dto = { name: 'Report', sourceType: 'CURRENT', filters: {}, config: { metric } };
+      const legacyKey = createHash('sha256').update(JSON.stringify({ config: dto.config, filters: dto.filters,
+        metricVersion: METRIC_VERSION, name: dto.name, role: user.role, sourceType: dto.sourceType })).digest('hex');
+      const key = (service as any).reportCacheKey(dto, user);
+      if (metric === 'loss_reasons') expect(key).not.toBe(legacyKey);
+      else expect(key).toBe(legacyKey);
+    }
   });
 
   it('computes assigned-stage speed from sales responsibility and manager task to stage exit', async () => {
@@ -1937,6 +2014,9 @@ function mockFactTransitionQuery(sql: { text: string; values: any[] }) {
     const deal = deals.find((item) => item.id === entry.dealId)!;
     return {
       deal_id: entry.dealId,
+      deal_external_id: (deal as any).externalId ?? null,
+      title: deal.title,
+      amount: deal.amount,
       responsible_id: deal.responsibleId,
       custom_fields: deal.customFields,
       moved_at: entry.movedAt,

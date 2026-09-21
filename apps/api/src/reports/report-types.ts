@@ -17,6 +17,14 @@ export interface ReportFilters {
   }>;
 }
 
+export interface LossReasonDealSample {
+  dealId: string;
+  dealExternalId: string | null;
+  dealTitle: string;
+  amount: number | null;
+  occurredAt: string | null;
+}
+
 export interface ConversionStep {
   id: string;
   label: string;

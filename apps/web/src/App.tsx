@@ -1,6 +1,7 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import type {
   CSSProperties,
   Dispatch,
@@ -41,6 +42,7 @@ import {
   SlidersHorizontal,
   Trash2,
   Users,
+  X,
 } from 'lucide-react';
 import { api, downloadExcel, downloadFile } from '@/lib/api';
 import CrmControl from './CrmControl';
@@ -7198,7 +7200,7 @@ function ReportResultDetails({
   }
 
   if (result.type === 'lossReasons') {
-    return <LossReasonsReport result={result} />;
+    return <LossReasonsReport amoDomain={amoDomain} result={result} />;
   }
 
   if (result.type === 'forecast') {
@@ -7287,7 +7289,7 @@ function ReportResultDetails({
 
 type ContractDealSample = {
   dealId: string;
-  dealExternalId?: string;
+  dealExternalId?: string | null;
   dealTitle: string;
   amount?: number | null;
   expectedAmount?: number | null;
@@ -7360,7 +7362,7 @@ function ContractMetricCell({
       amoDomain={amoDomain}
       trigger={label}
       title="Сделки в расчёте"
-      meta={`В расчёте: ${formatNumber(value.sampleSize ?? value.dealCount ?? value.samples?.length ?? 0)} сделок`}
+      meta={`Сделок: ${formatNumber(value.sampleSize ?? value.dealCount ?? value.samples?.length ?? 0)}`}
       sections={[{ samples: value.samples ?? [] }]}
     />
   );
@@ -7390,35 +7392,165 @@ function ContractDealDrilldown({
   title,
   meta,
   sections,
+  emptyMessage = 'Нет сделок',
 }: {
   amoDomain: string;
   trigger: string;
   title: string;
   meta: string;
   sections: Array<{ label?: string; count?: number; samples: ContractDealSample[] }>;
+  emptyMessage?: string;
 }) {
-  const triggerRef = useRef<HTMLSpanElement>(null);
-  const [popoverOffset, setPopoverOffset] = useState(0);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const popoverRef = useRef<HTMLDivElement>(null);
+  const closeTimer = useRef<number>();
+  const focusRequested = useRef(false);
+  const popoverId = useId();
+  const [open, setOpen] = useState(false);
+  const [pinned, setPinned] = useState(false);
+  const [position, setPosition] = useState<{ left: number; top?: number; bottom?: number; maxHeight: number }>({ left: 16, top: 16, maxHeight: 300 });
+  const cancelClose = useCallback(() => window.clearTimeout(closeTimer.current), []);
+  const closePopover = useCallback(() => {
+    cancelClose();
+    setOpen(false);
+    setPinned(false);
+  }, [cancelClose]);
+  const openPopover = () => {
+    cancelClose();
+    document.dispatchEvent(new CustomEvent('report-deal-popover-open', { detail: popoverId }));
+    setOpen(true);
+  };
+  const focusFirstLink = () => {
+    (popoverRef.current?.querySelector<HTMLAnchorElement>('a[href]') ?? popoverRef.current)?.focus();
+  };
   const placePopover = useCallback(() => {
     const rect = triggerRef.current?.getBoundingClientRect();
-    if (!rect || typeof window === 'undefined') return;
+    if (!rect) return;
     const width = Math.min(380, window.innerWidth - 56);
-    const viewportLeft = Math.min(Math.max(rect.left, 16), window.innerWidth - width - 16);
-    setPopoverOffset(Math.round(viewportLeft - rect.left));
+    const height = popoverRef.current?.getBoundingClientRect().height ?? 300;
+    const below = window.innerHeight - rect.bottom - 16;
+    const above = rect.top - 16;
+    const showBelow = height <= below || below >= above;
+    const maxHeight = Math.max(80, Math.min(300, showBelow ? below : above));
+    setPosition({
+      left: Math.round(Math.min(Math.max(rect.left, 16), window.innerWidth - width - 16)),
+      ...(showBelow ? { top: Math.round(rect.bottom + 8) } : { bottom: Math.round(Math.max(8, window.innerHeight - rect.top + 8)) }),
+      maxHeight,
+    });
   }, []);
+  const scheduleClose = () => {
+    cancelClose();
+    if (pinned) return;
+    closeTimer.current = window.setTimeout(() => {
+      if (triggerRef.current === document.activeElement || popoverRef.current?.contains(document.activeElement)) return;
+      closePopover();
+    }, 180);
+  };
+  const handleBlur = (next: EventTarget | null) => {
+    if (next instanceof Node && (popoverRef.current?.contains(next) || triggerRef.current?.contains(next))) return;
+    closePopover();
+  };
+  useLayoutEffect(() => {
+    if (!open) return;
+    placePopover();
+    if (focusRequested.current) { focusRequested.current = false; focusFirstLink(); }
+  }, [open, pinned, placePopover]);
+  useEffect(() => cancelClose, [cancelClose]);
+  useEffect(() => {
+    if (!open) return;
+    const outside = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (!triggerRef.current?.contains(target) && !popoverRef.current?.contains(target)) closePopover();
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      if (popoverRef.current?.contains(document.activeElement)) triggerRef.current?.focus({ preventScroll: true });
+      closePopover();
+    };
+    const scroll = (event: Event) => {
+      if (event.target instanceof Node && popoverRef.current?.contains(event.target)) return;
+      closePopover();
+    };
+    const otherPopover = (event: Event) => {
+      if ((event as CustomEvent<string>).detail !== popoverId) closePopover();
+    };
+    document.addEventListener('pointerdown', outside);
+    document.addEventListener('keydown', escape);
+    document.addEventListener('scroll', scroll, true);
+    document.addEventListener('report-deal-popover-open', otherPopover);
+    window.addEventListener('resize', closePopover);
+    return () => {
+      document.removeEventListener('pointerdown', outside);
+      document.removeEventListener('keydown', escape);
+      document.removeEventListener('scroll', scroll, true);
+      document.removeEventListener('report-deal-popover-open', otherPopover);
+      window.removeEventListener('resize', closePopover);
+    };
+  }, [open, closePopover, popoverId]);
 
   return (
-    <span
-      ref={triggerRef}
-      className="drilldown-popover-trigger"
-      style={{ '--drilldown-popover-left': `${popoverOffset}px` } as CSSProperties}
-      tabIndex={0}
-      onFocus={placePopover}
-      onMouseEnter={placePopover}
-    >
-      {trigger}
-      <span className="duration-popover">
-        <span className="deal-cycle-tooltip-title">{title}</span>
+    <>
+      <button
+        ref={triggerRef}
+        type="button"
+        className="drilldown-popover-trigger"
+        aria-label={`${title}. ${meta}. Показать сделки`}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        aria-controls={open ? popoverId : undefined}
+        onFocus={openPopover}
+        onBlur={(event) => handleBlur(event.relatedTarget)}
+        onMouseEnter={openPopover}
+        onMouseLeave={scheduleClose}
+        onClick={(event) => {
+          cancelClose();
+          focusRequested.current = !pinned && event.detail === 0;
+          if (pinned) setOpen(false); else openPopover();
+          setPinned(!pinned);
+        }}
+        onKeyDown={(event) => {
+          if (event.key === 'ArrowDown' || (event.key === 'Tab' && !event.shiftKey && open)) {
+            event.preventDefault();
+            focusRequested.current = true;
+            setPinned(true);
+            if (open) { focusRequested.current = false; focusFirstLink(); } else openPopover();
+          }
+        }}
+      >
+        {trigger}
+      </button>
+      {open && createPortal(<div
+        ref={popoverRef}
+        id={popoverId}
+        role="dialog"
+        aria-label={`${title}. ${meta}`}
+        tabIndex={-1}
+        className="report-deal-popover"
+        style={position}
+        onMouseEnter={cancelClose}
+        onMouseLeave={scheduleClose}
+        onBlur={(event) => handleBlur(event.relatedTarget)}
+        onKeyDown={(event) => {
+          if (event.key !== 'Tab') return;
+          const controls = popoverRef.current?.querySelectorAll<HTMLElement>('a[href], button');
+          if (!controls?.length) return;
+          if (event.shiftKey && event.target === controls[0]) {
+            event.preventDefault();
+            triggerRef.current?.focus();
+          } else if (!event.shiftKey && event.target === controls[controls.length - 1]) {
+            triggerRef.current?.focus();
+            closePopover();
+          }
+        }}
+      >
+        <div className="report-deal-popover-heading">
+          <span className="deal-cycle-tooltip-title">{title}</span>
+          <button type="button" className="icon-btn" aria-label="Закрыть список сделок" onClick={() => {
+            triggerRef.current?.focus({ preventScroll: true });
+            closePopover();
+          }}><X size={16} /></button>
+        </div>
         <span className="deal-cycle-tooltip-meta">{meta}</span>
         <span className="deal-cycle-tooltip-list">
           {sections.map((section, sectionIndex) => (
@@ -7429,7 +7561,7 @@ function ContractDealDrilldown({
                 </span>
               )}
               {section.samples.length === 0 ? (
-                <span className="deal-cycle-tooltip-empty">Нет сделок</span>
+                <span className="deal-cycle-tooltip-empty">{emptyMessage}</span>
               ) : (
                 section.samples.map((sample, index) => {
                   const dealUrl = buildAmoDealUrl(amoDomain, sample.dealExternalId);
@@ -7450,8 +7582,8 @@ function ContractDealDrilldown({
             </span>
           ))}
         </span>
-      </span>
-    </span>
+      </div>, document.body)}
+    </>
   );
 }
 
@@ -7519,9 +7651,10 @@ type LossReasonRow = {
   percentages?: Record<string, number>;
   total: number;
   totalPercent?: number;
+  samplesByManager?: Record<string, ContractDealSample[]>;
 };
 
-function LossReasonsReport({ result }: { result: Record<string, any> }) {
+function LossReasonsReport({ amoDomain, result }: { amoDomain: string; result: Record<string, any> }) {
   const managers = (result.managers ?? []) as LossReasonManager[];
   const rows = (result.rows ?? []) as LossReasonRow[];
   const summary = (result.summary ?? {}) as { total?: number; values?: Record<string, number> };
@@ -7555,9 +7688,20 @@ function LossReasonsReport({ result }: { result: Record<string, any> }) {
               {managers.map((manager) => {
                 const value = row.values?.[manager.id] ?? 0;
                 const managerTotal = summary.values?.[manager.id] ?? 0;
+                const label = cellValue(value, row.percentages?.[manager.id] ?? percent(value, managerTotal));
+                const samples = row.samplesByManager?.[manager.id] ?? [];
                 return (
                   <td key={`${row.reasonId}-${manager.id}`} className="mono-num">
-                    {cellValue(value, row.percentages?.[manager.id] ?? percent(value, managerTotal))}
+                    {value > 0 ? (
+                      <ContractDealDrilldown
+                        amoDomain={amoDomain}
+                        trigger={label}
+                        title={manager.name}
+                        meta={`${row.reasonName} · Сделок: ${formatNumber(value)}${samples.length > 0 && samples.length < value ? ` · показано ${formatNumber(samples.length)}` : ''}`}
+                        sections={[{ samples }]}
+                        emptyMessage="Список сделок пока не загружен. Обновите отчёт."
+                      />
+                    ) : label}
                   </td>
                 );
               })}
@@ -8008,7 +8152,7 @@ function DealCycleTimelineRow({
   );
 }
 
-function buildAmoDealUrl(domain: string, externalId?: string) {
+function buildAmoDealUrl(domain: string, externalId?: string | null) {
   const cleanDomain = domain.trim().replace(/^https?:\/\//, '').replace(/\/$/, '');
   if (!cleanDomain || !externalId) return '';
   return `https://${cleanDomain}/leads/detail/${externalId}`;

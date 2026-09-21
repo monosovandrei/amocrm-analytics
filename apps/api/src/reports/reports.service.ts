@@ -24,6 +24,7 @@ import {
   DataContractDuration,
   DataContractFilter,
   DataContractMetric,
+  LossReasonDealSample,
   ReportConfig,
   ReportFilters,
 } from './report-types';
@@ -312,6 +313,7 @@ export class ReportsService {
         config: dto.config,
         role: user.role,
         metricVersion: METRIC_VERSION,
+        ...(dto.config?.metric === 'loss_reasons' ? { lossReasonsPayloadVersion: 2 } : {}),
       }))
       .digest('hex');
   }
@@ -3653,7 +3655,8 @@ ${sheets}
     const percent = (value: number, denominator: number) =>
       denominator > 0 ? Number(((value / denominator) * 100).toFixed(2)) : 0;
     const lossReasonCell = (value: number, denominator: number) => `${value} (${percent(value, denominator)}%)`;
-    const valuesByReason = new Map<string, { reasonId: string; reasonName: string; values: Record<string, number>; total: number }>();
+    const valuesByReason = new Map<string, { reasonId: string; reasonName: string; values: Record<string, number>;
+      samplesByManager: Record<string, LossReasonDealSample[]>; total: number }>();
     const summaryValues: Record<string, number> = Object.fromEntries(managers.map((manager) => [manager.id, 0]));
     let total = 0;
 
@@ -3666,11 +3669,19 @@ ${sheets}
           reasonId,
           reasonName,
           values: Object.fromEntries(managers.map((manager) => [manager.id, 0])),
+          samplesByManager: Object.fromEntries(managers.map((manager) => [manager.id, []])),
           total: 0,
         });
       }
       const row = valuesByReason.get(reasonId)!;
       row.values[managerId] = (row.values[managerId] ?? 0) + 1;
+      row.samplesByManager[managerId].push({
+        dealId: entry.deal_id,
+        dealExternalId: entry.deal_external_id ?? null,
+        dealTitle: entry.title,
+        amount: entry.amount == null ? null : this.toNumber(entry.amount),
+        occurredAt: entry.moved_at?.toISOString() ?? null,
+      });
       row.total += 1;
       summaryValues[managerId] = (summaryValues[managerId] ?? 0) + 1;
       total += 1;
@@ -3719,6 +3730,9 @@ ${sheets}
     if (filters.pipelineIds?.length) {
       where.push(Prisma.sql`deal."pipeline_id" IN (${Prisma.join(filters.pipelineIds)})`);
     }
+    if (filters.stageIds?.length) where.push(Prisma.sql`deal."stage_id" IN (${Prisma.join(filters.stageIds)})`);
+    if (filters.excludeStageIds?.length) where.push(Prisma.sql`deal."stage_id" NOT IN (${Prisma.join(filters.excludeStageIds)})`);
+    if (filters.lossReasonIds?.length) where.push(Prisma.sql`deal."loss_reason_id" IN (${Prisma.join(filters.lossReasonIds)})`);
     if (range?.gte) where.push(Prisma.sql`transition."moved_at" >= ${range.gte}`);
     if (range?.lte) where.push(Prisma.sql`transition."moved_at" <= ${range.lte}`);
     if (filters.amountFrom !== undefined) where.push(Prisma.sql`deal."amount" >= ${filters.amountFrom}`);
@@ -3733,12 +3747,18 @@ ${sheets}
 
     return this.prisma.$queryRaw<Array<{
       deal_id: string;
+      deal_external_id: string | null;
+      title: string;
+      amount: Prisma.Decimal | number | null;
       responsible_id: string | null;
       custom_fields: Prisma.JsonValue;
       moved_at: Date;
     }>>`
       SELECT
         transition."deal_id",
+        deal."deal_external_id",
+        deal."title",
+        deal."amount",
         deal."responsible_id",
         deal."custom_fields",
         transition."moved_at"
