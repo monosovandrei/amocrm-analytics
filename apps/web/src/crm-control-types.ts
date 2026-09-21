@@ -71,6 +71,13 @@ export interface ControlRun {
   sourceSyncAt: string | null;
   error: string | null;
   counts: ControlCounts;
+  completion?: {
+    status: 'CHECKED' | 'UNCHECKED';
+    remainingResults: number;
+    remainingDeals: number;
+    reasons: Array<{ code: string; message: string; count?: number }>;
+    canRecheck: boolean;
+  };
 }
 
 export interface ControlManager extends ControlCounts {
@@ -85,6 +92,22 @@ export interface ControlRunDetail {
   counts: ControlCounts;
   managers: ControlManager[];
   configurationIssues: string[];
+  ruleBreakdown?: ControlRuleBreakdown[];
+}
+
+export interface ControlRuleBreakdown {
+  ruleCode: string;
+  ruleName: string;
+  failedDeals: number;
+  reviewDeals: number;
+  unknownDeals: number;
+  byManager: Array<{
+    managerId: string | null;
+    department: ControlDepartment;
+    failedDeals: number;
+    reviewDeals: number;
+    unknownDeals: number;
+  }>;
 }
 
 export interface ControlResult {
@@ -99,6 +122,12 @@ export interface ControlResult {
   details?: Record<string, unknown>;
   caseId?: string | null;
   caseStatus?: ControlCaseStatus | null;
+  review?: {
+    allowed: boolean;
+    expectedDecisionId: string | null;
+    guidance: string;
+    current: { decisionId: string; outcome: 'PASS' | 'FAIL' | 'NA'; reason: string; reviewedBy: string; reviewedAt: string } | null;
+  };
 }
 
 export interface ControlEvidence {
@@ -131,7 +160,7 @@ export interface ControlObservation {
 
 export interface ControlDecision {
   id: string;
-  action: 'CONFIRM' | 'EXEMPT' | 'DISPUTE';
+  action: 'CONFIRM' | 'EXEMPT' | 'DISPUTE' | 'VERIFY_PASS' | 'VERIFY_FAIL' | 'VERIFY_NA';
   reason: string;
   validUntil?: string | null;
   createdAt: string;

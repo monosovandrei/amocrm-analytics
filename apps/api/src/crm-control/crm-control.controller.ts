@@ -2,7 +2,7 @@ import { Body, Controller, Get, Header, Param, Post, Put, Query, Req, Streamable
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { AuthUser } from '../auth/jwt.strategy';
 import { CrmControlService } from './crm-control.service';
-import { CrmControlDecisionInput } from './crm-control.types';
+import { CrmControlDecisionInput, CrmControlManualReviewInput } from './crm-control.types';
 
 @Controller('crm-control')
 @UseGuards(JwtAuthGuard)
@@ -15,8 +15,12 @@ export class CrmControlController {
   @Post('runs') enqueue(@Req() request: { user: AuthUser }, @Body() body: { sourceRunId?: string; requestKey?: string }) { return this.service.enqueue(request.user, body); }
   @Get('runs/:id') run(@Req() request: { user: AuthUser }, @Param('id') id: string) { return this.service.run(request.user, id); }
   @Get('runs/:id/deals') deals(@Req() request: { user: AuthUser }, @Param('id') id: string,
-    @Query() query: { managerId?: string; department?: string; status?: string; cursor?: string }) { return this.service.deals(request.user, id, query); }
+    @Query() query: { managerId?: string; department?: string; status?: string; ruleCode?: string; cursor?: string }) { return this.service.deals(request.user, id, query); }
   @Get('observations/:id') observation(@Req() request: { user: AuthUser }, @Param('id') id: string) { return this.service.observation(request.user, id); }
+  @Post('observations/:observationId/results/:resultId/review') reviewResult(@Req() request: { user: AuthUser },
+    @Param('observationId') observationId: string, @Param('resultId') resultId: string, @Body() body: CrmControlManualReviewInput) {
+    return this.service.reviewResult(request.user, observationId, resultId, body);
+  }
   @Post('cases/:id/decisions') decide(@Req() request: { user: AuthUser }, @Param('id') id: string, @Body() body: CrmControlDecisionInput) { return this.service.decide(request.user, id, body); }
   @Post('evidence/:id/retry') retryEvidence(@Req() request: { user: AuthUser }, @Param('id') id: string) { return this.service.retryEvidence(request.user, id); }
   @Get('evidence/:id/file')

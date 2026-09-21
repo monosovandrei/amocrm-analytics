@@ -1,4 +1,4 @@
-import { BadRequestException, ForbiddenException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { createHash, randomUUID } from 'crypto';
 import { Prisma } from '../generated/prisma';
 import { PrismaService } from '../prisma/prisma.service';
@@ -7,9 +7,9 @@ import { AmoService } from '../amo/amo.service';
 import { CrmControlEvidenceService } from './crm-control-evidence.service';
 import { CRM_CONTROL_RULE_CATALOG, CRM_CONTROL_RULE_VERSION, evaluateCrmControlDeal } from './crm-control.rules';
 import { hasStageDeadline, stageDeadlineConfigError } from './crm-control-deadline';
-import { CrmControlConfig, CrmControlCounts, CrmControlDecisionInput, CrmControlRuleInput, CrmControlRuleResult,
+import { CrmControlConfig, CrmControlCounts, CrmControlDecisionInput, CrmControlManualReviewInput, CrmControlRuleInput, CrmControlRuleResult,
   CrmControlScope, DEFAULT_CRM_CONTROL_CONFIG } from './crm-control.types';
-import { addControlCounts, controlScheduleSlot, emptyControlCounts, nextControlCaseState, observationCounts } from './crm-control.logic';
+import { addControlCounts, controlCompletion, controlManualReviewAllowed, controlManualReviewGuidance, controlScheduleSlot, emptyControlCounts, nextControlCaseState, observationCounts } from './crm-control.logic';
 
 type Access = { role: 'OWNER' | 'ROP' | 'MANAGER'; managerId?: string; groupId?: string; actorId: string; actorName: string };
 type Pipeline = Prisma.PipelineGetPayload<{ include: { stages: true } }>;
@@ -17,8 +17,14 @@ const isWorkingStage = (stage: Pipeline['stages'][number]) => !stage.isWon && !s
   && !(stage.raw && typeof stage.raw === 'object' && !Array.isArray(stage.raw) && stage.raw.type === 1);
 type Observation = Prisma.CrmControlObservationGetPayload<{ include: { results: { include: { case: { include: { decisions: true } } } }; evidence: true } }>;
 const observationInclude = { results: { include: { case: { include: { decisions: true } } } }, evidence: true } as const;
+type AssessedDecision = { id?: string; action: string; observationId: string; createdAt: Date; validUntil: Date | null; reason?: string; actorName?: string };
 type AssessedResult = { status: string; observationId: string; case?: { status: string; confirmedAt?: Date | null;
-  decisions?: Array<{ action: string; observationId: string; createdAt: Date; validUntil: Date | null }> } | null };
+  decisions?: AssessedDecision[] } | null };
+const manualReviewActions = ['VERIFY_PASS', 'VERIFY_FAIL', 'VERIFY_NA'];
+const newestDecision = (items: AssessedDecision[]) => [...items].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime() || String(b.id ?? '').localeCompare(String(a.id ?? '')))[0];
+type RuleDealCounts = { failedDeals: number; reviewDeals: number; unknownDeals: number };
+type RuleBreakdown = RuleDealCounts & { ruleCode: string; ruleName: string;
+  byManager: Array<RuleDealCounts & { managerId: string | null; department: string }> };
 const json = (value: unknown): Prisma.InputJsonValue => JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
 const normal = (value: string) => value.trim().toLocaleLowerCase('ru').replace(/ё/g, 'е');
 const timestamp = (value: unknown): Date | null => Number.isFinite(Number(value)) && Number(value) > 0 ? new Date(Number(value) * 1000) : null;
@@ -213,16 +219,18 @@ export class CrmControlService {
 
   private publicRun(run: any, counts: CrmControlCounts) {
     return { id: run.id, status: run.status, trigger: run.trigger, scheduledFor: run.scheduledFor, startedAt: run.startedAt,
-      finishedAt: run.finishedAt, sourceSyncAt: run.sourceSyncAt, error: run.error, counts, configVersion: run.configVersion, ruleVersion: run.ruleVersion };
+      finishedAt: run.finishedAt, sourceSyncAt: run.sourceSyncAt, error: run.error, counts, configVersion: run.configVersion, ruleVersion: run.ruleVersion,
+      completion: controlCompletion(run.status, counts, Array.isArray(run.issues) ? run.issues : []) };
   }
 
   private async summary(runId: string, access: Access) {
     const observations = await this.prisma.crmControlObservation.findMany({ where: { runId, ...this.scopeWhere(access) },
       select: { managerId: true, managerName: true, groupName: true, department: true, counts: true, observedAt: true,
-        results: { select: { status: true, observationId: true, case: { select: { status: true,
-          decisions: { select: { action: true, observationId: true, createdAt: true, validUntil: true } } } } } } } });
+        results: { select: { status: true, ruleCode: true, ruleName: true, observationId: true, case: { select: { status: true,
+          decisions: { select: { id: true, action: true, observationId: true, createdAt: true, validUntil: true } } } } } } } });
     const counts = emptyControlCounts();
     const managers = new Map<string, CrmControlCounts & { managerId: string | null; managerName: string | null; groupName: string | null; department: string }>();
+    const rules = new Map<string, RuleBreakdown>();
     for (const observation of observations) {
       const value = this.effectiveCounts(observation.results, observation.observedAt);
       addControlCounts(counts, value);
@@ -232,8 +240,25 @@ export class CrmControlService {
       // Aggregate only count fields: manager metadata is never coerced into numbers.
       const totals = addControlCounts(Object.fromEntries(Object.keys(emptyControlCounts()).map((key) => [key, (manager as any)[key]])) as unknown as CrmControlCounts, value);
       managers.set(key, { ...manager, ...totals });
+      // Several tasks may fail the same rule. Each cell counts the deal only once per status.
+      const statusesByRule = new Map<string, { name: string; statuses: Set<string> }>();
+      for (const result of observation.results) {
+        const item = statusesByRule.get(result.ruleCode) ?? { name: result.ruleName, statuses: new Set<string>() };
+        item.statuses.add(this.effectiveStatus(result, observation.observedAt));
+        statusesByRule.set(result.ruleCode, item);
+      }
+      for (const [ruleCode, item] of statusesByRule) {
+        const value: RuleDealCounts = { failedDeals: Number(item.statuses.has('FAIL')),
+          reviewDeals: Number(item.statuses.has('REVIEW')), unknownDeals: Number(item.statuses.has('UNKNOWN')) };
+        const rule = rules.get(ruleCode) ?? { ruleCode, ruleName: item.name, failedDeals: 0, reviewDeals: 0, unknownDeals: 0, byManager: [] };
+        let cell = rule.byManager.find(cell => cell.managerId === observation.managerId && cell.department === observation.department);
+        if (!cell) { cell = { managerId: observation.managerId, department: observation.department, failedDeals: 0, reviewDeals: 0, unknownDeals: 0 }; rule.byManager.push(cell); }
+        for (const field of ['failedDeals', 'reviewDeals', 'unknownDeals'] as const) { rule[field] += value[field]; cell[field] += value[field]; }
+        rules.set(ruleCode, rule);
+      }
     }
-    return { counts, managers: [...managers.values()].sort((a, b) => b.failedDeals - a.failedDeals || String(a.managerName).localeCompare(String(b.managerName), 'ru')) };
+    return { counts, managers: [...managers.values()].sort((a, b) => b.failedDeals - a.failedDeals || String(a.managerName).localeCompare(String(b.managerName), 'ru')),
+      ruleBreakdown: [...rules.values()].sort((a, b) => b.failedDeals - a.failedDeals || a.ruleName.localeCompare(b.ruleName, 'ru')) };
   }
 
   async run(actor: AuthUser, id: string) {
@@ -244,13 +269,16 @@ export class CrmControlService {
     return { run: this.publicRun(run, summary.counts), ...summary, configurationIssues: run.issues };
   }
 
-  async deals(actor: AuthUser, runId: string, query: { managerId?: string; department?: string; status?: string; cursor?: string }) {
+  async deals(actor: AuthUser, runId: string, query: { managerId?: string; department?: string; status?: string; ruleCode?: string; cursor?: string }) {
     const access = await this.access(actor);
     await this.run(actor, runId);
     if (query.status && !['FAIL', 'REVIEW', 'UNKNOWN', 'PASS', 'NA'].includes(query.status)) throw new BadRequestException('Неверный статус проверки');
+    if (query.ruleCode && !CRM_CONTROL_RULE_CATALOG.some(rule => rule.code === query.ruleCode)) throw new BadRequestException('Неверный тип проверки');
+    if (query.department && !['sales', 'csm'].includes(query.department)) throw new BadRequestException('Неверный отдел');
     const where: Prisma.CrmControlObservationWhereInput = { AND: [{ runId }, this.scopeWhere(access),
       ...(query.managerId ? [{ managerId: query.managerId === 'unassigned' ? null : query.managerId }] : []),
-      ...(query.department ? [{ department: query.department }] : [])] };
+      ...(query.department ? [{ department: query.department }] : []),
+      ...(query.ruleCode ? [{ results: { some: { ruleCode: query.ruleCode } } }] : [])] };
     const matching: ReturnType<CrmControlService['publicObservation']>[] = [];
     let cursor = query.cursor;
     // Decisions are temporal. Filter using exactly the same projection as the rows and manager summary.
@@ -260,8 +288,10 @@ export class CrmControlService {
       if (!rows.length) break;
       for (const row of rows) {
         const view = this.publicObservation(row);
-        if (!query.status || (query.status === 'PASS' ? view.counts.checkedDeals === 1 && view.counts.failedDeals === 0
-          : view.results.some((result) => result.effectiveStatus === query.status))) matching.push(view);
+        const matchingResults = view.results.filter(result => !query.ruleCode || result.ruleCode === query.ruleCode);
+        if ((!query.ruleCode || matchingResults.length > 0) && (!query.status || (query.status === 'PASS' && !query.ruleCode
+          ? view.counts.checkedDeals === 1 && view.counts.failedDeals === 0
+          : matchingResults.some(result => result.effectiveStatus === query.status)))) matching.push(view);
         if (matching.length > 50) break;
       }
       cursor = rows[rows.length - 1].id;
@@ -273,18 +303,33 @@ export class CrmControlService {
   private publicObservation(row: Observation) {
     const { snapshot, snapshotHash, results, evidence, ...rest } = row;
     const counts = this.effectiveCounts(results, row.observedAt);
-    return { ...rest, counts, results: results.map(({ case: caseValue, ...result }) => ({ ...result, effectiveStatus: this.effectiveStatus({ ...result, case: caseValue }, row.observedAt), caseStatus: caseValue?.status ?? null })),
+    return { ...rest, counts, results: results.map(({ case: caseValue, ...result }) => ({ ...result, effectiveStatus: this.effectiveStatus({ ...result, case: caseValue }, row.observedAt), caseStatus: caseValue?.status ?? null,
+      review: this.manualReviewState({ ...result, case: caseValue }) })),
       evidence: evidence.map(({ storageKey, ...item }) => ({ ...item, downloadUrl: item.status === 'READY' ? `/crm-control/evidence/${item.id}/file` : null })) };
   }
 
   private effectiveStatus(result: AssessedResult, observedAt: Date) {
-    if (!['FAIL', 'REVIEW'].includes(result.status)) return result.status;
-    const decision = result.case?.decisions?.filter((decision) => ['CONFIRM', 'EXEMPT'].includes(decision.action)
-      && (decision.observationId === result.observationId || decision.createdAt <= observedAt))
-      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0];
+    const decision = newestDecision((result.case?.decisions ?? []).filter((decision) => manualReviewActions.includes(decision.action)
+      ? decision.observationId === result.observationId
+      : ['FAIL', 'REVIEW'].includes(result.status) && ['CONFIRM', 'EXEMPT'].includes(decision.action)
+        && (decision.observationId === result.observationId || decision.createdAt <= observedAt)));
+    if (decision && manualReviewActions.includes(decision.action)) return decision.action.slice('VERIFY_'.length);
     if (decision?.action === 'EXEMPT' && decision.validUntil && decision.validUntil >= observedAt) return 'NA';
     if (decision?.action === 'CONFIRM') return 'FAIL';
     return result.status;
+  }
+
+  private manualReviewState(result: AssessedResult & { ruleCode?: string; message?: string; details?: unknown }) {
+    const decisions = (result.case?.decisions ?? []).filter((decision) => decision.observationId === result.observationId);
+    const latest = newestDecision(decisions);
+    const current = latest && manualReviewActions.includes(latest.action) ? latest : null;
+    return { allowed: controlManualReviewAllowed(result), expectedDecisionId: latest?.id ?? null,
+      current: current ? this.manualReviewResponse(current) : null, guidance: controlManualReviewGuidance(result) };
+  }
+
+  private manualReviewResponse(decision: AssessedDecision) {
+    return { decisionId: decision.id, outcome: decision.action.slice('VERIFY_'.length), reason: decision.reason,
+      reviewedBy: decision.actorName, reviewedAt: decision.createdAt };
   }
 
   private effectiveCounts(results: AssessedResult[], observedAt: Date) {
@@ -320,18 +365,67 @@ export class CrmControlService {
     const { row: currentObservation } = await this.visibleObservation(actor, item.latestObservationId);
     if (!body || !['CONFIRM', 'EXEMPT', 'DISPUTE'].includes(body.action) || typeof body.reason !== 'string' || body.reason.trim().length < 5 || body.reason.length > 4000) throw new BadRequestException('Укажите действие и содержательное обоснование');
     if (access.role === 'MANAGER' && body.action !== 'DISPUTE') throw new ForbiddenException('Менеджер может только оспорить нарушение');
+    const caseResults = currentObservation.results.filter((result) => result.caseId === id);
+    if (body.action !== 'DISPUTE' && (!caseResults.length || caseResults.some((result) => result.status === 'UNKNOWN'
+      || this.effectiveStatus(result, currentObservation.observedAt) !== 'FAIL'))) {
+      throw new BadRequestException('Сначала выполните ручную допроверку пункта с объяснением и ссылкой на подтверждение');
+    }
+    const expectedDecisionId = newestDecision((caseResults[0]?.case?.decisions ?? []).filter((decision) => decision.observationId === currentObservation.id))?.id ?? null;
     if (['RESOLVED', 'SUPERSEDED'].includes(item.status)) throw new BadRequestException('Этот эпизод уже завершён');
     const validUntil = body.validUntil ? new Date(body.validUntil) : null;
     if (body.action === 'EXEMPT' && (!validUntil || !Number.isFinite(validUntil.getTime()) || validUntil <= new Date())) throw new BadRequestException('Укажите будущую дату окончания исключения');
     const status = body.action === 'CONFIRM' ? 'OPEN' : body.action === 'EXEMPT' ? 'EXEMPTED' : 'DISPUTED';
     return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT "id" FROM "CrmControlCase" WHERE "id" = ${id} FOR UPDATE`;
+      const last = await tx.crmControlDecision.findFirst({ where: { caseId: id, observationId: currentObservation.id }, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }] });
+      if ((last?.id ?? null) !== expectedDecisionId) throw new ConflictException('Решение уже изменилось. Обновите карточку');
       const update = await tx.crmControlCase.updateMany({ where: { id, status: item.status, latestObservationId: item.latestObservationId },
         data: { status, exemptionUntil: body.action === 'EXEMPT' ? validUntil : null,
           ...(body.action === 'CONFIRM' ? { confirmedAt: new Date() } : body.action === 'EXEMPT' ? { confirmedAt: null } : {}) } });
       if (update.count !== 1) throw new BadRequestException('Состояние изменилось. Обновите карточку');
       return tx.crmControlDecision.create({ data: { caseId: id, observationId: currentObservation.id, actorId: actor.id, actorName: access.actorName,
         managerId: currentObservation.managerId, groupId: currentObservation.groupId, action: body.action,
-        reason: body.reason.trim(), validUntil: body.action === 'EXEMPT' ? validUntil : null } });
+        reason: body.reason.trim(), validUntil: body.action === 'EXEMPT' ? validUntil : null,
+        createdAt: new Date(Math.max(Date.now(), last ? last.createdAt.getTime() + 1 : 0)) } });
+    });
+  }
+
+  async reviewResult(actor: AuthUser, observationId: string, resultId: string, body: CrmControlManualReviewInput) {
+    const { row, access } = await this.visibleObservation(actor, observationId);
+    if (access.role === 'MANAGER') throw new ForbiddenException('Ручную проверку может выполнить только руководитель');
+    if (!row.results.some((result) => result.id === resultId)) throw new NotFoundException('Пункт в этой проверке не найден');
+    if (!body || !['PASS', 'FAIL', 'NA'].includes(body.outcome) || typeof body.reason !== 'string' || body.reason.trim().length < 20 || body.reason.length > 4000
+      || typeof body.evidence !== 'string' || body.evidence.length > 2048
+      || !(body.expectedDecisionId === null || (typeof body.expectedDecisionId === 'string' && body.expectedDecisionId.length > 0 && body.expectedDecisionId.length <= 100))) {
+      throw new BadRequestException('Укажите результат, объяснение от 20 символов и ссылку на проверенное подтверждение');
+    }
+    let evidence: URL;
+    try { evidence = new URL(body.evidence.trim()); } catch { throw new BadRequestException('Укажите полную ссылку http(s) на проверенное подтверждение'); }
+    if (!['http:', 'https:'].includes(evidence.protocol) || evidence.username || evidence.password) throw new BadRequestException('Допустима ссылка http(s) без учётных данных');
+    return this.prisma.$transaction(async (tx) => {
+      const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT "id" FROM "CrmControlResult" WHERE "id" = ${resultId} AND "observationId" = ${observationId} FOR UPDATE`;
+      if (!locked.length) throw new NotFoundException('Пункт в этой проверке не найден');
+      const result = await tx.crmControlResult.findUnique({ where: { id: resultId } });
+      if (!result || !controlManualReviewAllowed(result)) throw new BadRequestException('Этот пункт нельзя допроверить вручную: повторите автоматическую проверку после наступления срока');
+      let caseId = result.caseId;
+      if (!caseId) {
+        const reviewCase = await tx.crmControlCase.create({ data: { caseKey: `review:${result.id}`, activeKey: null,
+          dealId: row.dealId, ruleCode: result.ruleCode, subjectId: result.subjectId, status: 'REVIEW',
+          firstDetectedAt: row.observedAt, lastDetectedAt: row.observedAt, latestObservationId: row.id,
+          assessmentHash: createHash('sha256').update(`${row.snapshotHash}:${result.id}`).digest('hex') } });
+        const linked = await tx.crmControlResult.updateMany({ where: { id: resultId, caseId: null }, data: { caseId: reviewCase.id } });
+        if (linked.count !== 1) throw new ConflictException('Пункт уже изменился. Обновите карточку');
+        caseId = reviewCase.id;
+      }
+      await tx.$queryRaw`SELECT "id" FROM "CrmControlCase" WHERE "id" = ${caseId} FOR UPDATE`;
+      const last = await tx.crmControlDecision.findFirst({ where: { caseId, observationId }, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }] });
+      if ((last?.id ?? null) !== body.expectedDecisionId) throw new ConflictException('Решение уже изменилось. Обновите карточку и проверьте результат');
+      // The reference is recorded, never fetched by the server. Review does not rewrite source facts or other observations.
+      const decision = await tx.crmControlDecision.create({ data: { caseId, observationId, actorId: actor.id, actorName: access.actorName,
+        managerId: row.managerId, groupId: row.groupId, action: `VERIFY_${body.outcome}`,
+        reason: `${body.reason.trim()}\nИсточник: ${evidence.href}`, validUntil: null,
+        createdAt: new Date(Math.max(Date.now(), last ? last.createdAt.getTime() + 1 : 0)) } });
+      return this.manualReviewResponse(decision);
     });
   }
 

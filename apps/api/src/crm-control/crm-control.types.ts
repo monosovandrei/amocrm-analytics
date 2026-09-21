@@ -85,3 +85,18 @@ export interface CrmControlDecisionInput {
   reason: string;
   validUntil?: string;
 }
+
+export interface CrmControlManualReviewInput {
+  outcome: 'PASS' | 'FAIL' | 'NA';
+  reason: string;
+  evidence: string;
+  expectedDecisionId: string | null;
+}
+
+export interface CrmControlCompletion {
+  status: 'CHECKED' | 'UNCHECKED';
+  remainingResults: number;
+  remainingDeals: number;
+  reasons: Array<{ code: string; message: string; count?: number }>;
+  canRecheck: boolean;
+}

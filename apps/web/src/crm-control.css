@@ -387,6 +387,121 @@
   gap: 15px;
 }
 
+.crm-control .crm-completion {
+  display: grid;
+  gap: 10px;
+  padding: 14px 16px;
+  border-left: 3px solid var(--pb-accent-yellow);
+  background: var(--pb-surface);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.crm-control .crm-completion-checked {
+  border-left-color: var(--pb-accent-green);
+}
+
+.crm-control .crm-view-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 14px;
+}
+
+.crm-control .crm-view-switch {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.crm-control .crm-view-active {
+  border-color: var(--pb-primary);
+  color: var(--pb-primary);
+  background: #edf3fb;
+}
+
+.crm-control .crm-rule-table th:first-child {
+  min-width: 240px;
+  max-width: 320px;
+  text-align: left;
+  position: sticky;
+  left: 0;
+  z-index: 1;
+}
+
+.crm-control .crm-rule-table thead .crm-number {
+  min-width: 140px;
+  max-width: 210px;
+  white-space: normal;
+}
+
+.crm-control .crm-rule-table thead .crm-number > span {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.crm-control .crm-rule-table tbody th {
+  background: var(--pb-surface);
+  color: var(--pb-text-primary);
+  font-weight: 500;
+}
+
+.crm-control .crm-count-link {
+  min-width: 28px;
+  justify-content: center;
+}
+
+.crm-control.crm-deal-popup {
+  position: fixed;
+  z-index: 110;
+  width: min(480px, calc(100vw - 32px));
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--pb-border);
+  border-radius: 8px;
+  background: var(--pb-surface);
+  box-shadow: 0 16px 38px rgba(15, 23, 42, 0.18);
+  overflow: hidden;
+  font-size: 13px;
+}
+
+.crm-control.crm-deal-popup .crm-section-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+}
+
+.crm-control .crm-popup-list {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.crm-control .crm-popup-deal {
+  display: grid;
+  gap: 5px;
+  padding: 10px 0;
+  border-top: 1px solid var(--pb-border);
+}
+
+.crm-control .crm-popup-deal > button {
+  justify-self: start;
+}
+
+.crm-control .crm-manual-review {
+  display: grid;
+  gap: 10px;
+  max-width: 720px;
+  margin-top: 6px;
+}
+
+.crm-control .crm-review-reason {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .crm-control .crm-stage-rule {
   display: grid;
   gap: 14px;
@@ -439,6 +554,11 @@
 }
 
 @media (max-width: 640px) {
+  .crm-control .crm-rule-table th:first-child {
+    min-width: 160px;
+    max-width: 180px;
+  }
+
   .app-shell:has(.crm-control) > .app-main > .topbar {
     position: static;
   }

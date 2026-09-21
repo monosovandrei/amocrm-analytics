@@ -1,7 +1,7 @@
 import { CrmControlRuleInput, CrmControlRuleResult, CrmControlResultStatus } from './crm-control.types';
 import { civilTime, stageDeadline } from './crm-control-deadline';
 
-export const CRM_CONTROL_RULE_VERSION = '2';
+export const CRM_CONTROL_RULE_VERSION = '3';
 
 type RuleCode = keyof typeof RULE_NAMES;
 type ResultExtra = Pick<CrmControlRuleResult, 'subjectId' | 'details'> & { clauses?: string[] };
@@ -130,7 +130,7 @@ export function evaluateCrmControlDeal(input: CrmControlRuleInput): CrmControlRu
   } else if (deal.stageId !== intakeStageId) {
     add('intake_stage', 'NA', 'Сделка находится на другом этапе.', { details: { resolvesPrior: true } });
   } else if (beforeDayEnd) {
-    add('intake_stage', 'UNKNOWN', 'Итог рабочего дня ещё не наступил. Этот пункт проверяется после 19:00.');
+    add('intake_stage', 'UNKNOWN', 'Итог рабочего дня ещё не наступил. Этот пункт проверяется после 19:00.', { details: { awaitingDayEnd: true } });
   } else if (!sales) {
     add('intake_stage', 'FAIL', 'После окончания рабочего дня сделка осталась на этапе «Новый клиент».');
   } else if (!createdAt || createdAt > observedAt) {
@@ -172,7 +172,7 @@ export function evaluateCrmControlDeal(input: CrmControlRuleInput): CrmControlRu
         const overdue = dueAt < observedAt;
         if (dueToday && !overdue && beforeDayEnd) {
           add('task_deadline', 'UNKNOWN', 'Задача назначена на сегодня, но срок ещё не истёк и итог рабочего дня не наступил.',
-            { subjectId, clauses: [`${department} 2`], details: { ...taskDetails, dueToday, overdue } });
+            { subjectId, clauses: [`${department} 2`], details: { ...taskDetails, dueToday, overdue, awaitingDayEnd: true } });
         } else {
           const failedClauses = [...(dueToday && !beforeDayEnd ? [`${department} 2`] : []), ...(overdue ? [`${department} 3`] : [])];
           add('task_deadline', dueToday || overdue ? 'FAIL' : 'PASS', dueToday && overdue
@@ -184,7 +184,9 @@ export function evaluateCrmControlDeal(input: CrmControlRuleInput): CrmControlRu
       }
 
       const allowedTypes = stageRule?.allowedTaskTypeIds;
-      if (!allowedTypes?.length || allowedTypes.some((type) => !Number.isInteger(type))) {
+      if (base && !allowedTypes?.length) {
+        add('task_type', 'NA', 'На этапе «База» регламент не ограничивает тип задачи.', { subjectId, details: { ...taskDetails, resolvesPrior: true } });
+      } else if (!allowedTypes?.length || allowedTypes.some((type) => !Number.isInteger(type))) {
         add('task_type', 'UNKNOWN', 'Для этапа не утверждены допустимые типы задач.', { subjectId, details: taskDetails });
       } else {
         const allowed = task.typeId !== null && allowedTypes.includes(task.typeId);
@@ -264,7 +266,7 @@ export function evaluateCrmControlDeal(input: CrmControlRuleInput): CrmControlRu
   } else if (deal.stageId !== scope.preparedProposalStageId) {
     add('proposal_note', 'NA', 'Сделка не на этапе «КП подготовлено».', { details: { resolvesPrior: true } });
   } else if (beforeDayEnd) {
-    add('proposal_note', 'UNKNOWN', 'Итог рабочего дня ещё не наступил: презентация КП или примечание о переносе ещё могут быть оформлены сегодня.');
+    add('proposal_note', 'UNKNOWN', 'Итог рабочего дня ещё не наступил: презентация КП или примечание о переносе ещё могут быть оформлены сегодня.', { details: { awaitingDayEnd: true } });
   } else {
     const noteState = currentNotes(true);
     const hasManagerText = input.notes.some((note) => note.type === 'common' && !!note.text?.trim());
