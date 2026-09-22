@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { CrmControlService } from './crm-control.service';
 
 const actor = { id: 'owner', email: 'owner@example.test', role: 'ADMIN' as const, businessRole: 'OWNER' as const };
@@ -16,6 +17,7 @@ function fixture(rows: any[]) {
   const prisma: any = {
     user: { findUnique: jest.fn().mockResolvedValue({ id: 'owner', isActive: true, name: 'Owner', businessRole: 'OWNER' }) },
     crmControlObservation: { findMany: jest.fn().mockResolvedValue(rows) },
+    crmControlAnalysisBatch: { findFirst: jest.fn().mockResolvedValue(null) },
   };
   const service = new CrmControlService(prisma, {} as any, {} as any);
   return { prisma, service };
@@ -75,6 +77,49 @@ describe('CRM control rule breakdown', () => {
     jest.spyOn(service, 'run').mockResolvedValue({} as any);
     const page = await service.deals(actor, 'run', { ruleCode: 'offer_budget', status: 'FAIL' });
     expect(page.items).toEqual([]);
+  });
+});
+
+describe('CRM control breakdown with configured local analysis', () => {
+  const keys = ['CRM_CONTROL_LOCAL_AI_ORIGIN', 'CRM_CONTROL_LOCAL_AI_MODEL', 'CRM_CONTROL_LOCAL_AI_MODEL_SHA256',
+    'CRM_CONTROL_LOCAL_AI_CACHE_DIR', 'CRM_CONTROL_LOCAL_AI_TIMEOUT_MS'] as const;
+  const original = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+  beforeEach(() => {
+    process.env.CRM_CONTROL_LOCAL_AI_ORIGIN = 'http://127.0.0.1:18080';
+    process.env.CRM_CONTROL_LOCAL_AI_MODEL = 'synthetic-breakdown-model';
+    process.env.CRM_CONTROL_LOCAL_AI_MODEL_SHA256 = 'a'.repeat(64);
+    process.env.CRM_CONTROL_LOCAL_AI_CACHE_DIR = path.resolve('tmp/synthetic-breakdown-cache');
+    process.env.CRM_CONTROL_LOCAL_AI_TIMEOUT_MS = '120000';
+  });
+  afterEach(() => {
+    for (const key of keys) if (original[key] === undefined) delete process.env[key]; else process.env[key] = original[key];
+  });
+
+  it.each([
+    [{ ...access, role: 'OWNER' }, {}, {}],
+    [{ ...access, role: 'ROP', groupId: 'team' }, { groupId: 'team' }, { OR: [{ scopeRole: 'OWNER' }, { groupId: 'team' }] }],
+    [{ ...access, role: 'MANAGER', managerId: 'mine' }, { managerId: 'mine' }, { OR: [{ scopeRole: 'OWNER' }, { managerId: 'mine' }] }],
+  ])('reads only the preparation queue visible to %j when local analysis is configured', async (scope, rowScope, queueScope) => {
+    const { service, prisma } = fixture([observation('1', 'mine', [result('offer_budget', 'UNKNOWN')])]);
+    prisma.crmControlAnalysisBatch.findFirst.mockResolvedValueOnce(null).mockResolvedValueOnce({ id: 'batch' });
+    const idle = await (service as any).summary('run', scope);
+    expect(idle.analysis.preparing).toBe(false);
+    expect(idle.counts.unknownDeals).toBe(1);
+    const preparing = await (service as any).summary('run', scope);
+    expect(preparing.analysis.preparing).toBe(true);
+    expect(preparing.counts.unknownDeals).toBe(1); // Queue presence does not turn an unverified result into a checked one.
+    expect(prisma.crmControlObservation.findMany).toHaveBeenLastCalledWith(expect.objectContaining({ where: { runId: 'run', ...rowScope } }));
+    expect(prisma.crmControlAnalysisBatch.findFirst).toHaveBeenCalledTimes(2);
+    expect(prisma.crmControlAnalysisBatch.findFirst).toHaveBeenLastCalledWith({ where: {
+      runId: 'run', status: { in: ['QUEUED', 'RUNNING'] }, ...queueScope,
+    }, select: { id: true } });
+  });
+
+  it('does not read preparation batches when local analysis is disabled', async () => {
+    delete process.env.CRM_CONTROL_LOCAL_AI_MODEL;
+    const { service, prisma } = fixture([]);
+    expect((await (service as any).summary('run', access)).analysis.preparing).toBe(false);
+    expect(prisma.crmControlAnalysisBatch.findFirst).not.toHaveBeenCalled();
   });
 });
 
