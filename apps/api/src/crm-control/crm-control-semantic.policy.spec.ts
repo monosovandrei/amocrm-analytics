@@ -15,6 +15,12 @@ describe('local semantic deterministic policy', () => {
     answer.status = status as any;
     expect(assessCrmControlSemantic(input, answer, 'task_text').status).toBe('UNKNOWN');
   });
+  it('explains an empty archived source set without asserting that a note is absent', () => {
+    const input = request('proposal_note'), answer = validation(input, { transfer_reason: 'uncertain', presentation_date: 'uncertain' });
+    answer.status = 'UNKNOWN';
+    expect(assessCrmControlSemantic(input, answer, 'proposal_note')).toMatchObject({ status: 'UNKNOWN',
+      message: 'В сохранённом срезе нет текстовых источников для смысловой проверки. Отсутствие нужного примечания этим не подтверждено.' });
+  });
   it.each(['requestId','check','subjectId'])('rejects a different %s', key => {
     const input = request('task_action'), answer = validation(input, { action: 'present', stage_relevance: 'present' });
     (answer as any)[key] = 'other';

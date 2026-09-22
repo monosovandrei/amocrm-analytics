@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { chromium } from 'playwright-core';
-import { CrmControlEvidenceService, sanitizeCrmCaptureHealth, validateCrmCaptureUrl } from './crm-control-evidence.service';
+import { CrmControlEvidenceService, CrmSourceAuthExpiredError, sanitizeCrmCaptureHealth, validateCrmCaptureUrl } from './crm-control-evidence.service';
 import { collectCrmEvidenceFrames } from './crm-control-evidence-frames';
 import { crmBrowserNeedsRefresh, observeCrmBrowserAccess, refreshCrmBrowserAccess } from './crm-control-browser-auth';
 import { acquireCrmBrowserSessionLease } from './crm-control-browser-session';
@@ -38,9 +38,17 @@ describe('CRM screenshot evidence', () => {
     await writeFile(process.env.CRM_CONTROL_BROWSER_STATE_FILE, JSON.stringify(sessionState));
     await writeFile(process.env.CRM_CONTROL_CHROMIUM_EXECUTABLE, 'mock');
     title = { waitFor: jest.fn(), getAttribute: jest.fn().mockResolvedValue('Сделка #123'), inputValue: jest.fn().mockResolvedValue('Test lead') };
+    const responseListeners = new Set<(value: any) => void>();
     page = {
       setDefaultTimeout: jest.fn(), route: jest.fn(), mainFrame: jest.fn().mockReturnValue('main-frame'),
-      goto: jest.fn().mockResolvedValue({ status: () => 200 }), url: jest.fn().mockReturnValue(job.sourceUrl),
+      goto: jest.fn().mockImplementation(async () => {
+        for (const listener of responseListeners) listener({ status: () => 200, request: () => ({ method: () => 'GET' }),
+          url: () => 'https://amomail.amocrm.ru/api/v2/42/leads/123/compose' });
+        return { status: () => 200 };
+      }), url: jest.fn().mockReturnValue(job.sourceUrl),
+      on: jest.fn((_event: string, listener: (value: any) => void) => { responseListeners.add(listener); }),
+      off: jest.fn((_event: string, listener: (value: any) => void) => { responseListeners.delete(listener); }),
+      evaluate: jest.fn().mockResolvedValue({ accountCode: 'EUR', localeCode: 'EUR' }),
       locator: jest.fn().mockImplementation((selector: string) => selector.includes('lead[NAME]') ? title : { waitFor: jest.fn(), isVisible: jest.fn().mockResolvedValue(false) }),
       screenshot: jest.fn().mockResolvedValue(png),
       close: jest.fn().mockResolvedValue(undefined),
@@ -134,6 +142,123 @@ describe('CRM screenshot evidence', () => {
     expect(browser.newContext).toHaveBeenCalledTimes(1);
     expect(page.close).toHaveBeenCalledTimes(2);
     expect(contexts[0].close).toHaveBeenCalledTimes(1);
+  });
+
+  test('direct source reads bootstrap once, keep the real currency check time and do not navigate subsequent deals', async () => {
+    const references: any[] = [];
+    const dispose = jest.fn();
+    const result = await service.withSourceBatch(async batch => {
+      const first = await batch.readSources(job, access => { references.push(access); return { collect: async () => 'first', dispose }; });
+      const second = await batch.readSources({ dealExternalId: '456', sourceUrl: `${origin}/leads/detail/456` }, access => {
+        references.push(access); return { collect: async () => 'second', dispose };
+      });
+      return [first, second];
+    });
+    expect(result).toMatchObject({ ok: true, value: [{ ok: true, value: 'first' }, { ok: true, value: 'second' }] });
+    expect(page.goto).toHaveBeenCalledTimes(1);
+    expect(browser.newContext).toHaveBeenCalledTimes(1);
+    expect(page.evaluate).toHaveBeenCalledTimes(1);
+    expect(references[0]).toMatchObject({ origin, mailAccountId: '42', currencyValues: { accountCode: 'EUR', localeCode: 'EUR' } });
+    expect(references[1].context).toBe(references[0].context);
+    expect(references[1].currencyObservedAt).toBe(references[0].currencyObservedAt);
+    expect(dispose).toHaveBeenCalledTimes(2);
+  });
+
+  test('a direct source401 destroys its reader, refreshes natively and restarts the whole deal once', async () => {
+    let attempts = 0;
+    const dispose = jest.fn(), factory = jest.fn(() => ({ collect: async () => {
+      if (++attempts === 1) throw new CrmSourceAuthExpiredError(); return ['fresh-page-1', 'fresh-page-2'];
+    }, dispose }));
+    const result = await service.withSourceBatch(batch => batch.readSources(job, factory));
+    expect(result).toMatchObject({ ok: true, value: { ok: true, value: ['fresh-page-1', 'fresh-page-2'] } });
+    expect(factory).toHaveBeenCalledTimes(2);
+    expect(dispose).toHaveBeenCalledTimes(2);
+    expect(refreshCrmBrowserAccess).toHaveBeenCalledTimes(1);
+    expect(page.goto).toHaveBeenCalledTimes(3); // initial bootstrap; recovery page; reload after native refresh.
+    expect(browser.newContext).toHaveBeenCalledTimes(1);
+  });
+
+  test('a second direct401 blocks further source reads without repeated refreshes', async () => {
+    const factory = jest.fn(() => ({ collect: async () => { throw new CrmSourceAuthExpiredError(); }, dispose: jest.fn() }));
+    const result = await service.withSourceBatch(async batch => [await batch.readSources(job, factory), await batch.readSources(job, factory)]);
+    expect(result).toMatchObject({ ok: true, value: [{ ok: false, errorCode: 'AUTH_REQUIRED' }, { ok: false, errorCode: 'AUTH_REQUIRED' }] });
+    expect(factory).toHaveBeenCalledTimes(2);
+    expect(refreshCrmBrowserAccess).toHaveBeenCalledTimes(1);
+  });
+
+  test('a direct permission failure does not rotate the account login', async () => {
+    const result = await service.withSourceBatch(batch => batch.readSources(job, () => ({
+      collect: async () => ({ reasonCodes: ['HISTORY_ACCESS_DENIED'] }), dispose: jest.fn(),
+    })));
+    expect(result).toMatchObject({ ok: true, value: { ok: true, value: { reasonCodes: ['HISTORY_ACCESS_DENIED'] } } });
+    expect(refreshCrmBrowserAccess).not.toHaveBeenCalled();
+  });
+
+  test('native source bootstrap is reverified after five minutes, without reusing old account metadata', async () => {
+    const factory = () => ({ collect: async () => 1, dispose: jest.fn() });
+    await service.withSourceBatch(async batch => {
+      await batch.readSources(job, factory);
+      const clock = jest.spyOn(Date, 'now').mockReturnValue(Date.now() + 5 * 60_000 + 1);
+      try { await batch.readSources(job, factory); } finally { clock.mockRestore(); }
+    });
+    expect(page.goto).toHaveBeenCalledTimes(2);
+    expect(page.evaluate).toHaveBeenCalledTimes(2);
+  });
+
+  test('source request optimization never substitutes API-rendered content for a screenshot', async () => {
+    const result = await service.withSourceBatch(async batch => {
+      await batch.readSources(job, () => ({ collect: async () => 1, dispose: jest.fn() }));
+      return service.capture(job);
+    });
+    expect(result).toMatchObject({ ok: true, value: { status: 'READY' } });
+    expect(page.goto).toHaveBeenCalledTimes(2);
+    expect(collectCrmEvidenceFrames).toHaveBeenCalledWith(page, expect.objectContaining(job), expect.any(Function));
+    expect(browser.newContext).toHaveBeenCalledTimes(1);
+  });
+
+  test('a replaced session cannot be used for another direct read', async () => {
+    const factory = jest.fn(() => ({ collect: async () => 1, dispose: jest.fn() }));
+    const result = await service.withSourceBatch(async batch => {
+      await batch.readSources(job, factory);
+      await writeFile(process.env.CRM_CONTROL_BROWSER_STATE_FILE!, JSON.stringify({ ...sessionState, origins: [{ origin, localStorage: [{ name: 'fresh', value: 'login' }] }] }));
+      return batch.readSources(job, factory);
+    });
+    expect(result).toMatchObject({ ok: true, value: { ok: false, errorCode: 'SESSION_CONFLICT' } });
+    expect(factory).toHaveBeenCalledTimes(1);
+    expect(page.goto).toHaveBeenCalledTimes(1);
+  });
+
+  test('direct source requests cannot guess a mailbox account when native discovery is missing', async () => {
+    page.goto.mockResolvedValue({ status: () => 200 });
+    const factory = jest.fn(() => ({ collect: async () => 1, dispose: jest.fn() }));
+    const result = await service.withSourceBatch(batch => batch.readSources(job, factory));
+    expect(result).toMatchObject({ ok: true, value: { ok: false, errorCode: 'SOURCE_NOT_READY' } });
+    expect(factory).not.toHaveBeenCalled();
+  });
+
+  test('a bootstrap currency evaluation failure stays unknown without replacing it with a guess', async () => {
+    page.evaluate.mockRejectedValueOnce(new Error('private browser details'));
+    const result = await service.withSourceBatch(batch => batch.readSources(job, access => ({
+      collect: async () => access.currencyValues, dispose: jest.fn(),
+    })));
+    expect(result).toMatchObject({ ok: true, value: { ok: true, value: { accountCode: null, localeCode: null } } });
+    expect(JSON.stringify(result)).not.toContain('private');
+  });
+
+  test('shutdown drains direct requests and saves their final cookie state before releasing the context', async () => {
+    let started!: () => void, finish!: () => void;
+    const reading = new Promise<void>(resolve => { started = resolve; });
+    const work = service.withSourceBatch(batch => batch.readSources(job, () => ({ collect: async () => {
+      started(); await new Promise<void>(resolve => { finish = resolve; });
+      sessionState.cookies[0].value = 'last-request-cookie'; return 1;
+    }, dispose: jest.fn() })));
+    await reading;
+    const stopping = service.onModuleDestroy();
+    await Promise.resolve(); await Promise.resolve();
+    expect(contexts[0].close).not.toHaveBeenCalled();
+    finish(); await Promise.all([work, stopping]);
+    expect(JSON.parse(await readFile(process.env.CRM_CONTROL_BROWSER_STATE_FILE!, 'utf8')).cookies[0].value).toBe('last-request-cookie');
+    expect(contexts[0].close.mock.invocationCallOrder[0]).toBeGreaterThan(contexts[0].storageState.mock.invocationCallOrder.at(-1));
   });
 
   test('refresh persists new state immediately and again after page activity stops', async () => {

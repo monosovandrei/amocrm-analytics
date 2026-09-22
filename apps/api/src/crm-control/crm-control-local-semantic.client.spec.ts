@@ -50,6 +50,18 @@ describe('local CRM semantic boundary', () => {
     expect(await new CrmControlLocalSemanticClient(options(), send).analyze(request)).toMatchObject({ status: 'ERROR', code: 'LOCAL_AI_INPUT_LIMIT', retryable: false });
     expect(send).not.toHaveBeenCalled();
   });
+  it.each([true, false])('keeps an empty archived source set UNKNOWN without a model call (notes complete: %s)', async complete => {
+    const request = input(); request.check = 'proposal_note'; request.subjectId = null; request.sources = [];
+    request.coverage.notes = complete;
+    const send = jest.fn();
+    const result = await new CrmControlLocalSemanticClient(options(), send).analyze(request);
+    expect(result).toMatchObject({ status: 'READY', inputHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      validation: { status: 'UNKNOWN' }, response: { inspectedSourceIds: [], findings: [
+        { fact: 'transfer_reason', state: 'uncertain', evidence: [] },
+        { fact: 'presentation_date', state: 'uncertain', evidence: [] },
+      ] } });
+    expect(send).not.toHaveBeenCalled();
+  });
   it('rejects a valid-looking result cut short by the runtime', async () => {
     const send = jest.fn().mockResolvedValue(answer(text, 'length'));
     expect(await new CrmControlLocalSemanticClient(options(), send).analyze(input())).toMatchObject({ status: 'ERROR', code: 'LOCAL_AI_INVALID_RESPONSE' });

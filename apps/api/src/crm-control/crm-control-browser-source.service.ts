@@ -2,8 +2,8 @@ import { Injectable } from '@nestjs/common';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, rename, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { CrmControlEvidenceService, CrmSourceBrowserBatch, CrmSourceCardJob } from './crm-control-evidence.service';
-import { CrmBrowserHistory, observeCrmBrowserHistory } from './crm-control-browser-history';
+import { CrmControlEvidenceService, CrmSourceAuthExpiredError, CrmSourceBrowserBatch, CrmSourceCardJob } from './crm-control-evidence.service';
+import { BrowserHistoryError, CrmBrowserHistory, createCrmBrowserHistoryReader } from './crm-control-browser-history';
 import { archiveMailAttachment, downloadMailAttachment } from './crm-control-browser-files';
 import { CrmControlDocumentArtifact } from './crm-control-proposal-sources';
 import { readCrmControlPrivateArtifact } from './crm-control-document-evidence';
@@ -62,19 +62,15 @@ export class CrmControlBrowserSourceService {
     const startedAt = new Date().toISOString();
     const base: CrmBrowserSourceBundle = { schemaVersion: 1, dealExternalId: job.dealExternalId, startedAt,
       finishedAt: startedAt, documents: [], communicationsComplete: false, reasonCodes: [] };
-    const read = await browser.readCard(job, page => {
-      const observer = observeCrmBrowserHistory(page, { origin: new URL(job.sourceUrl).origin, dealExternalId: job.dealExternalId });
+    const read = await browser.readSources(job, access => {
+      const observer = createCrmBrowserHistoryReader(access.context, { origin: access.origin,
+        dealExternalId: job.dealExternalId, mailAccountId: access.mailAccountId });
       return { dispose: observer.dispose, collect: async () => {
-        // Confirm the account's currency against the same source used by the native UI; never infer it from a symbol or a document.
-        const currencyValues = await page.evaluate(() => {
-          const amo = (window as any).AMOCRM;
-          const boundedCode = (value: unknown) => typeof value === 'string' && /^[a-zA-Z]{3}$/.test(value) ? value : null;
-          let accountCode: unknown = null;
-          try { accountCode = amo?.constant?.('account')?.currency; } catch { /* Missing authority stays unknown. */ }
-          return { accountCode: boundedCode(accountCode), localeCode: boundedCode(amo?.system?.locale?.currency) };
-        }).catch(() => null);
-        const accountCurrency = parseCrmBrowserAccountCurrency(currencyValues, new Date().toISOString());
-        const history = await observer.collect(), documents: CrmBrowserDocumentSource[] = [];
+        const accountCurrency = parseCrmBrowserAccountCurrency(access.currencyValues, access.currencyObservedAt);
+        const history = await observer.collect().catch(error => {
+          if (error instanceof BrowserHistoryError && error.code === 'HISTORY_AUTH_EXPIRED') throw new CrmSourceAuthExpiredError();
+          throw error;
+        }), documents: CrmBrowserDocumentSource[] = [];
         const reasons = new Set(history.reasonCodes), signal = AbortSignal.timeout(120_000);
         if (accountCurrency.status !== 'VERIFIED') reasons.add(`ACCOUNT_CURRENCY_${accountCurrency.status}`);
         let bytesRemaining = 64 * 1024 * 1024, filesStarted = 0;
@@ -103,7 +99,10 @@ export class CrmControlBrowserSourceService {
               item.artifact = await archiveMailAttachment(this.directory(), file); bytesRemaining -= file.size;
               archiveCache.set(cacheKey, item.artifact);
               if (archiveCache.size > 256) archiveCache.delete(archiveCache.keys().next().value!);
-            } catch (error) { item.errorCode = signal.aborted ? 'COLLECTION_LIMIT' : safeCode(error); reasons.add(item.errorCode); }
+            } catch (error) {
+              if (error instanceof BrowserHistoryError && error.code === 'HISTORY_AUTH_EXPIRED') throw new CrmSourceAuthExpiredError();
+              item.errorCode = signal.aborted ? 'COLLECTION_LIMIT' : safeCode(error); reasons.add(item.errorCode);
+            }
           }
         }
         const finishedAt = new Date().toISOString();

@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { CrmControlAnalysisService, crmControlLocalAnalysisOptions } from './crm-control-analysis.service';
+import { CRM_CONTROL_ANALYZER_VERSION, CrmControlAnalysisService, crmControlLocalAnalysisOptions } from './crm-control-analysis.service';
 import { CRM_CONTROL_LOCAL_PROMPT_VERSION, CrmControlLocalSemanticClient } from './crm-control-local-semantic.client';
 import { CrmControlSemanticRequest, crmControlSemanticTextHash } from './crm-control-semantic.validation';
 import { buildCrmControlSemanticRequest } from './crm-control-semantic.request';
@@ -16,6 +16,8 @@ function matches(row: any, where: any): boolean {
     if (key === 'OR') return value.some((condition: any) => matches(row, condition));
     const isDate = Object.prototype.toString.call(value) === '[object Date]';
     if (value && typeof value === 'object' && !isDate) {
+      if ('in' in value) return value.in.includes(row[key]);
+      if ('not' in value) return row[key] !== value.not;
       if ('lt' in value) return row[key] < (value.lt?.kind === 'field' ? row[value.lt.name] : value.lt);
       if ('lte' in value) return row[key] <= value.lte;
       if ('gt' in value) return row[key] > value.gt;
@@ -47,6 +49,7 @@ function fixture() {
     crmControlAnalysisJob: {
       fields: { attemptLimit: { kind: 'field', name: 'attemptLimit' } },
       findFirst: jest.fn(async ({ where }) => clone(state.jobs.find(row => matches(row, where)) ?? null)),
+      findMany: jest.fn(async ({ where, take }) => clone(state.jobs.filter(row => matches(row, where)).slice(0, take))),
       findUnique: jest.fn(async ({ where }) => clone(state.jobs.find(row => row.id === where.id) ?? null)),
       upsert: jest.fn(async ({ where, create }) => {
         const found = state.jobs.find(row => matches(row, where.resultId_inputHash_analyzerVersion));
@@ -57,12 +60,13 @@ function fixture() {
         state.jobs.push(row); return clone(row);
       }),
       updateMany: jest.fn(async ({ where, data }) => {
-        const row = state.jobs.find(item => matches(item, where));
-        if (!row) return { count: 0 };
-        if (data.activeKey && state.jobs.some(item => item.id !== row.id && item.activeKey === data.activeKey)) throw Object.assign(new Error('unique'), { code: 'P2002' });
-        for (const [key, value] of Object.entries(data)) row[key] = value && typeof value === 'object' && 'increment' in value
-          ? row[key] + (value as any).increment : clone(value);
-        return { count: 1 };
+        const rows = state.jobs.filter(item => matches(item, where));
+        for (const row of rows) {
+          if (data.activeKey && state.jobs.some(item => item.id !== row.id && item.activeKey === data.activeKey)) throw Object.assign(new Error('unique'), { code: 'P2002' });
+          for (const [key, value] of Object.entries(data)) row[key] = value && typeof value === 'object' && 'increment' in value
+            ? row[key] + (value as any).increment : clone(value);
+        }
+        return { count: rows.length };
       }),
     },
     crmControlAnalysisAttempt: { create: jest.fn(async ({ data }) => {
@@ -197,6 +201,21 @@ describe('persistent local semantic analysis queue', () => {
     expect(f.state.attempts[0].validation.issues).toContainEqual({ code: 'INCOMPLETE_TASKS' });
   });
 
+  it('finishes an empty-source REVIEW as UNKNOWN with a concrete reason, without calling the model', async () => {
+    const f = fixture(), result = f.state.results[0];
+    Object.assign(result, { ruleCode: 'proposal_note', subjectId: '' });
+    Object.assign(result.observation.snapshot, { notes: [], tasks: [] });
+    Object.assign(f.request, buildCrmControlSemanticRequest(result.observation, result));
+    const send = jest.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('unexpected model call'));
+    await f.enqueue(); await f.service.processQueue();
+    expect(send).not.toHaveBeenCalled();
+    expect(f.state.jobs[0]).toMatchObject({ status: 'UNKNOWN', errorCode: null, assessmentStatus: 'UNKNOWN',
+      assessmentMessage: expect.stringContaining('нет текстовых источников') });
+    expect(f.state.attempts[0]).toMatchObject({ status: 'UNKNOWN', rawResponse: { status: 'READY',
+      inputHash: f.state.jobs[0].inputHash, validation: { status: 'UNKNOWN' } } });
+    expect(result.status).toBe('REVIEW');
+  });
+
   it('does not accept a response for another model or input', async () => {
     const f = fixture(); await f.enqueue();
     jest.spyOn(CrmControlLocalSemanticClient.prototype, 'analyze').mockImplementation(async input => ({ ...f.ready(input), inputHash: 'c'.repeat(64) }));
@@ -317,6 +336,51 @@ describe('persistent local semantic analysis queue', () => {
     await f.service.processQueue();
     expect(analyze).not.toHaveBeenCalled();
     expect(f.state.jobs[0]).toMatchObject({ status: 'ERROR', errorCode: 'LOCAL_AI_VERSION_CHANGED' });
+  });
+
+  it('retires only 100 outdated queued jobs and processes a current job in the same tick', async () => {
+    const f = fixture(); await f.enqueue();
+    const current = f.state.jobs[0];
+    f.state.jobs.unshift(...Array.from({ length: 930 }, (_, index) => ({ ...clone(current), id: `old-${index}`, analyzerVersion: '1' })));
+    const historicalAttempt = { jobId: 'old-0', attemptNo: 1, status: 'ERROR', errorCode: 'LOCAL_AI_IDENTITY_MISMATCH' };
+    f.state.attempts.push(clone(historicalAttempt));
+    const analyze = jest.spyOn(CrmControlLocalSemanticClient.prototype, 'analyze').mockImplementation(async input => f.ready(input));
+    await f.service.processQueue();
+    expect(current).toMatchObject({ status: 'READY', analyzerVersion: CRM_CONTROL_ANALYZER_VERSION, attemptCount: 1 });
+    expect(analyze).toHaveBeenCalledTimes(1);
+    expect(f.state.jobs.filter(job => job.errorCode === 'LOCAL_AI_VERSION_CHANGED')).toHaveLength(100);
+    expect(f.state.jobs.filter(job => job.analyzerVersion === '1' && job.status === 'QUEUED')).toHaveLength(830);
+    expect(f.state.jobs.filter(job => job.analyzerVersion === '1').every(job => job.attemptCount === 0)).toBe(true);
+    expect(f.state.attempts[0]).toEqual(historicalAttempt);
+    expect(f.state.attempts).toHaveLength(2);
+  });
+
+  it('does not retire an outdated running request or rewrite completed errors and attempts', async () => {
+    const f = fixture(); await f.enqueue();
+    const running = { ...clone(f.state.jobs[0]), id: 'old-running', analyzerVersion: '1', status: 'RUNNING',
+      activeKey: 'local-semantic', leaseToken: 'old-lease', leaseUntil: new Date(CLOCK.getTime() + 60_000), startedAt: CLOCK, attemptCount: 1 };
+    const failed = { ...clone(f.state.jobs[0]), id: 'old-error', analyzerVersion: '1', status: 'ERROR',
+      errorCode: 'LOCAL_AI_IDENTITY_MISMATCH', finishedAt: CLOCK, attemptCount: 1 };
+    f.state.jobs.unshift(clone(running), clone(failed));
+    f.state.attempts.push({ jobId: failed.id, attemptNo: 1, errorCode: failed.errorCode });
+    const attempts = clone(f.state.attempts);
+    const analyze = jest.spyOn(CrmControlLocalSemanticClient.prototype, 'analyze');
+    await f.service.processQueue();
+    expect(f.state.jobs[0]).toEqual(running); expect(f.state.jobs[1]).toEqual(failed);
+    expect(f.state.attempts).toEqual(attempts); expect(analyze).not.toHaveBeenCalled();
+  });
+
+  it('does not retire a queued job that another worker claimed before the retirement CAS', async () => {
+    const f = fixture(); await f.enqueue(); f.state.jobs[0].analyzerVersion = '1';
+    const updateMany = f.db.crmControlAnalysisJob.updateMany.getMockImplementation();
+    f.db.crmControlAnalysisJob.updateMany.mockImplementationOnce(async (args: any) => {
+      Object.assign(f.state.jobs[0], { status: 'RUNNING', activeKey: 'local-semantic', leaseToken: 'concurrent',
+        leaseUntil: new Date(CLOCK.getTime() + 60_000), startedAt: CLOCK, attemptCount: 1 });
+      return updateMany(args);
+    });
+    await f.service.processQueue();
+    expect(f.state.jobs[0]).toMatchObject({ status: 'RUNNING', errorCode: null, finishedAt: null, leaseToken: 'concurrent' });
+    expect(f.state.attempts).toHaveLength(0);
   });
 
   it('permits only one active request across service instances and different jobs', async () => {

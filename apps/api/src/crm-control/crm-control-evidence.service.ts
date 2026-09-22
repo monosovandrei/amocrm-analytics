@@ -27,8 +27,14 @@ export interface CrmControlCaptureResult {
 
 export type CrmSourceCardJob = Pick<CrmControlCaptureJob, 'sourceUrl' | 'dealExternalId'>;
 export type CrmSourceReadResult<T> = { ok: true; value: T } | { ok: false; errorCode: string; message: string; retryable: boolean };
+export interface CrmSourceRequestSession {
+  context: BrowserContext; origin: string; mailAccountId: string;
+  currencyValues: { accountCode: string | null; localeCode: string | null }; currencyObservedAt: string;
+}
+export class CrmSourceAuthExpiredError extends Error { constructor() { super('SOURCE_AUTH_EXPIRED'); } }
 export interface CrmSourceBrowserBatch {
   readCard<T>(job: CrmSourceCardJob, reader: (page: Page) => { collect(): Promise<T>; dispose(): void }): Promise<CrmSourceReadResult<T>>;
+  readSources<T>(job: CrmSourceCardJob, reader: (session: CrmSourceRequestSession) => { collect(): Promise<T>; dispose(): void }): Promise<CrmSourceReadResult<T>>;
 }
 
 const MAX_EVIDENCE_BYTES = 32 * 1024 * 1024;
@@ -39,7 +45,8 @@ type StorageState = Exclude<NonNullable<Parameters<Browser['newContext']>[0]>['s
 export type CaptureHealth = { status: 'UNVERIFIED' | 'READY' | 'ERROR'; checkedAt: string | null; errorCode?: string; message?: string };
 type CaptureConfiguration = { origin: string; executable: string; statePath: string; rawHash: string; state: StorageState; fingerprint: string };
 type AuthSession = { config: CaptureConfiguration; context: BrowserContext; lease: CrmBrowserSessionLease;
-  rawHash: string; tail: Promise<void>; closing?: Promise<void>; invalid?: CaptureFailure };
+  rawHash: string; tail: Promise<void>; closing?: Promise<void>; invalid?: CaptureFailure;
+  sourceAccess?: { mailAccountId: string; currencyValues: CrmSourceRequestSession['currencyValues']; currencyObservedAt: string; verifiedAt: number } };
 
 class CaptureFailure extends Error {
   constructor(readonly code: string, message: string, readonly retryable = false) { super(message); }
@@ -248,6 +255,16 @@ export class CrmControlEvidenceService implements OnModuleDestroy {
             const failure = this.failure(error, 'CAPTURE_FAILED', 'Не удалось прочитать источники карточки.', true);
             return { ok: false, errorCode: failure.code, message: failure.message, retryable: failure.retryable };
           }
+        }, readSources: async (job, createReader) => {
+          try {
+            if (!accepting) throw new CaptureFailure('WORKER_STOPPING', HEALTH_ERRORS.WORKER_STOPPING, true);
+            const result = session.tail.then(() => this.readSessionSources(session, job, createReader));
+            session.tail = result.then(() => undefined, () => undefined);
+            return { ok: true, value: await result };
+          } catch (error) {
+            const failure = this.failure(error, 'CAPTURE_FAILED', 'Не удалось прочитать источники карточки.', true);
+            return { ok: false, errorCode: failure.code, message: failure.message, retryable: failure.retryable };
+          }
         } };
         try { return { ok: true as const, value: await action(batch) }; }
         finally { accepting = false; await session.tail; }
@@ -341,8 +358,77 @@ export class CrmControlEvidenceService implements OnModuleDestroy {
     return result;
   }
 
+  private async ensureSourceAccess(session: AuthSession, job: CrmSourceCardJob, forceRefresh = false) {
+    if (!forceRefresh && session.sourceAccess && Date.now() - session.sourceAccess.verifiedAt < HEALTH_MAX_AGE_MS
+      && !await crmBrowserNeedsRefresh(session.context, session.config.origin)) return session.sourceAccess;
+    session.sourceAccess = undefined;
+    const access = await this.readSessionCard(session, job, page => {
+      let mailAccountId: string | null = null, conflict = false;
+      const listener = (response: import('playwright-core').Response) => {
+        if (response.status() !== 200 || response.request().method() !== 'GET') return;
+        let url: URL; try { url = new URL(response.url()); } catch { return; }
+        const match = url.pathname.match(/^\/api\/v2\/([1-9]\d{0,19})\/leads\/([1-9]\d{0,19})\/compose$/);
+        if (url.origin !== 'https://amomail.amocrm.ru' || url.username || url.password || url.hash || match?.[2] !== job.dealExternalId) return;
+        if (mailAccountId && mailAccountId !== match[1]) conflict = true; else mailAccountId = match[1];
+      };
+      page.on('response', listener);
+      return { dispose: () => page.off('response', listener), collect: async () => {
+        // readSessionCard has already verified real timeline and compose response schemas for this exact card.
+        if (!mailAccountId || conflict) throw new CaptureFailure('SOURCE_NOT_READY', HEALTH_ERRORS.SOURCE_NOT_READY, true);
+        const currencyValues = await page.evaluate(() => {
+          const amo = (window as any).AMOCRM;
+          const code = (value: unknown) => typeof value === 'string' && /^[a-zA-Z]{3}$/.test(value) ? value : null;
+          let accountCode: unknown = null;
+          try { accountCode = amo?.constant?.('account')?.currency; } catch { /* Account authority remains unknown. */ }
+          return { accountCode: code(accountCode), localeCode: code(amo?.system?.locale?.currency) };
+        }).catch(() => ({ accountCode: null, localeCode: null }));
+        return { mailAccountId, currencyValues, currencyObservedAt: new Date().toISOString(), verifiedAt: Date.now() };
+      } };
+    }, forceRefresh);
+    session.sourceAccess = access;
+    return access;
+  }
+
+  private async readSessionSources<T>(session: AuthSession, job: CrmSourceCardJob,
+    createReader: (access: CrmSourceRequestSession) => { collect(): Promise<T>; dispose(): void }): Promise<T> {
+    if (this.destroyed) throw new CaptureFailure('WORKER_STOPPING', HEALTH_ERRORS.WORKER_STOPPING, true);
+    if (session.invalid) throw session.invalid;
+    if (this.configuration().fingerprint !== session.config.fingerprint) throw new CaptureFailure('SESSION_CONFLICT', HEALTH_ERRORS.SESSION_CONFLICT);
+    try { validateCrmCaptureUrl(job.sourceUrl, job.dealExternalId, session.config.origin); }
+    catch { throw new CaptureFailure('TARGET_INVALID', HEALTH_ERRORS.TARGET_INVALID); }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const access = await this.ensureSourceAccess(session, job, attempt === 1);
+      let reader: ReturnType<typeof createReader> | undefined, authorized = true;
+      try {
+        reader = createReader({ context: session.context, origin: session.config.origin, mailAccountId: access.mailAccountId,
+          currencyValues: { ...access.currencyValues }, currencyObservedAt: access.currencyObservedAt });
+        return await reader.collect();
+      } catch (error) {
+        if (!(error instanceof CrmSourceAuthExpiredError)) throw error;
+        authorized = false;
+        session.sourceAccess = undefined;
+        if (attempt === 1) {
+          session.invalid = new CaptureFailure('AUTH_REQUIRED', HEALTH_ERRORS.AUTH_REQUIRED);
+          this.health = { status: 'ERROR', checkedAt: new Date().toISOString(), errorCode: 'AUTH_REQUIRED', message: HEALTH_ERRORS.AUTH_REQUIRED };
+          throw session.invalid;
+        }
+        // Discard the whole reader: no pagination or message state crosses the native refresh boundary.
+      } finally {
+        reader?.dispose();
+        if (authorized && !session.invalid) {
+          const previousHealth = this.currentHealth();
+          await this.persistSession(session);
+          // Preserve the time of the real native access check; direct reads do not invent a later browser probe.
+          this.health = previousHealth.status === 'READY' && previousHealth.checkedAt && Date.parse(previousHealth.checkedAt) > access.verifiedAt
+            ? previousHealth : { status: 'READY', checkedAt: new Date(access.verifiedAt).toISOString() };
+        }
+      }
+    }
+    throw new CaptureFailure('AUTH_REQUIRED', HEALTH_ERRORS.AUTH_REQUIRED);
+  }
+
   private async readSessionCard<T>(session: AuthSession, job: CrmSourceCardJob,
-    createReader: (page: Page) => { collect(title: string): Promise<T>; dispose(): void }): Promise<T> {
+    createReader: (page: Page) => { collect(title: string): Promise<T>; dispose(): void }, forceRefresh = false): Promise<T> {
     let page: Page | undefined, reader: ReturnType<typeof createReader> | undefined;
     let access: ReturnType<typeof observeCrmBrowserAccess> | undefined;
     let stage: 'card' | 'action' = 'card', navigationBlocked = false, verified = false;
@@ -381,11 +467,12 @@ export class CrmControlEvidenceService implements OnModuleDestroy {
         if (result !== 'READY') throw new CaptureFailure(result, HEALTH_ERRORS[result], result !== 'AUTH_REQUIRED');
         // Persist rotation immediately even if a subsequent source request is temporarily unavailable.
         await this.persistSession(session);
+        session.sourceAccess = undefined;
         refreshed = true;
         access!.reset();
         await navigate();
       };
-      if (await crmBrowserNeedsRefresh(session.context, session.config.origin)) await refresh();
+      if (forceRefresh || await crmBrowserNeedsRefresh(session.context, session.config.origin)) await refresh();
       let sourceAccess = await access.read();
       if (sourceAccess === 'AUTH_REQUIRED' && !refreshed) { await refresh(); sourceAccess = await access.read(); }
       if (sourceAccess !== 'READY') throw new CaptureFailure(sourceAccess, HEALTH_ERRORS[sourceAccess], sourceAccess !== 'AUTH_REQUIRED');

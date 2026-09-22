@@ -184,7 +184,8 @@ async function readJson(context: BrowserContext, url: string, origin: string, de
   const response = await context.request.get(url, { timeout: Math.min(15_000, remaining), maxRedirects: 0,
     headers: { 'X-Requested-With': 'XMLHttpRequest', Origin: origin, Referer: `${origin}/`, ...(revealToken ? { 'X-Reveal-Token': revealToken } : {}) } });
   try {
-    if (response.status() !== 200) throw new BrowserHistoryError([401, 403].includes(response.status()) ? 'HISTORY_ACCESS_DENIED' : 'HISTORY_RESPONSE_ERROR');
+    if (response.status() !== 200) throw new BrowserHistoryError(response.status() === 401 ? 'HISTORY_AUTH_EXPIRED'
+      : response.status() === 403 ? 'HISTORY_ACCESS_DENIED' : 'HISTORY_RESPONSE_ERROR');
     const length = Number(response.headers()['content-length']);
     if (Number.isFinite(length) && length > MAX_BODY_BYTES) throw new BrowserHistoryError('HISTORY_RESPONSE_TOO_LARGE');
     const body = await response.body();
@@ -193,64 +194,36 @@ async function readJson(context: BrowserContext, url: string, origin: string, de
   } finally { await response.dispose(); }
 }
 
-/**
- * Attach before navigating the dedicated collector page, collect after the card is ready, then dispose.
- * Only URLs observed from that card can select a mailbox account. History is read-only; explicit prepareAttachment
- * may perform the authorized preparation POST for an attachment already bound to a returned message.
- * This is an additive local source, not a certificate of the latest offer or complete client communications.
- */
-export function observeCrmBrowserHistory(page: Page, input: { origin: string; dealExternalId: string; discoveryWaitMs?: number }): {
+export interface CrmBrowserHistoryReader {
   collect: () => Promise<CrmBrowserHistory>; dispose: () => void;
   prepareAttachment: (reference: { threadId: string; messageId: string; attachmentId: string }, signal: AbortSignal) => Promise<{ downloadUrl: string }>;
-} {
+}
+
+/** Same verified endpoints and parsers, without rendering another card. The provider supplies the account observed in its leased browser session. */
+export function createCrmBrowserHistoryReader(context: BrowserContext, input: {
+  origin: string; dealExternalId: string; mailAccountId: string | null; initialTimelineUrl?: string;
+}): CrmBrowserHistoryReader {
   const origin = accountOrigin(input.origin), dealId = numericId(input.dealExternalId);
   if (!dealId) throw new BrowserHistoryError('DEAL_INVALID');
-  let timelineUrl: string | null = null, timelineFailure: string | null = null;
-  let mailAccountId: string | null = null, accountConflict = false, disposed = false;
+  const timelineUrl = validateBrowserTimelineUrl(input.initialTimelineUrl ?? `${origin}/ajax/v3/leads/${dealId}/events_timeline`, origin, dealId);
+  const mailAccountId = input.mailAccountId === null ? null : numericId(input.mailAccountId);
+  if (input.mailAccountId !== null && !mailAccountId) throw new BrowserHistoryError('MAIL_ACCOUNT_UNVERIFIED');
+  let disposed = false;
   let collectedAccountId: string | null = null;
   const attachments = new Map<string, BrowserMailMessage['attachments'][number]>();
-  const discoveryWaitMs = Math.max(0, Math.min(10_000, input.discoveryWaitMs ?? 5000));
-  const discoveryListeners = new Set<() => void>();
-  const waitForDiscovery = async (ready: () => boolean) => {
-    if (ready() || !discoveryWaitMs || disposed) return;
-    await new Promise<void>(resolve => {
-      const finish = () => { clearTimeout(timer); discoveryListeners.delete(check); resolve(); };
-      const check = () => { if (ready() || disposed) finish(); };
-      const timer = setTimeout(finish, discoveryWaitMs);
-      discoveryListeners.add(check); check();
-    });
-  };
-  const listener = (response: Response) => {
-    if (response.request().method() !== 'GET') return;
-    const url = new URL(response.url());
-    if (url.origin === origin && url.pathname.replace(/\/$/, '') === `/ajax/v3/leads/${dealId}/events_timeline`) {
-      try {
-        const target = validateBrowserTimelineUrl(url.href, origin, dealId);
-        if (response.status() === 200) { timelineUrl ??= target; timelineFailure = null; }
-        else timelineFailure = [401, 403].includes(response.status()) ? 'HISTORY_ACCESS_DENIED' : 'HISTORY_RESPONSE_ERROR';
-      } catch { /* Rejected URLs never select a request target. */ }
-    }
-    const match = url.pathname.match(/^\/api\/v2\/(\d+)\/leads\/(\d+)\/compose$/);
-    if (response.status() === 200 && url.origin === MAIL_ORIGIN && !url.username && !url.password && match?.[2] === dealId && numericId(match[1])) {
-      if (mailAccountId && mailAccountId !== match[1]) accountConflict = true;
-      else mailAccountId = match[1];
-    }
-    for (const notify of discoveryListeners) notify();
-  };
-  page.on('response', listener);
   return {
-    dispose: () => { disposed = true; page.off('response', listener); for (const notify of discoveryListeners) notify(); },
+    dispose: () => { disposed = true; attachments.clear(); },
     prepareAttachment: async (reference, signal) => {
       const key = `${reference.threadId}:${reference.messageId}:${reference.attachmentId}`;
       const attachment = attachments.get(key);
-      if (disposed || !collectedAccountId || accountConflict || !attachment) throw new BrowserHistoryError('MAIL_ATTACHMENT_NOT_OBSERVED');
+      if (disposed || !collectedAccountId || !attachment) throw new BrowserHistoryError('MAIL_ATTACHMENT_NOT_OBSERVED');
       if (attachment.downloadBlocked || attachment.state === 'archived') throw new BrowserHistoryError('MAIL_ATTACHMENT_BLOCKED');
       const endpoint = `${MAIL_ORIGIN}/api/v2/${collectedAccountId}/attachments/${attachment.id}`;
       const headers = { 'X-Requested-With': 'XMLHttpRequest', Origin: origin, Referer: `${origin}/` };
       let requested = false;
       for (let attempt = 0; attempt < 8; attempt++) {
         signal.throwIfAborted();
-        const value = object(await readJson(page.context(), endpoint, origin, Date.now() + 15_000));
+        const value = object(await readJson(context, endpoint, origin, Date.now() + 15_000));
         signal.throwIfAborted();
         if (value?.status === 'complete' && typeof value.url === 'string') {
           return { downloadUrl: validateMailAttachmentDownload(value.url, attachment.id) };
@@ -258,8 +231,12 @@ export function observeCrmBrowserHistory(page: Page, input: { origin: string; de
         if (value?.status === 'not_downloaded' && !requested) {
           // The user's collector authorization includes preparation of this exact observed attachment only.
           signal.throwIfAborted();
-          const response = await page.context().request.post(endpoint, { maxRedirects: 0, timeout: 15_000, headers });
-          try { if (![200, 202, 204].includes(response.status())) throw new BrowserHistoryError('MAIL_ATTACHMENT_PREPARATION_FAILED'); }
+          const response = await context.request.post(endpoint, { maxRedirects: 0, timeout: 15_000, headers });
+          try {
+            if (response.status() === 401) throw new BrowserHistoryError('HISTORY_AUTH_EXPIRED');
+            if (response.status() === 403) throw new BrowserHistoryError('HISTORY_ACCESS_DENIED');
+            if (![200, 202, 204].includes(response.status())) throw new BrowserHistoryError('MAIL_ATTACHMENT_PREPARATION_FAILED');
+          }
           finally { await response.dispose(); }
           requested = true;
         } else if (!['not_downloaded', 'processing'].includes(value?.status)) throw new BrowserHistoryError('MAIL_ATTACHMENT_PREPARATION_FAILED');
@@ -278,19 +255,14 @@ export function observeCrmBrowserHistory(page: Page, input: { origin: string; de
         timelineServerReportedEnd: false, communicationsComplete: false, reasonCodes: ['ALL_CHANNEL_COVERAGE_UNPROVEN'] };
       const reasons = new Set(result.reasonCodes);
       const finish = () => ({ ...result, reasonCodes: [...reasons], finishedAt: new Date().toISOString() });
-      const card = new URL(page.url());
-      if (disposed || card.origin !== origin || ![`/leads/detail/${dealId}`, `/leads/detail/${dealId}/`].includes(card.pathname)
-        || card.username || card.password || card.search || card.hash) throw new BrowserHistoryError('WRONG_CARD');
-      await waitForDiscovery(() => !!timelineUrl || !!timelineFailure);
-      if (timelineFailure) { reasons.add(timelineFailure); return finish(); }
-      if (!timelineUrl) { reasons.add('TIMELINE_NOT_OBSERVED'); return finish(); }
+      if (disposed) throw new BrowserHistoryError('HISTORY_READER_DISPOSED');
       const seenUrls = new Set<string>(), seenEntries = new Map<string, BrowserTimelineEntry>();
       try {
         let url: string | null = timelineUrl, revealToken: string | undefined;
         for (let index = 0; url && index < MAX_TIMELINE_PAGES; index++) {
           if (seenUrls.has(url)) throw new BrowserHistoryError('TIMELINE_CURSOR_REPEATED');
           seenUrls.add(url);
-          const payload = await readJson(page.context(), validateBrowserTimelineUrl(url, origin, dealId), origin, deadline, revealToken);
+          const payload = await readJson(context, validateBrowserTimelineUrl(url, origin, dealId), origin, deadline, revealToken);
           const nextRevealToken = object(payload)?.reveal_token;
           if (nextRevealToken != null) {
             if (typeof nextRevealToken !== 'string' || !nextRevealToken || nextRevealToken.length > 8192 || /[\r\n]/.test(nextRevealToken)) {
@@ -310,12 +282,14 @@ export function observeCrmBrowserHistory(page: Page, input: { origin: string; de
           url = parsed.olderUrl;
         }
         if (!result.timelineServerReportedEnd) reasons.add('TIMELINE_PAGE_LIMIT');
-      } catch (error) { reasons.add(error instanceof BrowserHistoryError ? error.code : 'HISTORY_READ_FAILED'); }
+      } catch (error) {
+        if (error instanceof BrowserHistoryError && error.code === 'HISTORY_AUTH_EXPIRED') throw error;
+        reasons.add(error instanceof BrowserHistoryError ? error.code : 'HISTORY_READ_FAILED');
+      }
       if (result.entries.some(entry => entry.binding === 'RELATED_ENTITY')) reasons.add('RELATED_ENTITY_HISTORY_PRESENT');
       const refs = new Map<string, string[]>();
       for (const entry of result.entries) if (entry.mail) refs.set(entry.mail.threadId, [...(refs.get(entry.mail.threadId) ?? []), entry.mail.messageId]);
-      if (refs.size) await waitForDiscovery(() => !!mailAccountId);
-      if (refs.size && (!mailAccountId || accountConflict)) { reasons.add('MAIL_ACCOUNT_UNVERIFIED'); return finish(); }
+      if (refs.size && !mailAccountId) { reasons.add('MAIL_ACCOUNT_UNVERIFIED'); return finish(); }
       const verifiedMailAccount = mailAccountId;
       collectedAccountId = verifiedMailAccount;
       if (refs.size > MAX_THREADS) reasons.add('MAIL_THREAD_LIMIT');
@@ -324,7 +298,7 @@ export function observeCrmBrowserHistory(page: Page, input: { origin: string; de
           attachmentContentComplete: false, expectedMessages: null, reasonCodes: [] };
         result.threads.push(thread);
         try {
-          const metadata = await readJson(page.context(), `${MAIL_ORIGIN}/api/v2/${verifiedMailAccount}/threads/${threadId}`, origin, deadline);
+          const metadata = await readJson(context, `${MAIL_ORIGIN}/api/v2/${verifiedMailAccount}/threads/${threadId}`, origin, deadline);
           thread.binding = parseBrowserMailThread(metadata, threadId, dealId);
           let nextToken: string | null = null, terminal = false;
           const tokens = new Set<string>(), messageIds = new Set<string>();
@@ -334,7 +308,7 @@ export function observeCrmBrowserHistory(page: Page, input: { origin: string; de
             const url = new URL(`${MAIL_ORIGIN}/api/v2.1/${verifiedMailAccount}/threads/${threadId}/messages`);
             url.searchParams.set('limit', '100');
             if (nextToken) url.searchParams.set('next_page_token', nextToken);
-            const parsed = parseBrowserMailPage(await readJson(page.context(), url.href, origin, deadline));
+            const parsed = parseBrowserMailPage(await readJson(context, url.href, origin, deadline));
             if (thread.expectedMessages !== null && thread.expectedMessages !== parsed.total) throw new BrowserHistoryError('MAIL_TOTAL_CHANGED');
             thread.expectedMessages = parsed.total;
             for (const message of parsed.messages) {
@@ -355,9 +329,69 @@ export function observeCrmBrowserHistory(page: Page, input: { origin: string; de
           thread.attachmentContentComplete = thread.messages.every(message => message.attachmentCount === 0) && thread.messageListComplete;
           if (!thread.attachmentContentComplete) thread.reasonCodes.push('ATTACHMENT_CONTENT_UNVERIFIED');
           if (thread.binding !== 'DEAL') thread.reasonCodes.push('MAIL_NOT_BOUND_TO_DEAL');
-        } catch (error) { thread.reasonCodes.push(error instanceof BrowserHistoryError ? error.code : 'HISTORY_READ_FAILED'); }
+        } catch (error) {
+          if (error instanceof BrowserHistoryError && error.code === 'HISTORY_AUTH_EXPIRED') throw error;
+          thread.reasonCodes.push(error instanceof BrowserHistoryError ? error.code : 'HISTORY_READ_FAILED');
+        }
       }
       return finish();
+    },
+  };
+}
+
+/** Compatibility/native discovery adapter. It never guesses a mailbox account from the deal ID. */
+export function observeCrmBrowserHistory(page: Page, input: { origin: string; dealExternalId: string; discoveryWaitMs?: number }): CrmBrowserHistoryReader {
+  const origin = accountOrigin(input.origin), dealId = numericId(input.dealExternalId);
+  if (!dealId) throw new BrowserHistoryError('DEAL_INVALID');
+  let timelineUrl: string | null = null, timelineFailure: string | null = null, mailAccountId: string | null = null;
+  let accountConflict = false, disposed = false, reader: CrmBrowserHistoryReader | undefined;
+  const discoveryWaitMs = Math.max(0, Math.min(10_000, input.discoveryWaitMs ?? 5000));
+  const listeners = new Set<() => void>();
+  const waitForDiscovery = async (ready: () => boolean) => {
+    if (ready() || !discoveryWaitMs || disposed) return;
+    await new Promise<void>(resolve => {
+      const finish = () => { clearTimeout(timer); listeners.delete(check); resolve(); };
+      const check = () => { if (ready() || disposed) finish(); };
+      const timer = setTimeout(finish, discoveryWaitMs); listeners.add(check); check();
+    });
+  };
+  const listener = (response: Response) => {
+    if (response.request().method() !== 'GET') return;
+    let url: URL; try { url = new URL(response.url()); } catch { return; }
+    if (url.origin === origin && url.pathname.replace(/\/$/, '') === `/ajax/v3/leads/${dealId}/events_timeline`) {
+      try {
+        const target = validateBrowserTimelineUrl(url.href, origin, dealId);
+        if (response.status() === 200) { timelineUrl ??= target; timelineFailure = null; }
+        else timelineFailure = [401, 403].includes(response.status()) ? 'HISTORY_ACCESS_DENIED' : 'HISTORY_RESPONSE_ERROR';
+      } catch { /* Rejected URLs never select a request target. */ }
+    }
+    const match = url.pathname.match(/^\/api\/v2\/(\d+)\/leads\/(\d+)\/compose$/);
+    if (response.status() === 200 && url.origin === MAIL_ORIGIN && !url.username && !url.password && !url.hash
+      && match?.[2] === dealId && numericId(match[1])) {
+      if (mailAccountId && mailAccountId !== match[1]) accountConflict = true; else mailAccountId = match[1];
+    }
+    for (const notify of listeners) notify();
+  };
+  page.on('response', listener);
+  return {
+    dispose: () => { disposed = true; reader?.dispose(); page.off('response', listener); for (const notify of listeners) notify(); },
+    prepareAttachment: (reference, signal) => {
+      if (disposed || !reader || accountConflict) return Promise.reject(new BrowserHistoryError('MAIL_ATTACHMENT_NOT_OBSERVED'));
+      return reader.prepareAttachment(reference, signal);
+    },
+    collect: async () => {
+      const startedAt = new Date().toISOString(), card = new URL(page.url());
+      if (disposed || card.origin !== origin || ![`/leads/detail/${dealId}`, `/leads/detail/${dealId}/`].includes(card.pathname)
+        || card.username || card.password || card.search || card.hash) throw new BrowserHistoryError('WRONG_CARD');
+      await waitForDiscovery(() => !!timelineUrl || !!timelineFailure);
+      if (!timelineUrl || timelineFailure) return { dealExternalId: dealId, startedAt, finishedAt: new Date().toISOString(),
+        entries: [], threads: [], timelineServerReportedEnd: false, communicationsComplete: false,
+        reasonCodes: ['ALL_CHANNEL_COVERAGE_UNPROVEN', timelineFailure ?? 'TIMELINE_NOT_OBSERVED'] };
+      await waitForDiscovery(() => !!mailAccountId || accountConflict);
+      reader?.dispose();
+      reader = createCrmBrowserHistoryReader(page.context(), { origin, dealExternalId: dealId,
+        mailAccountId: accountConflict ? null : mailAccountId, initialTimelineUrl: timelineUrl });
+      return reader.collect();
     },
   };
 }

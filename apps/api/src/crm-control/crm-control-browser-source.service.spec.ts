@@ -3,10 +3,11 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { CrmControlBrowserSourceService, parseCrmBrowserAccountCurrency } from './crm-control-browser-source.service';
-import { observeCrmBrowserHistory } from './crm-control-browser-history';
+import { BrowserHistoryError, createCrmBrowserHistoryReader } from './crm-control-browser-history';
+import { CrmSourceAuthExpiredError } from './crm-control-evidence.service';
 import { downloadMailAttachment } from './crm-control-browser-files';
 
-jest.mock('./crm-control-browser-history', () => ({ observeCrmBrowserHistory: jest.fn() }));
+jest.mock('./crm-control-browser-history', () => ({ ...jest.requireActual('./crm-control-browser-history'), createCrmBrowserHistoryReader: jest.fn() }));
 jest.mock('./crm-control-browser-files', () => ({ ...jest.requireActual('./crm-control-browser-files'), downloadMailAttachment: jest.fn() }));
 const time = '2026-09-22T10:00:00.000Z';
 const pdf = Buffer.from('%PDF-1.4\nFixture only');
@@ -16,20 +17,21 @@ const message = (metadataHash = 'metadata') => ({ id: '8', sent: true, occurredA
 
 describe('browser source batch/private manifest', () => {
   let folder: string, oldDirectory: string | undefined, service: CrmControlBrowserSourceService, prepare: jest.Mock;
-  let history: any, page: any;
+  let history: any, currencyValues: any;
   beforeEach(async () => {
     folder = await mkdtemp(path.join(os.tmpdir(), 'crm-browser-source-'));
     oldDirectory = process.env.CRM_CONTROL_DOCUMENT_DIR; process.env.CRM_CONTROL_DOCUMENT_DIR = folder;
     history = { dealExternalId: '123', entries: [], threads: [{ id: '7', binding: 'RELATED_ENTITY', messages: [message()] }],
       communicationsComplete: false, reasonCodes: ['ALL_CHANNEL_COVERAGE_UNPROVEN'], startedAt: time, finishedAt: time };
     prepare = jest.fn().mockResolvedValue({ downloadUrl: 'https://private-signed-url.example' });
-    (observeCrmBrowserHistory as jest.Mock).mockReset().mockImplementation((_page, input) => ({
+    (createCrmBrowserHistoryReader as jest.Mock).mockReset().mockImplementation((_context, input) => ({
       collect: async () => ({ ...structuredClone(history), dealExternalId: input.dealExternalId }), dispose: jest.fn(), prepareAttachment: prepare,
     }));
     (downloadMailAttachment as jest.Mock).mockReset().mockResolvedValue({ bytes: pdf, sha256: createHash('sha256').update(pdf).digest('hex'), size: pdf.length, contentType: 'application/pdf' });
-    page = { evaluate: jest.fn().mockResolvedValue({ accountCode: 'EUR', localeCode: 'EUR' }) };
-    const evidence = { withSourceBatch: async (action: any) => ({ ok: true, value: await action({ readCard: async (_job: any, make: any) => {
-      const reader = make(page); try { return { ok: true, value: await reader.collect() }; } finally { reader.dispose(); }
+    currencyValues = { accountCode: 'EUR', localeCode: 'EUR' };
+    const evidence = { withSourceBatch: async (action: any) => ({ ok: true, value: await action({ readSources: async (_job: any, make: any) => {
+      const reader = make({ context: {}, origin: 'https://test.amocrm.ru', mailAccountId: '42', currencyValues, currencyObservedAt: time });
+      try { return { ok: true, value: await reader.collect() }; } finally { reader.dispose(); }
     } }) }) };
     service = new CrmControlBrowserSourceService(evidence as any);
   });
@@ -48,7 +50,7 @@ describe('browser source batch/private manifest', () => {
     expect(JSON.stringify(bundle)).not.toContain('PRIVATE TEST');
     expect(JSON.stringify(bundle)).not.toContain('private-signed-url');
     const stored = await service.readManifest(bundle.manifest!, '123');
-    expect(bundle.accountCurrency).toMatchObject({ status: 'VERIFIED', code: 'EUR', source: 'AMOCRM.constant(account).currency' });
+    expect(bundle.accountCurrency).toMatchObject({ status: 'VERIFIED', code: 'EUR', source: 'AMOCRM.constant(account).currency', observedAt: time });
     expect(stored.accountCurrency).toEqual(bundle.accountCurrency);
     expect(stored.history.threads[0].messages[0].content).toBe('PRIVATE TEST MESSAGE BODY');
     expect(await readFile(path.join(folder, bundle.documents[0].artifact!.storageKey))).toEqual(pdf);
@@ -65,8 +67,8 @@ describe('browser source batch/private manifest', () => {
     expect(parseCrmBrowserAccountCurrency(raw, time)).toMatchObject({ status, code, observedAt: time });
   });
 
-  it('keeps history usable while an unavailable currency stays explicit, without leaking browser errors', async () => {
-    page.evaluate.mockRejectedValueOnce(new Error('private-cookie=secret'));
+  it('keeps history usable while an unavailable bootstrap currency stays explicit', async () => {
+    currencyValues = { accountCode: null, localeCode: null };
     const result = await service.withBatch(batch => batch.collectCurrent(job()));
     if (!result.ok) throw Error('Unexpected fixture failure');
     expect(result.value.manifest).toBeDefined();
@@ -76,11 +78,22 @@ describe('browser source batch/private manifest', () => {
   });
 
   it('does not select either currency when account authority and locale conflict', async () => {
-    page.evaluate.mockResolvedValueOnce({ accountCode: 'EUR', localeCode: 'USD' });
+    currencyValues = { accountCode: 'EUR', localeCode: 'USD' };
     const result = await service.withBatch(batch => batch.collectCurrent(job()));
     if (!result.ok) throw Error('Unexpected fixture failure');
     expect(result.value.accountCurrency).toMatchObject({ status: 'CONFLICT', code: null, accountCode: 'EUR', localeCode: 'USD' });
     expect(result.value.reasonCodes).toContain('ACCOUNT_CURRENCY_CONFLICT');
+  });
+
+  it('propagates a history401 so the provider restarts the whole source reader after native refresh', async () => {
+    (createCrmBrowserHistoryReader as jest.Mock).mockReturnValueOnce({ collect: async () => { throw new BrowserHistoryError('HISTORY_AUTH_EXPIRED'); }, dispose: jest.fn() });
+    await expect(service.withBatch(batch => batch.collectCurrent(job()))).rejects.toBeInstanceOf(CrmSourceAuthExpiredError);
+    expect(downloadMailAttachment).not.toHaveBeenCalled();
+  });
+
+  it('propagates an attachment preparation401 instead of storing a partial manifest as the finished read', async () => {
+    prepare.mockRejectedValueOnce(new BrowserHistoryError('HISTORY_AUTH_EXPIRED'));
+    await expect(service.withBatch(batch => batch.collectCurrent(job()))).rejects.toBeInstanceOf(CrmSourceAuthExpiredError);
   });
 
   it('uses exact message-level timeline binding without attaching the rest of a contact thread to the deal', async () => {

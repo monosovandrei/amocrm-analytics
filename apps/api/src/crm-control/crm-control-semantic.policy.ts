@@ -8,8 +8,11 @@ export interface CrmControlSemanticAssessment { status: 'PASS' | 'FAIL' | 'UNKNO
 export function assessCrmControlSemantic(request: CrmControlSemanticRequest, validation: CrmControlSemanticValidation,
   ruleCode: string): CrmControlSemanticAssessment {
   const result = (status: CrmControlSemanticAssessment['status'], message: string) => ({ status, message, policyVersion: CRM_CONTROL_SEMANTIC_POLICY_VERSION });
-  if (validation.status !== 'VALIDATED' || validation.requestId !== request.requestId || validation.check !== request.check
+  if (validation.requestId !== request.requestId || validation.check !== request.check
     || validation.subjectId !== request.subjectId) return result('UNKNOWN', 'Для смысловой проверки пока недостаточно подтверждённых данных.');
+  if (validation.status !== 'VALIDATED') return result('UNKNOWN', validation.status === 'UNKNOWN' && !request.sources.length
+    ? 'В сохранённом срезе нет текстовых источников для смысловой проверки. Отсутствие нужного примечания этим не подтверждено.'
+    : 'Для смысловой проверки пока недостаточно подтверждённых данных.');
   const facts = new Map(validation.findings.map(finding => [finding.fact, finding]));
   if (request.check === 'task_action' && ruleCode === 'task_text') {
     if (facts.get('action')?.state === 'absent') return result('FAIL', 'Текст задачи не описывает следующее действие по сделке.');

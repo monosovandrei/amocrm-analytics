@@ -1,5 +1,5 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { CrmControlAnalysisJob, Prisma } from '../generated/prisma';
 import { PrismaService } from '../prisma/prisma.service';
@@ -8,11 +8,13 @@ import { CRM_CONTROL_LOCAL_PROMPT_VERSION, CrmControlLocalSemanticClient, CrmCon
 import { CRM_CONTROL_SEMANTIC_FACTS, CrmControlSemanticRequest, validateCrmControlSemanticResponse } from './crm-control-semantic.validation';
 import { buildCrmControlSemanticRequest } from './crm-control-semantic.request';
 import { CRM_CONTROL_SEMANTIC_POLICY_VERSION, assessCrmControlSemantic } from './crm-control-semantic.policy';
+import { canonicalCrmControlSemanticJson as canonical, crmControlSemanticInputHash } from './crm-control-semantic.identity';
 
-export const CRM_CONTROL_ANALYZER_VERSION = '1';
+export const CRM_CONTROL_ANALYZER_VERSION = '2';
 const ATTEMPTS_PER_REQUEST = 3;
 const LEASE_MS = 5 * 60_000; // Longer than the client's hard 180-second request limit.
 const ACTIVE_KEY = 'local-semantic';
+const RETIRE_BATCH_SIZE = 100;
 const HASH = /^[a-f0-9]{64}$/;
 const TRANSIENT = new Set(['LOCAL_AI_UNAVAILABLE', 'LOCAL_AI_TIMEOUT', 'LOCAL_AI_STORAGE_UNAVAILABLE']);
 const RULE_CHECK: Record<string, CrmControlSemanticRequest['check']> = {
@@ -20,17 +22,8 @@ const RULE_CHECK: Record<string, CrmControlSemanticRequest['check']> = {
   stage_duration: 'deadline_agreement', price_requested_duration: 'price_delay',
 };
 const json = (value: unknown) => JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
-const hash = (value: string) => createHash('sha256').update(value, 'utf8').digest('hex');
 const sameDate = (left: unknown, right: unknown) => left == null && right == null
   || typeof left === 'string' && typeof right === 'string' && Number.isFinite(Date.parse(left)) && Date.parse(left) === Date.parse(right);
-
-/** Stable key order prevents a caller's object construction order from duplicating a job. */
-function canonical(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
-  if (value && typeof value === 'object') return `{${Object.entries(value).filter(([, item]) => item !== undefined)
-    .sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => `${JSON.stringify(key)}:${canonical(item)}`).join(',')}}`;
-  return JSON.stringify(value);
-}
 
 export function crmControlLocalAnalysisOptions(env: NodeJS.ProcessEnv = process.env): CrmControlLocalSemanticOptions | null {
   const origin = env.CRM_CONTROL_LOCAL_AI_ORIGIN;
@@ -77,8 +70,8 @@ export class CrmControlAnalysisService {
     if (preflight.status === 'INVALID') throw new BadRequestException('Некорректные источники анализа.');
     // Preserve the trusted builder's stable ID; ignore only an arbitrary caller's replacement ID.
     const request = JSON.parse(canonical(expected)) as CrmControlSemanticRequest;
-    const inputHash = hash(JSON.stringify({ promptVersion: CRM_CONTROL_LOCAL_PROMPT_VERSION,
-      model: options.model, modelSha256: options.modelSha256, input: request }));
+    const inputHash = crmControlSemanticInputHash(request, { promptVersion: CRM_CONTROL_LOCAL_PROMPT_VERSION,
+      model: options.model, modelSha256: options.modelSha256 });
     return this.prisma.crmControlAnalysisJob.upsert({
       where: { resultId_inputHash_analyzerVersion: { resultId, inputHash, analyzerVersion: CRM_CONTROL_ANALYZER_VERSION } }, update: {},
       create: { resultId, snapshotHash, inputHash, analyzerVersion: CRM_CONTROL_ANALYZER_VERSION,
@@ -130,8 +123,25 @@ export class CrmControlAnalysisService {
     });
   }
 
-  private async claim(now: Date): Promise<CrmControlAnalysisJob | null> {
+  /** Retire a bounded page without spending model attempts or changing an active request/history. */
+  private async retireOutdatedQueued(now: Date, options: CrmControlLocalSemanticOptions) {
+    const outdated = { OR: [{ analyzerVersion: { not: CRM_CONTROL_ANALYZER_VERSION } },
+      { promptVersion: { not: CRM_CONTROL_LOCAL_PROMPT_VERSION } }, { model: { not: options.model } },
+      { modelSha256: { not: options.modelSha256 } }] };
+    const rows = await this.prisma.crmControlAnalysisJob.findMany({ where: { status: 'QUEUED', ...outdated },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }], take: RETIRE_BATCH_SIZE, select: { id: true } });
+    if (!rows.length) return;
+    await this.prisma.crmControlAnalysisJob.updateMany({ where: { id: { in: rows.map(row => row.id) }, status: 'QUEUED', ...outdated },
+      data: { status: 'ERROR', errorCode: 'LOCAL_AI_VERSION_CHANGED', finishedAt: now, nextAttemptAt: null,
+        activeKey: null, leaseToken: null, leaseUntil: null, assessmentStatus: 'UNKNOWN',
+        assessmentMessage: 'Настройки анализатора изменились; требуется новая допроверка.', policyVersion: CRM_CONTROL_SEMANTIC_POLICY_VERSION } });
+  }
+
+  private async claim(now: Date, options = crmControlLocalAnalysisOptions()): Promise<CrmControlAnalysisJob | null> {
+    if (!options) return null;
     const candidate = await this.prisma.crmControlAnalysisJob.findFirst({ where: { status: 'QUEUED',
+      analyzerVersion: CRM_CONTROL_ANALYZER_VERSION, promptVersion: CRM_CONTROL_LOCAL_PROMPT_VERSION,
+      model: options.model, modelSha256: options.modelSha256,
       attemptCount: { lt: this.prisma.crmControlAnalysisJob.fields.attemptLimit },
       OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: now } }] }, orderBy: [{ createdAt: 'asc' }, { id: 'asc' }] });
     if (!candidate) return null;
@@ -186,7 +196,8 @@ export class CrmControlAnalysisService {
     try {
       const now = new Date();
       await this.recoverExpired(now);
-      const job = await this.claim(now);
+      await this.retireOutdatedQueued(now, options);
+      const job = await this.claim(now, options);
       if (!job) return;
       if (job.model !== options.model || job.modelSha256 !== options.modelSha256 || job.promptVersion !== CRM_CONTROL_LOCAL_PROMPT_VERSION
         || job.analyzerVersion !== CRM_CONTROL_ANALYZER_VERSION) {

@@ -3,6 +3,7 @@ import { lstat, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promi
 import path from 'node:path';
 import { CRM_CONTROL_SEMANTIC_FACTS, CrmControlSemanticRequest, CrmControlSemanticResponse,
   CrmControlSemanticValidation, crmControlSemanticInstructionRisk, validateCrmControlSemanticResponse } from './crm-control-semantic.validation';
+import { crmControlSemanticInputHash } from './crm-control-semantic.identity';
 
 export const CRM_CONTROL_LOCAL_PROMPT_VERSION = '4';
 const MAX_RESPONSE_BYTES = 64 * 1024;
@@ -127,15 +128,15 @@ export class CrmControlLocalSemanticClient {
       if (!HASH.test(this.options.modelSha256) || !this.options.model || !path.isAbsolute(this.options.cacheDirectory)) throw new Error();
     } catch { return { status: 'ERROR', code: 'LOCAL_AI_NOT_CONFIGURED', retryable: false }; }
     const prepared = prompt(input);
-    if (prepared.content.length > MAX_INPUT_CHARACTERS || input.sources.length > 24 || !input.sources.length
-      || input.check === 'task_action' && (input.sources.length !== 1 || input.sources[0].text.length > 2000)) {
+    if (prepared.content.length > MAX_INPUT_CHARACTERS || input.sources.length > 24
+      || input.check === 'task_action' && input.sources.length > 0 && (input.sources.length !== 1 || input.sources[0].text.length > 2000)) {
       return { status: 'ERROR', code: 'LOCAL_AI_INPUT_LIMIT', retryable: false };
     }
-    const identity = JSON.stringify({ promptVersion: CRM_CONTROL_LOCAL_PROMPT_VERSION,
-      model: this.options.model, modelSha256: this.options.modelSha256, input });
-    const inputHash = createHash('sha256').update(identity).digest('hex');
+    const inputHash = crmControlSemanticInputHash(input, { promptVersion: CRM_CONTROL_LOCAL_PROMPT_VERSION,
+      model: this.options.model, modelSha256: this.options.modelSha256 });
     // Explicit instructions embedded in CRM data cannot be promoted by a model or an older cached answer.
-    if (crmControlSemanticInstructionRisk(input.stageName) || input.sources.some(source => crmControlSemanticInstructionRisk(source.text))) {
+    // No text also stays UNKNOWN: an empty filtered set is not proof that a required note never existed.
+    if (!input.sources.length || crmControlSemanticInstructionRisk(input.stageName) || input.sources.some(source => crmControlSemanticInstructionRisk(source.text))) {
       const response: CrmControlSemanticResponse = { schemaVersion: 1, requestId: input.requestId, check: input.check,
         subjectId: input.subjectId, inspectedSourceIds: input.sources.map(source => source.id),
         findings: CRM_CONTROL_SEMANTIC_FACTS[input.check].map(fact => ({ fact, state: 'uncertain', evidence: [] })) };

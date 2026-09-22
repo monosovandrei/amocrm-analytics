@@ -1,4 +1,4 @@
-import { BrowserHistoryError, observeCrmBrowserHistory, parseBrowserMailPage, parseBrowserMailThread,
+import { BrowserHistoryError, createCrmBrowserHistoryReader, observeCrmBrowserHistory, parseBrowserMailPage, parseBrowserMailThread,
   parseBrowserTimelinePage, validateBrowserTimelineUrl } from './crm-control-browser-history';
 
 const origin = 'https://test-account.amocrm.ru';
@@ -100,6 +100,52 @@ function harness(payloads: unknown[], options: { account?: string; card?: string
 }
 
 describe('browser history bounded collector', () => {
+  it('direct requests and native discovery produce the same bound history and attachment metadata', async () => {
+    const prev = `${timelineUrl}/?limit=100&filter%5Bcreated_at%5D%5Blt%5D=1789998000`;
+    const payloads = [timeline([event()], { prev }), timeline([event({ id: 'related', element_type: 1, element_id: 456 })]),
+      { id: 7, entity: { type: 'contact', id: 456 } }, mailPage({ items: [mailMessage({ attachments: [attachment()] })] })];
+    const native = harness(payloads), direct = harness(payloads);
+    const reader = createCrmBrowserHistoryReader(direct.page.context() as any, { origin, dealExternalId: '123', mailAccountId: '42' });
+    const [left, right] = await Promise.all([native.observer.collect(), reader.collect()]);
+    expect(right.entries).toEqual(left.entries);
+    expect(right.threads).toEqual(left.threads);
+    expect(right.reasonCodes).toEqual(left.reasonCodes);
+    expect(right.timelineServerReportedEnd).toBe(true);
+    expect(direct.get.mock.calls[0][0]).toBe(timelineUrl);
+    expect(right.entries.map(item => item.binding)).toEqual(['DEAL', 'RELATED_ENTITY']);
+    reader.dispose(); native.observer.dispose(); direct.observer.dispose();
+  });
+
+  it('does not accept an initial timeline for another deal/account or a nonnumeric mailbox account', () => {
+    const context = { request: { get: jest.fn() } } as any;
+    expect(() => createCrmBrowserHistoryReader(context, { origin, dealExternalId: '123', mailAccountId: '42',
+      initialTimelineUrl: `${origin}/ajax/v3/leads/999/events_timeline` })).toThrow('TIMELINE_LINK_INVALID');
+    expect(() => createCrmBrowserHistoryReader(context, { origin, dealExternalId: '123', mailAccountId: '42/other' })).toThrow('MAIL_ACCOUNT_UNVERIFIED');
+    expect(context.request.get).not.toHaveBeenCalled();
+  });
+
+  it('a direct401 aborts immediately for a full-reader retry;403 stays a per-deal permission failure', async () => {
+    for (const status of [401, 403]) {
+      const dispose = jest.fn(), get = jest.fn().mockResolvedValue({ status: () => status, dispose });
+      const reader = createCrmBrowserHistoryReader({ request: { get } } as any, { origin, dealExternalId: '123', mailAccountId: '42' });
+      if (status === 401) await expect(reader.collect()).rejects.toThrow('HISTORY_AUTH_EXPIRED');
+      else expect((await reader.collect()).reasonCodes).toContain('HISTORY_ACCESS_DENIED');
+      expect(get).toHaveBeenCalledTimes(1); expect(dispose).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it('direct readers retain the exact attachment allowlist and propagate preparation401', async () => {
+    const fixture = harness([timeline(), { id: 7 }, mailPage({ items: [mailMessage({ attachments: [attachment()] })] }), { status: 'not_downloaded' }]);
+    const reader = createCrmBrowserHistoryReader(fixture.page.context() as any, { origin, dealExternalId: '123', mailAccountId: '42' });
+    await reader.collect();
+    await expect(reader.prepareAttachment({ threadId: '7', messageId: '999', attachmentId: '91' }, new AbortController().signal)).rejects.toThrow('MAIL_ATTACHMENT_NOT_OBSERVED');
+    fixture.post.mockResolvedValueOnce({ status: () => 401, dispose: jest.fn() });
+    await expect(reader.prepareAttachment({ threadId: '7', messageId: '8', attachmentId: '91' }, new AbortController().signal)).rejects.toThrow('HISTORY_AUTH_EXPIRED');
+    expect(fixture.post).toHaveBeenCalledTimes(1);
+    reader.dispose();
+    await expect(reader.collect()).rejects.toThrow('HISTORY_READER_DISPOSED');
+  });
+
   it('reads only observed account paths and certifies only a concrete complete mail message list', async () => {
     const { observer, get } = harness([timeline(), { id: 7, entity: { type: 'lead', id: 123 } }, mailPage()]);
     const output = await observer.collect();
