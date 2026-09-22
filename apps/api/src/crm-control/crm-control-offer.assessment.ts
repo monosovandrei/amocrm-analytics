@@ -17,6 +17,7 @@ export interface CrmControlArchivedOfferCandidate {
   classification: CrmControlOfferSelection['classification']; selectionStatus: CrmControlOfferSelection['status']; issues: string[];
   amount: { decimal: string; currency: string; evidence: CrmControlOfferCitation[] } | null;
   headingEvidence: CrmControlOfferCitation[];
+  nonOffer?: CrmControlOfferSelection['nonOffer'];
 }
 export interface CrmControlArchivedOfferAssessment {
   validation: CrmControlOfferValidation;
@@ -257,6 +258,7 @@ export async function assessArchivedOffer(input: CrmControlArchivedOfferInput,
     inspectedDocuments: Math.min(reads, 32), candidates: candidates.map(candidate => ({ status: 'CANDIDATE_ONLY', source: candidate.source,
       sourceId: candidate.sourceId, sentAt: candidate.sentAt, artifactSha256: candidate.artifactSha256,
       classification: candidate.selection.classification, selectionStatus: candidate.selection.status, issues: candidate.selection.issues,
+      ...(candidate.selection.nonOffer ? { nonOffer: candidate.selection.nonOffer } : {}),
       headingEvidence: candidate.selection.headingEvidence.slice(0, 1), amount: candidate.selection.amount ? {
         decimal: candidate.selection.amount.decimal, currency: candidate.selection.amount.currency,
         evidence: [candidate.selection.amount.amountCitation, candidate.selection.amount.currencyCitation] } : null })) } };

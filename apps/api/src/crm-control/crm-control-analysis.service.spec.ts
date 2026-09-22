@@ -134,6 +134,29 @@ describe('persistent local semantic analysis queue', () => {
     expect(f.db.crmControlResult.findUnique).not.toHaveBeenCalled();
     expect(f.db.crmControlAnalysisJob.findFirst).not.toHaveBeenCalled();
   });
+  it('hydrates only the server-selected immutable private archive and rejects caller-supplied mail', async () => {
+    const f = fixture(), result = f.state.results[0], observation = result.observation as any;
+    const start = '2026-09-22T18:00:00.000Z', finish = '2026-09-22T18:01:00.000Z';
+    Object.assign(result, { ruleCode: 'stage_duration', subjectId: '', details: { maximumDueAt: '2026-09-22T12:00:00Z' } });
+    observation.dealExternalId = '100';
+    observation.snapshot.notes = [];
+    Object.assign(observation.snapshot.deal, { id: 'amo:100', responsibleId: 'manager-1' });
+    Object.assign(observation.snapshot.deal.raw, { id: 100, account_id: 42, _embedded: { contacts: [{ id: 55 }] } });
+    observation.snapshot.browserSources = { connectionId: 'connection-1', accountExternalId: '42', startedAt: start, finishedAt: finish,
+      manifest: { storageKey: 'a'.repeat(64) + '.browser-history.json', sha256: 'a'.repeat(64), size: 1000 } };
+    const manifest = { connectionId: 'connection-1', accountExternalId: '42', dealExternalId: '100', startedAt: start, finishedAt: finish,
+      history: { dealExternalId: '100', entries: [], threads: [{ id: '11', binding: 'DEAL', messages: [{ id: '22', sent: false,
+        occurredAt: start, content: 'Да, перенесём на 25.09.2026.', participants: { from: [{ type: 'contact', id: '55' }], reasonCodes: [] } }] }] } };
+    const reader = { readManifest: jest.fn().mockResolvedValue(manifest) };
+    f.db.amoConnection = { findUnique: jest.fn().mockResolvedValue({ id: 'connection-1', accountId: '42' }) };
+    const service = new CrmControlAnalysisService(f.db, reader as any);
+    const request = buildCrmControlSemanticRequest(observation, result)!;
+    await service.enqueue(result.id, SNAPSHOT_HASH, request);
+    expect(reader.readManifest).toHaveBeenCalledWith(observation.snapshot.browserSources.manifest, '100');
+    expect(f.state.jobs[0].request.sources).toEqual([expect.objectContaining({ id: 'mail:11:22', actor: 'customer' })]);
+    expect(f.state.jobs[0].request.coverage.communications).toBe(false);
+    await expect(service.enqueue(result.id, SNAPSHOT_HASH, { ...request, sources: f.state.jobs[0].request.sources })).rejects.toThrow('сохранённым данным');
+  });
 
   it.each(['dealId', 'ownerId', 'subjectId', 'observedAt', 'stageName', 'stageEnteredAt', 'check', 'timeZone', 'taskDueAt', 'maxDueAt'] as const)('rejects mismatched archived %s', key => {
     const f = fixture();
@@ -201,18 +224,45 @@ describe('persistent local semantic analysis queue', () => {
     expect(f.state.attempts[0].validation.issues).toContainEqual({ code: 'INCOMPLETE_TASKS' });
   });
 
-  it('finishes an empty-source REVIEW as UNKNOWN with a concrete reason, without calling the model', async () => {
+  it.each([true, false])('preserves raw REVIEW and evaluates complete empty notes without a model (complete=%s)', async complete => {
     const f = fixture(), result = f.state.results[0];
     Object.assign(result, { ruleCode: 'proposal_note', subjectId: '' });
     Object.assign(result.observation.snapshot, { notes: [], tasks: [] });
+    result.observation.snapshot.sourceCompleteness.notes = complete;
     Object.assign(f.request, buildCrmControlSemanticRequest(result.observation, result));
     const send = jest.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('unexpected model call'));
     await f.enqueue(); await f.service.processQueue();
     expect(send).not.toHaveBeenCalled();
-    expect(f.state.jobs[0]).toMatchObject({ status: 'UNKNOWN', errorCode: null, assessmentStatus: 'UNKNOWN',
-      assessmentMessage: expect.stringContaining('нет текстовых источников') });
-    expect(f.state.attempts[0]).toMatchObject({ status: 'UNKNOWN', rawResponse: { status: 'READY',
-      inputHash: f.state.jobs[0].inputHash, validation: { status: 'UNKNOWN' } } });
+    expect(f.state.jobs[0]).toMatchObject({ status: complete ? 'READY' : 'UNKNOWN', errorCode: null, assessmentStatus: complete ? 'FAIL' : 'UNKNOWN',
+      assessmentMessage: expect.stringContaining(complete ? 'нет причины переноса' : 'нет текстовых источников') });
+    expect(f.state.attempts[0]).toMatchObject({ status: complete ? 'READY' : 'UNKNOWN', rawResponse: { status: 'READY',
+      inputHash: f.state.jobs[0].inputHash, validation: { status: complete ? 'VALIDATED' : 'UNKNOWN' } } });
+    expect(result.status).toBe('REVIEW');
+  });
+  it.each([true, false])('projects decisive missing manager note only with complete notes (%s)', async complete => {
+    const f = fixture(), result = f.state.results[0];
+    Object.assign(result, { ruleCode: 'stage_duration', subjectId: '', details: { maximumDueAt: '2026-09-22T15:00:00Z' } });
+    Object.assign(result.observation.snapshot, { notes: [], tasks: [] });
+    result.observation.snapshot.sourceCompleteness.notes = complete;
+    Object.assign(f.request, buildCrmControlSemanticRequest(result.observation, result));
+    const send = jest.spyOn(globalThis, 'fetch').mockRejectedValue(Error('unexpected model call'));
+    await f.enqueue(); await f.service.processQueue();
+    expect(send).not.toHaveBeenCalled();
+    expect(f.state.jobs[0]).toMatchObject({ status: complete ? 'READY' : 'UNKNOWN', assessmentStatus: complete ? 'FAIL' : 'UNKNOWN', errorCode: null });
+    expect(f.state.attempts[0]).toMatchObject({ status: complete ? 'READY' : 'UNKNOWN', validation: { status: 'UNKNOWN' } });
+    expect(result.status).toBe('REVIEW');
+  });
+  it.each([
+    ['2026-09-20T10:00:00Z', 'FAIL'], [null, 'UNKNOWN'], ['2026-09-23T10:00:00Z', 'UNKNOWN'],
+  ])('resolves the current stage empty window without masking an uncertain note date: %s', async (createdAt, expected) => {
+    const f = fixture(), result = f.state.results[0];
+    Object.assign(result, { ruleCode: 'proposal_note', subjectId: '' });
+    Object.assign(result.observation.snapshot, { notes: [{ id: 'note-1', type: 'common', text: 'Презентация позже', createdAt,
+      raw: { created_by: 'crm-manager-1' } }] });
+    Object.assign(f.request, buildCrmControlSemanticRequest(result.observation, result));
+    const send = jest.spyOn(globalThis, 'fetch').mockRejectedValue(Error('unexpected model call'));
+    await f.enqueue(); await f.service.processQueue();
+    expect(send).not.toHaveBeenCalled(); expect(f.state.jobs[0].assessmentStatus).toBe(expected);
     expect(result.status).toBe('REVIEW');
   });
 

@@ -71,6 +71,7 @@ export interface ControlRun {
   sourceSyncAt: string | null;
   error: string | null;
   counts: ControlCounts;
+  scope?: { kind: 'ALL' | 'MANAGER' | 'GROUP'; label: string; managerId?: string; managerName?: string; groupId?: string };
   completion?: {
     status: 'CHECKED' | 'UNCHECKED';
     remainingResults: number;

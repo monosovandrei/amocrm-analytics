@@ -3,6 +3,7 @@ import { CrmControlSemanticRequest, CrmControlSemanticSource, crmControlSemantic
 
 export interface CrmControlSemanticObservation {
   id: string; dealId: string; managerId: string | null; observedAt: Date; stageName: string;
+  dealExternalId?: string;
   snapshot: unknown; snapshotHash: string; run: { config: unknown };
 }
 export interface CrmControlSemanticRule {
@@ -47,8 +48,9 @@ export function buildCrmControlSemanticRequest(observation: CrmControlSemanticOb
     if (!stageEnteredAt) return null;
     const withinWindow = (date: string | null) => !!date && date >= stageEnteredAt && date <= observedAt;
     for (const note of Array.isArray(snapshot.notes) ? snapshot.notes : []) {
-      if (note.type === 'common' && typeof note.text === 'string' && note.text.trim() && !iso(note.createdAt)) notesDated = false;
-      if (note.type !== 'common' || typeof note.text !== 'string' || !note.text.trim() || !withinWindow(iso(note.createdAt))) continue;
+      const createdAt = iso(note.createdAt);
+      if (note.type === 'common' && typeof note.text === 'string' && note.text.trim() && (!createdAt || createdAt > observedAt)) notesDated = false;
+      if (note.type !== 'common' || typeof note.text !== 'string' || !note.text.trim() || !withinWindow(createdAt)) continue;
       const author = note.raw?.created_by == null ? null : String(note.raw.created_by);
       sources.push(make(`note:${note.externalId || note.id}`, note.text, 'manager_note', iso(note.createdAt),
         author && author === responsibleExternalId ? 'manager' : 'unknown', author, 'internal'));
@@ -57,8 +59,9 @@ export function buildCrmControlSemanticRequest(observation: CrmControlSemanticOb
       const contacts = new Set((snapshot.deal?.raw?._embedded?.contacts ?? []).map((item: any) => String(item.id)));
       for (const entry of snapshot.communicationSources?.messages ?? []) {
         const message = entry.message;
-        if (message && typeof message.text === 'string' && message.text.trim() && !iso(message.occurredAt)) communicationsDated = false;
-        if (!message?.messageId || typeof message.text !== 'string' || !message.text.trim() || !withinWindow(iso(message.occurredAt))) continue;
+        const occurredAt = iso(message?.occurredAt);
+        if (message && typeof message.text === 'string' && message.text.trim() && (!occurredAt || occurredAt > observedAt)) communicationsDated = false;
+        if (!message?.messageId || typeof message.text !== 'string' || !message.text.trim() || !withinWindow(occurredAt)) continue;
         // An arbitrary external participant is not certified as this customer's speaker.
         const customer = message.direction === 'incoming' && message.actorKind === 'external'
           && message.authorId && message.contactId && contacts.has(String(message.contactId));

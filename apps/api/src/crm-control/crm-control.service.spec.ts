@@ -237,6 +237,84 @@ describe('CRM archived offer persistence', () => {
 });
 
 describe('CRM control source coverage, access and scheduling', () => {
+  function selectedRunFixture(businessRole = 'OWNER') {
+    const config = { ...DEFAULT_CRM_CONTROL_CONFIG, enabled: true, scopes: [{ department: 'sales', pipelineId: 'pipeline' }] };
+    const saved: any[] = [];
+    const prisma = {
+      user: { findUnique: jest.fn().mockResolvedValue({ id: actor.id, name: 'Инициатор', isActive: true, businessRole,
+        crmUserId: 'self', crmUser: { groupId: 'group' } }) },
+      crmUser: { findUnique: jest.fn().mockResolvedValue({ id: 'selected', externalId: '300', name: 'Выбранный менеджер', isActive: true, groupId: 'group' }) },
+      crmControlSettings: { findUnique: jest.fn().mockResolvedValue({ version: 7, config }) },
+      crmControlRun: { upsert: jest.fn(async ({ where, create }) => {
+        const existing = saved.find(run => run.requestKey === where.requestKey);
+        if (existing) return existing;
+        const run = { id: `run-${saved.length}`, ...create }; saved.push(run); return run;
+      }) },
+    };
+    const service = new CrmControlService(prisma as any, {} as any, {} as any);
+    return { service, prisma, config, saved };
+  }
+
+  it('freezes a manager selection separately from owner access without changing global settings or scheduling', async () => {
+    const f = selectedRunFixture(), before = structuredClone(f.config);
+    const run = await f.service.enqueue(actor, { managerId: 'selected', requestKey: 'pilot' });
+    expect(f.saved[0].config).toMatchObject({ _access: { role: 'OWNER', actorId: actor.id }, _selection: {
+      kind: 'MANAGER', managerId: 'selected', managerExternalId: '300', managerName: 'Выбранный менеджер' } });
+    expect(run.scope).toEqual({ kind: 'MANAGER', managerId: 'selected', managerName: 'Выбранный менеджер', label: 'Менеджер: Выбранный менеджер' });
+    expect(f.config).toEqual(before);
+    await f.service.schedule(observedAt);
+    expect(f.saved[1].config).toEqual(before);
+    expect(f.saved[1].config._selection).toBeUndefined();
+  });
+
+  it.each(['MANAGER', 'ROP'])('does not let a legacy ADMIN token select a manager when the current business role is %s', async role => {
+    const f = selectedRunFixture(role);
+    await expect(f.service.enqueue(actor, { managerId: 'selected' })).rejects.toMatchObject({ status: 403 });
+    expect(f.prisma.crmUser.findUnique).not.toHaveBeenCalled(); expect(f.saved).toHaveLength(0);
+  });
+
+  it.each([null, { id: 'selected', externalId: '300', isActive: false }, { id: 'selected', externalId: 'not-an-amo-id', isActive: true }])('rejects unavailable or invalid amoCRM managers: %j', async manager => {
+    const f = selectedRunFixture(); f.prisma.crmUser.findUnique.mockResolvedValue(manager);
+    await expect(f.service.enqueue(actor, { managerId: 'selected' })).rejects.toMatchObject({ status: 400 });
+    expect(f.saved).toHaveLength(0);
+  });
+
+  it.each(['', '  ', ' selected ', null, 123, ['selected']])('rejects malformed manager selection: %j', async managerId => {
+    const f = selectedRunFixture();
+    await expect(f.service.enqueue(actor, { managerId } as any)).rejects.toMatchObject({ status: 400 });
+    expect(f.saved).toHaveLength(0);
+  });
+
+  it('keeps an idempotent request in the same scope and refuses reuse for a different scope', async () => {
+    const f = selectedRunFixture();
+    const first = await f.service.enqueue(actor, { managerId: 'selected', requestKey: 'same-key' });
+    expect((await f.service.enqueue(actor, { managerId: 'selected', requestKey: 'same-key' })).id).toBe(first.id);
+    await expect(f.service.enqueue(actor, { requestKey: 'same-key' })).rejects.toMatchObject({ status: 409 });
+    expect(f.saved).toHaveLength(1); expect(f.saved[0].config._selection.managerId).toBe('selected');
+  });
+
+  it('preserves a selected manager on recheck, revalidates active membership and checks source access first', async () => {
+    const f = selectedRunFixture();
+    const read = jest.spyOn(f.service, 'run').mockResolvedValue({ run: { scope: { kind: 'MANAGER', managerId: 'selected' } } } as any);
+    expect((await f.service.enqueue(actor, { sourceRunId: 'source' })).scope).toMatchObject({ kind: 'MANAGER', managerId: 'selected' });
+    expect(read).toHaveBeenCalledWith(actor, 'source');
+    f.prisma.crmUser.findUnique.mockResolvedValue({ id: 'selected', externalId: '300', isActive: false } as any);
+    await expect(f.service.enqueue(actor, { sourceRunId: 'source' })).rejects.toMatchObject({ status: 400 });
+    read.mockRejectedValueOnce(new Error('source inaccessible'));
+    f.prisma.crmUser.findUnique.mockClear();
+    await expect(f.service.enqueue(actor, { sourceRunId: 'foreign' })).rejects.toThrow('source inaccessible');
+    expect(f.prisma.crmUser.findUnique).not.toHaveBeenCalled(); expect(f.saved).toHaveLength(1);
+    read.mockRestore();
+  });
+
+  it('does not inherit a manager outside the current ROP group on a historical recheck', async () => {
+    const f = selectedRunFixture('ROP');
+    const read = jest.spyOn(f.service, 'run').mockResolvedValue({ run: { scope: { kind: 'MANAGER', managerId: 'selected' } } } as any);
+    f.prisma.crmUser.findUnique.mockResolvedValue({ id: 'selected', externalId: '300', name: 'Другой менеджер', isActive: true, groupId: 'other' });
+    await expect(f.service.enqueue(actor, { sourceRunId: 'historically-visible' })).rejects.toMatchObject({ status: 403 });
+    expect(f.saved).toHaveLength(0); read.mockRestore();
+  });
+
   it('uses the current business role from the database, not a legacy ADMIN role', async () => {
     const prisma = { user: { findUnique: jest.fn().mockResolvedValue({ id: actor.id, name: 'Менеджер', isActive: true,
       businessRole: 'MANAGER', crmUserId: 'manager', crmUser: { groupId: 'group' } }) } };
@@ -458,7 +536,7 @@ describe('CRM control direct source reads', () => {
       }),
     };
     const prisma = { pipeline: { findMany: jest.fn().mockResolvedValue([pipeline]) },
-      crmUser: { findMany: jest.fn().mockResolvedValue([{ id: 'manager', externalId: '300', name: 'Менеджер', groupId: 'group', group: { name: 'ОПНК' } }]) },
+      crmUser: { findMany: jest.fn().mockResolvedValue([{ id: 'manager', externalId: '300', name: 'Менеджер', isActive: true, groupId: 'group', group: { name: 'ОПНК' } }]) },
       crmControlRun: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
       crmControlObservation: { findMany: jest.fn().mockResolvedValue([]) },
       crmControlCase: { findMany: jest.fn().mockResolvedValue([]) },
@@ -487,6 +565,53 @@ describe('CRM control direct source reads', () => {
       sentAttachments: [{ messageId: 'message-1', sentAt: new Date().toISOString(), name: 'test-proposal.pdf',
         artifact: { sha256: 'a'.repeat(64), size: 100, storageKey: `${'a'.repeat(64)}.bin`, contentType: 'application/pdf', capturedAt: new Date().toISOString() } }] };
   }
+
+  function selectManager(fixture: ReturnType<typeof sourceFixture>) {
+    Object.assign(fixture.run.config, { _selection: { kind: 'MANAGER', managerId: 'manager', managerExternalId: '300', managerName: 'Менеджер' } });
+  }
+
+  it('filters a selected manager before costly source reads even if the source list includes other managers', async () => {
+    const f = sourceFixture(3); selectManager(f);
+    f.leads[1].responsible_user_id = 999;
+    await (f.service as any).executeRun(f.run);
+    expect(f.client.get).not.toHaveBeenCalledWith('/leads/2');
+    expect(f.persist.mock.calls.map((call: any[]) => call[1].deal.externalId)).toEqual(['1', '3']);
+    expect(f.client.paginate).toHaveBeenCalledTimes(6);
+  });
+
+  it.each(['initial', 'final'])('does not include a selected deal reassigned during its %s read', async phase => {
+    const f = sourceFixture(); selectManager(f);
+    if (phase === 'final') f.readLead.mockResolvedValueOnce(f.leads[0]);
+    f.readLead.mockResolvedValue({ ...f.leads[0], responsible_user_id: 999 });
+    await (f.service as any).executeRun(f.run);
+    expect(f.persist).not.toHaveBeenCalled();
+    expect(f.client.paginate).toHaveBeenCalledTimes(phase === 'initial' ? 0 : 3);
+  });
+
+  it('rejects a queued manager selection that became inactive before execution', async () => {
+    const f = sourceFixture(); selectManager(f);
+    f.prisma.crmUser.findMany.mockResolvedValue([{ id: 'manager', externalId: '300', name: 'Менеджер', isActive: false, groupId: 'group', group: { name: 'ОПНК' } }]);
+    await expect((f.service as any).executeRun(f.run)).rejects.toThrow('больше не активен');
+    expect(f.client.paginateBatch).not.toHaveBeenCalled(); expect(f.persist).not.toHaveBeenCalled();
+  });
+
+  it.each(['foreign-prior', 'changed-owner', 'selected'])('limits historical-case reconciliation to the selection: %s', async scenario => {
+    const f = sourceFixture(0); selectManager(f);
+    const active = { id: 'case', dealId: 'amo:99', ruleCode: 'task_count', subjectId: '', latestObservationId: 'prior' };
+    f.prisma.crmControlCase.findMany.mockResolvedValueOnce([active] as never).mockResolvedValueOnce([active] as never).mockResolvedValue([]);
+    (f.prisma.crmControlObservation as any).findUnique = jest.fn().mockResolvedValue({ id: 'prior', dealId: 'amo:99', dealExternalId: '99', pipelineId: 'pipeline',
+      pipelineName: 'Продажи', stageId: 'stage', stageName: 'В работе', dealTitle: 'Тестовая сделка',
+      managerId: scenario === 'foreign-prior' ? 'other' : 'manager', managerName: 'Менеджер', groupId: 'group', groupName: 'ОПНК',
+      dealUrl: 'https://example.amocrm.ru/leads/detail/99' });
+    f.readLead.mockResolvedValue({ id: 99, pipeline_id: 100, status_id: 201,
+      responsible_user_id: scenario === 'changed-owner' ? 999 : 300, created_at: 1700000000, price: 450 });
+    await (f.service as any).executeRun(f.run);
+    if (scenario === 'selected') {
+      expect(f.persist).toHaveBeenCalledTimes(1);
+      expect((f.persist.mock.calls[0][1] as CrmControlRuleInput).deal.responsibleId).toBe('manager');
+    } else expect(f.persist).not.toHaveBeenCalled();
+    expect(f.readLead).toHaveBeenCalledTimes(scenario === 'foreign-prior' ? 0 : 1);
+  });
 
   it('aggregates returned persisted counts for normal source observations', async () => {
     const fixture = sourceFixture();

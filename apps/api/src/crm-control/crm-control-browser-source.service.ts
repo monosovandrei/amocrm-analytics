@@ -7,6 +7,10 @@ import { BrowserHistoryError, CrmBrowserHistory, createCrmBrowserHistoryReader }
 import { archiveMailAttachment, downloadMailAttachment } from './crm-control-browser-files';
 import { CrmControlDocumentArtifact } from './crm-control-proposal-sources';
 import { readCrmControlPrivateArtifact } from './crm-control-document-evidence';
+import { CrmChatHistory, collectCrmChatHistory } from './crm-control-chat-history';
+import { readEmptyCrmChatHistory } from './crm-control-chat-empty';
+import { createCrmControlChatNative, CrmChatNativeAccountMetadata } from './crm-control-chat-native';
+import { CrmControlChatExternalContact, CrmControlNormalizedChatMessage, normalizeCrmControlChatMessage } from './crm-control-chat-message';
 
 export interface CrmBrowserDocumentSource {
   messageId: string; threadId: string; attachmentId: string; sentAt: string; metadataHash: string;
@@ -19,14 +23,21 @@ export interface CrmBrowserAccountCurrency {
 }
 export interface CrmBrowserSourceBundle {
   schemaVersion: 1; dealExternalId: string; startedAt: string; finishedAt: string;
+  connectionId?: string; accountExternalId?: string;
   manifest?: { storageKey: string; sha256: string; size: number };
   documents: CrmBrowserDocumentSource[]; communicationsComplete: false; reasonCodes: string[];
   accountCurrency?: CrmBrowserAccountCurrency;
+  chatCoverage?: { readComplete: boolean; chats: number; messages: number; boundMessages: number; reasonCodes: string[] };
 }
 export interface CrmBrowserPrivateManifest {
   schemaVersion: 1; kind: 'crm-browser-history'; dealExternalId: string; startedAt: string; finishedAt: string;
+  connectionId?: string; accountExternalId?: string;
   history: CrmBrowserHistory; documents: CrmBrowserDocumentSource[];
   accountCurrency?: CrmBrowserAccountCurrency;
+  chatHistory?: CrmChatHistory;
+  chatAccount?: CrmChatNativeAccountMetadata;
+  chatExternalContacts?: CrmControlChatExternalContact[];
+  chatMessages?: CrmControlNormalizedChatMessage[];
 }
 export interface CrmBrowserSourceBatch {
   collectCurrent(job: CrmSourceCardJob, options?: { collectAttachments?: boolean }): Promise<CrmBrowserSourceBundle>;
@@ -61,8 +72,12 @@ export class CrmControlBrowserSourceService {
   private async collect(browser: CrmSourceBrowserBatch, job: CrmSourceCardJob, archiveCache: Map<string, CrmControlDocumentArtifact>, collectAttachments: boolean): Promise<CrmBrowserSourceBundle> {
     const startedAt = new Date().toISOString();
     const base: CrmBrowserSourceBundle = { schemaVersion: 1, dealExternalId: job.dealExternalId, startedAt,
+      ...(job.connectionId && job.accountExternalId ? { connectionId: job.connectionId, accountExternalId: job.accountExternalId } : {}),
       finishedAt: startedAt, documents: [], communicationsComplete: false, reasonCodes: [] };
     const read = await browser.readSources(job, access => {
+      if (job.accountExternalId && access.accountExternalId !== job.accountExternalId) {
+        throw new BrowserHistoryError('HISTORY_ACCOUNT_CONFLICT');
+      }
       const observer = createCrmBrowserHistoryReader(access.context, { origin: access.origin,
         dealExternalId: job.dealExternalId, mailAccountId: access.mailAccountId });
       return { dispose: observer.dispose, collect: async () => {
@@ -107,12 +122,63 @@ export class CrmControlBrowserSourceService {
         }
         const finishedAt = new Date().toISOString();
         const manifest: CrmBrowserPrivateManifest = { schemaVersion: 1, kind: 'crm-browser-history', dealExternalId: job.dealExternalId,
+          ...(job.connectionId && job.accountExternalId ? { connectionId: job.connectionId, accountExternalId: job.accountExternalId } : {}),
           startedAt, finishedAt, history, documents, accountCurrency };
-        return { ...base, finishedAt, manifest: await this.storeManifest(manifest), documents, accountCurrency, reasonCodes: [...reasons] };
+        const chatAccountVerified = Boolean(job.connectionId && job.accountExternalId && access.accountExternalId === job.accountExternalId);
+        if (chatAccountVerified) {
+          try { manifest.chatHistory = await readEmptyCrmChatHistory(access.context, { origin: access.origin,
+            connectionId: job.connectionId!, accountExternalId: job.accountExternalId!, dealExternalId: job.dealExternalId }) ?? undefined; }
+          catch (error) { if (error instanceof CrmSourceAuthExpiredError) throw error; }
+        }
+        return { manifest, chatAccountVerified, reasons: [...reasons] };
       } };
     });
-    if (read.ok) return read.value;
-    return { ...base, finishedAt: new Date().toISOString(), reasonCodes: [read.errorCode] };
+    if (!read.ok) return { ...base, finishedAt: new Date().toISOString(), reasonCodes: [read.errorCode] };
+    const { manifest, chatAccountVerified } = read.value;
+    const reasons = new Set(read.value.reasons), chatReasons = new Set<string>();
+    if (chatAccountVerified && !manifest.chatHistory) {
+      const chatRead = await browser.readCard(job, page => ({ dispose: () => undefined, collect: async () => {
+        const scope = { origin: new URL(job.sourceUrl).origin, connectionId: job.connectionId!,
+          accountExternalId: job.accountExternalId!, dealExternalId: job.dealExternalId };
+        const native = await createCrmControlChatNative(page, scope);
+        const chatHistory = await collectCrmChatHistory({ ...scope, transport: native.transport });
+        let externalContacts: CrmControlChatExternalContact[] = [];
+        const reasonCodes: string[] = [];
+        try { externalContacts = await native.readNativeExternalTargets(chatHistory.chats.map(chat => chat.chatId)); }
+        catch (error) {
+          if (error instanceof CrmSourceAuthExpiredError) throw error;
+          reasonCodes.push('CHAT_ACTORS_UNAVAILABLE');
+        }
+        return { chatHistory, accountMetadata: native.accountMetadata, externalContacts, reasonCodes };
+      } }));
+      if (chatRead.ok) {
+        manifest.chatHistory = chatRead.value.chatHistory;
+        manifest.chatAccount = chatRead.value.accountMetadata;
+        manifest.chatExternalContacts = chatRead.value.externalContacts;
+        chatRead.value.reasonCodes.forEach(reason => chatReasons.add(reason));
+        manifest.chatMessages = [];
+        for (const chat of manifest.chatHistory.chats) for (const entry of chat.messages) {
+          if (entry.binding.status !== 'BOUND') {
+            if (entry.binding.status === 'UNVERIFIED') entry.binding.reasonCodes.forEach(reason => chatReasons.add(reason));
+            continue;
+          }
+          const normalized = normalizeCrmControlChatMessage({ value: entry.capture.value, binding: entry.binding,
+            accountUsers: manifest.chatAccount.accountUsers, accountUnknownActorIds: manifest.chatAccount.unresolvedAccountActorIds,
+            externalContact: manifest.chatExternalContacts.find(target => target.chatId === chat.chatId) });
+          if (normalized.message) manifest.chatMessages.push(normalized.message);
+          normalized.reasonCodes.forEach(reason => chatReasons.add(reason));
+        }
+      } else chatReasons.add(chatRead.errorCode);
+    } else if (!chatAccountVerified) chatReasons.add('CHAT_ACCOUNT_UNVERIFIED');
+    for (const reason of manifest.chatHistory?.reasonCodes ?? []) chatReasons.add(reason);
+    for (const chat of manifest.chatHistory?.chats ?? []) for (const reason of chat.reasonCodes) chatReasons.add(reason);
+    chatReasons.forEach(reason => reasons.add(reason));
+    manifest.finishedAt = new Date().toISOString();
+    return { ...base, finishedAt: manifest.finishedAt, manifest: await this.storeManifest(manifest),
+      documents: manifest.documents, accountCurrency: manifest.accountCurrency, reasonCodes: [...reasons],
+      chatCoverage: { readComplete: manifest.chatHistory?.readComplete === true, chats: manifest.chatHistory?.chats.length ?? 0,
+        messages: manifest.chatHistory?.chats.reduce((sum, chat) => sum + chat.messages.length, 0) ?? 0,
+        boundMessages: manifest.chatMessages?.length ?? 0, reasonCodes: [...chatReasons] } };
   }
 
   private directory() { return path.resolve(process.env.CRM_CONTROL_DOCUMENT_DIR

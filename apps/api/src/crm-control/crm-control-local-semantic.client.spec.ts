@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { CRM_CONTROL_LOCAL_PROMPT_VERSION, CrmControlLocalSemanticClient, localCrmAnalysisOrigin } from './crm-control-local-semantic.client';
 import { crmControlSemanticTextHash, CrmControlSemanticRequest } from './crm-control-semantic.validation';
+import { assessCrmControlSemantic } from './crm-control-semantic.policy';
 
 describe('local CRM semantic boundary', () => {
   let directory: string;
@@ -50,16 +51,109 @@ describe('local CRM semantic boundary', () => {
     expect(await new CrmControlLocalSemanticClient(options(), send).analyze(request)).toMatchObject({ status: 'ERROR', code: 'LOCAL_AI_INPUT_LIMIT', retryable: false });
     expect(send).not.toHaveBeenCalled();
   });
-  it.each([true, false])('keeps an empty archived source set UNKNOWN without a model call (notes complete: %s)', async complete => {
+  it.each([true, false])('checks an empty note set from its actual completeness without a model call (notes complete: %s)', async complete => {
     const request = input(); request.check = 'proposal_note'; request.subjectId = null; request.sources = [];
     request.coverage.notes = complete;
     const send = jest.fn();
     const result = await new CrmControlLocalSemanticClient(options(), send).analyze(request);
     expect(result).toMatchObject({ status: 'READY', inputHash: expect.stringMatching(/^[a-f0-9]{64}$/),
-      validation: { status: 'UNKNOWN' }, response: { inspectedSourceIds: [], findings: [
-        { fact: 'transfer_reason', state: 'uncertain', evidence: [] },
-        { fact: 'presentation_date', state: 'uncertain', evidence: [] },
+      validation: { status: complete ? 'VALIDATED' : 'UNKNOWN' }, response: { inspectedSourceIds: [], findings: [
+        { fact: 'transfer_reason', state: complete ? 'absent' : 'uncertain', evidence: [] },
+        { fact: 'presentation_date', state: complete ? 'absent' : 'uncertain', evidence: [] },
       ] } });
+    expect(send).not.toHaveBeenCalled();
+    if (result.status !== 'READY') throw Error('fixture');
+    expect(assessCrmControlSemantic(request, result.validation, 'proposal_note').status).toBe(complete ? 'FAIL' : 'UNKNOWN');
+  });
+  it.each([null, '2026-09-23T10:00:00Z'])('does not turn an empty set into failure with unknown/future stage entry: %s', async entered => {
+    const request = input(); Object.assign(request, { check: 'proposal_note', subjectId: null, sources: [], stageEnteredAt: entered });
+    const send = jest.fn(), result = await new CrmControlLocalSemanticClient(options(), send).analyze(request);
+    expect(result).toMatchObject({ status: 'READY', validation: { status: 'UNKNOWN' } });
+    expect(send).not.toHaveBeenCalled();
+    if (result.status !== 'READY') throw Error('fixture');
+    expect(assessCrmControlSemantic(request, result.validation, 'proposal_note').status).toBe('UNKNOWN');
+  });
+  it('does not infer task-text failure when the requested task has no source', async () => {
+    const request = input(); request.sources = [];
+    const send = jest.fn(), result = await new CrmControlLocalSemanticClient(options(), send).analyze(request);
+    expect(result).toMatchObject({ status: 'READY', validation: { status: 'UNKNOWN' } });
+    expect(send).not.toHaveBeenCalled();
+  });
+  it.each(['deadline_agreement','price_delay'] as const)('requires complete communications before asserting empty %s evidence is absent', async check => {
+    const request = input(); Object.assign(request, { check, subjectId: null, sources: [], maxDueAt: '2026-09-22T12:00:00Z' });
+    const send = jest.fn(), client = new CrmControlLocalSemanticClient(options(), send);
+    expect(await client.analyze(request)).toMatchObject({ status: 'READY', validation: { status: 'UNKNOWN' } });
+    request.coverage.communications = true;
+    const result = await client.analyze(request);
+    expect(result).toMatchObject({ status: 'READY', validation: { status: 'VALIDATED' } });
+    if (result.status !== 'READY') throw Error('fixture');
+    expect(assessCrmControlSemantic(request, result.validation, check === 'price_delay' ? 'price_requested_duration' : 'stage_duration').status).toBe('FAIL');
+    expect(send).not.toHaveBeenCalled();
+  });
+  it('rejects a missing required manager note without the model when communications are incomplete', async () => {
+    const request = input(); Object.assign(request, { check: 'deadline_agreement', subjectId: null, sources: [], maxDueAt: '2026-09-22T12:00:00Z' });
+    const send = jest.fn(), result = await new CrmControlLocalSemanticClient(options(), send).analyze(request);
+    expect(result).toMatchObject({ status: 'READY', validation: { status: 'UNKNOWN' }, response: { findings: [
+      { fact: 'manager_note', state: 'absent', evidence: [] },
+      { fact: 'customer_agreement', state: 'uncertain', evidence: [] },
+      { fact: 'agreed_deadline', state: 'uncertain', evidence: [] },
+    ] } });
+    if (result.status !== 'READY') throw Error('fixture');
+    expect(assessCrmControlSemantic(request, result.validation, 'stage_duration').status).toBe('FAIL');
+    expect(send).not.toHaveBeenCalled();
+    expect(await readdir(directory)).toEqual([]);
+  });
+  it('does not spend model context on a large customer message when the required manager note is provably absent', async () => {
+    const request = input(); Object.assign(request, { check: 'deadline_agreement', subjectId: null, maxDueAt: '2026-09-22T12:00:00Z' });
+    const source = request.sources[0]; Object.assign(source, { kind: 'customer_message', subjectId: null,
+      actor: 'customer', actorId: 'customer-1', direction: 'incoming', text: 'Согласуем детали. '.repeat(500) });
+    source.sourceHash = crmControlSemanticTextHash(source.text);
+    const send = jest.fn(), result = await new CrmControlLocalSemanticClient(options(), send).analyze(request);
+    expect(result.status).toBe('READY');
+    if (result.status !== 'READY') throw Error('fixture');
+    expect(assessCrmControlSemantic(request, result.validation, 'task_stage_deadline').status).toBe('FAIL');
+    expect(send).not.toHaveBeenCalled();
+  });
+  it.each(['incomplete-notes', 'unknown-stage', 'price-delay'])('keeps empty %s unresolved instead of using the mandatory-note shortcut', async mode => {
+    const request = input(); Object.assign(request, { check: mode === 'price-delay' ? 'price_delay' : 'deadline_agreement',
+      subjectId: null, sources: [], maxDueAt: '2026-09-22T12:00:00Z' });
+    if (mode === 'incomplete-notes') request.coverage.notes = false;
+    if (mode === 'unknown-stage') request.stageEnteredAt = null;
+    const send = jest.fn(), result = await new CrmControlLocalSemanticClient(options(), send).analyze(request);
+    if (result.status !== 'READY') throw Error('fixture');
+    expect(result.validation.status).toBe('UNKNOWN');
+    expect(assessCrmControlSemantic(request, result.validation, mode === 'price-delay' ? 'price_requested_duration' : 'stage_duration').status).toBe('UNKNOWN');
+    expect(send).not.toHaveBeenCalled();
+  });
+  it.each(['unknown-author', 'wrong-owner', 'future', 'wrong-hash'])('does not bypass source validation for %s notes', async mode => {
+    const request = input(); Object.assign(request, { check: 'deadline_agreement', subjectId: null, maxDueAt: '2026-09-22T12:00:00Z' });
+    const source = request.sources[0]; Object.assign(source, { kind: 'manager_note', subjectId: null, actor: 'manager',
+      actorId: 'crm-manager-1', direction: 'internal' });
+    if (mode === 'unknown-author') Object.assign(source, { actor: 'unknown', actorId: null });
+    if (mode === 'wrong-owner') source.ownerId = 'another-manager';
+    if (mode === 'future') source.createdAt = '2026-09-23T10:00:00Z';
+    if (mode === 'wrong-hash') source.sourceHash = '0'.repeat(64);
+    const send = jest.fn().mockResolvedValue(new Response(JSON.stringify({ model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ findings: [
+      { fact: 'manager_note', state: 'absent', evidence: [] },
+      { fact: 'customer_agreement', state: 'uncertain', evidence: [] },
+      { fact: 'agreed_deadline', state: 'uncertain', evidence: [] },
+    ] }) } }] })));
+    const result = await new CrmControlLocalSemanticClient(options(), send).analyze(request);
+    expect(send).toHaveBeenCalledTimes(1);
+    if (result.status === 'READY') expect(assessCrmControlSemantic(request, result.validation, 'stage_duration').status).toBe('UNKNOWN');
+    else expect(result.code).toBe('LOCAL_AI_INVALID_RESPONSE');
+  });
+  it('does not query a model or reuse cached approval for an unverified call transcript', async () => {
+    const request = input(); Object.assign(request, { check: 'price_delay', subjectId: null, maxDueAt: '2026-09-22T12:00:00Z' });
+    Object.assign(request.sources[0], { kind: 'call_transcript', subjectId: null, actor: 'customer', actorId: 'contact-1', direction: 'incoming' });
+    request.coverage.communications = true;
+    const send = jest.fn(), client = new CrmControlLocalSemanticClient(options(), send);
+    const first = await client.analyze(request);
+    expect(first).toMatchObject({ status: 'READY', cacheHit: false, validation: { status: 'UNKNOWN',
+      issues: expect.arrayContaining([expect.objectContaining({ code: 'CALL_TRANSCRIPT_UNVERIFIED' })]) } });
+    if (first.status !== 'READY') throw Error('fixture');
+    await writeFile(path.join(directory, `${first.inputHash}.json`), JSON.stringify({ ...first, validation: { status: 'VALIDATED' } }));
+    expect(await client.analyze(request)).toMatchObject({ status: 'READY', cacheHit: false, validation: { status: 'UNKNOWN' } });
     expect(send).not.toHaveBeenCalled();
   });
   it('rejects a valid-looking result cut short by the runtime', async () => {

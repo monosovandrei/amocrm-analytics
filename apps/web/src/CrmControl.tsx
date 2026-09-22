@@ -197,7 +197,8 @@ export default function CrmControl() {
     try {
       const next = await api<ControlRun>(`${base}/runs`, { method: 'POST', body: JSON.stringify({ requestKey: crypto.randomUUID(), ...(sourceRunId ? { sourceRunId } : {}) }) });
       setRuns(current => unique([next, ...current])); setRunId(next.id);
-      setNotice(sourceRunId ? 'Новый полный обход поставлен в очередь. Он прочитает текущее состояние CRM и сохранит отдельную проверку; допроверка прежних фактов выполняется отдельно.' : 'Проверка поставлена в очередь. Результаты появятся здесь.');
+      setNotice(next.scope && next.scope.kind !== 'ALL' ? `${next.scope.label}. Проверка этой области поставлена в очередь; результаты сохранятся отдельно.`
+        : sourceRunId ? 'Новый полный обход поставлен в очередь. Он прочитает текущее состояние CRM и сохранит отдельную проверку; допроверка прежних фактов выполняется отдельно.' : 'Проверка поставлена в очередь. Результаты появятся здесь.');
     } catch (err) { setError(errorText(err, 'Не удалось запустить проверку')); }
     finally { setBusy(false); }
   }
@@ -243,7 +244,7 @@ export default function CrmControl() {
       {showRules && <RuleCatalog settings={settings} />}
       {showSettings && settings.canManage && <SettingsEditor settings={settings} onSaved={next => { setSettings(next); setNotice('Настройки контроля CRM сохранены.'); }} onClose={() => setShowSettings(false)} />}
       {runs.length > 0 && <div className="crm-toolbar">
-        <div style={{ minWidth: 240, maxWidth: '100%', flex: '0 1 410px' }}><SearchSelect label="Проверка" value={runId} choices={runs.map(run => ({ value: run.id, label: `${dateTime(run.startedAt || run.scheduledFor, timeZone)} · ${completionName(run)}${activeRun(run) ? ` · ${runNames[run.status]}` : ''}` }))} onChange={setRunId} /></div>
+        <div className="crm-run-picker" style={{ minWidth: 240, maxWidth: '100%', flex: '0 1 410px' }}><SearchSelect label="Проверка" value={runId} choices={runs.map(run => ({ value: run.id, label: `${dateTime(run.startedAt || run.scheduledFor, timeZone)} · ${completionName(run)}${activeRun(run) ? ` · ${runNames[run.status]}` : ''}${run.scope ? ` · ${run.scope.label}` : ''}` }))} onChange={setRunId} /></div>
         <label><span className="label">Отдел</span><select className="select" value={department} onChange={event => { setDepartment(event.target.value); setManager(null); }}><option value="all">Все отделы</option><option value="sales">ОПНК</option><option value="csm">ОППК</option></select></label>
         <label className="crm-search"><span className="label">Менеджер или группа</span><input className="field" type="search" value={query} onChange={event => { setQuery(event.target.value); setManager(null); }} placeholder="Поиск" /></label>
         {runsCursor && <button type="button" className="btn" disabled={busy} onClick={() => void moreRuns()}>Более ранние проверки</button>}
@@ -254,14 +255,14 @@ export default function CrmControl() {
       {detail && <>
         <section className={`crm-completion ${detail.run.completion?.status === 'CHECKED' ? 'crm-completion-checked' : ''}`} aria-label="Итог проверки">
           <div className="crm-section-head"><h2>{completionName(detail.run)}</h2>{activeRun(detail.run) && <span role="status" className="crm-note">{runNames[detail.run.status]}. Результаты обновляются автоматически.</span>}</div>
-          {detail.run.completion?.status === 'CHECKED' ? <p className="crm-note">Все применимые правила получили определённый результат. Найденные нарушения показаны в таблице.</p> : <>
+          {detail.run.completion?.status === 'CHECKED' ? <p className="crm-note">Все применимые правила в выбранной области проверки получили определённый результат. Найденные нарушения показаны в таблице.</p> : <>
             {detail.run.completion?.reasons.length ? <ul className="crm-error-list">{detail.run.completion.reasons.map((reason, index) => <li key={`${reason.code}:${index}`}>{reason.message}</li>)}</ul> : <p className="crm-note">{detail.run.error || (activeRun(detail.run) ? 'Обработка ещё не завершена.' : 'Итог полной проверки недоступен. Обновите результаты; отсутствие итога не считается успешной проверкой.')}</p>}
             <div className="crm-actions">
               {(detail.counts.unknown > 0 || detail.counts.review > 0) && <>
                 {settings.canReview && settings.capabilities.localAnalysis && <button className="btn" type="button" disabled={busy || analysisActive} onClick={() => void continueAnalysis()}>Допроверить оставшиеся</button>}
                 <button className="crm-link" type="button" onClick={() => { setView('rules'); setRuleStatus(detail.counts.unknown > 0 ? 'UNKNOWN' : 'REVIEW'); setManager(null); }}>Показать непроверенное</button>
               </>}
-              {settings.canReview && detail.run.completion?.canRecheck && <><button className="btn" type="button" disabled={busy || Boolean(runs.some(activeRun))} onClick={() => void startRun(detail.run.id)}><RefreshCw size={14} aria-hidden="true" />Проверить заново</button><span className="crm-note">Новый полный обход CRM. Не заменяет разбор недоступных источников.</span></>}
+              {settings.canReview && detail.run.completion?.canRecheck && <><button className="btn" type="button" disabled={busy || Boolean(runs.some(activeRun))} onClick={() => void startRun(detail.run.id)}><RefreshCw size={14} aria-hidden="true" />Проверить заново</button><span className="crm-note">{detail.run.scope?.kind === 'MANAGER' ? 'Новый обход сделок этого менеджера.' : 'Новый обход CRM в вашей области доступа.'} Не заменяет разбор недоступных источников.</span></>}
             </div>
             {analysisActive && <p className="crm-note" role="status">Локальная допроверка: {detail.analysis?.preparing ? 'подготовка источников; ' : ''}в очереди {detail.analysis?.queued ?? 0}, выполняется {detail.analysis?.running ?? 0}. Проверено пунктов: {detail.analysis?.completed ?? 0}.</p>}
           </>}

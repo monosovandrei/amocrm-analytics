@@ -31,6 +31,10 @@ describe('analysis projection identity and privacy', () => {
     expect(crmControlAnalysisProjection([stale])).toMatchObject({ outcome: null, message: expect.stringContaining('другой версией') });
     expect(crmControlAnalysisProjection([stale])?.message).not.toBe(stale.assessmentMessage);
   });
+  it.each(['PASS', 'FAIL'])('retires analyzer2 terminal %s conclusions under the new empty-source/call policy', assessmentStatus => {
+    expect(CRM_CONTROL_ANALYZER_VERSION).toBe('4');
+    expect(crmControlAnalysisProjection([{ ...job(), analyzerVersion: '2', assessmentStatus }])?.outcome).toBeNull();
+  });
 
   it('invalidates a previously accepted conclusion immediately when the configured model changes', () => {
     const previous = job();

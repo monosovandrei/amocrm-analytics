@@ -3,7 +3,7 @@ import path from 'node:path';
 import { crmControlAnalysisProof } from './crm-control-analysis-proof';
 import { CRM_CONTROL_ANALYZER_VERSION } from './crm-control-analysis.service';
 import { CRM_CONTROL_LOCAL_PROMPT_VERSION } from './crm-control-local-semantic.client';
-import { CRM_CONTROL_SEMANTIC_POLICY_VERSION } from './crm-control-semantic.policy';
+import { CRM_CONTROL_SEMANTIC_POLICY_VERSION, crmControlMissingManagerNoteProof } from './crm-control-semantic.policy';
 import { CrmControlSemanticRequest, CrmControlSemanticResponse, crmControlSemanticTextHash } from './crm-control-semantic.validation';
 import { CrmControlService } from './crm-control.service';
 import * as documents from './crm-control-document-evidence';
@@ -54,6 +54,16 @@ describe('analysis proof grounding and access', () => {
     const json = JSON.stringify(proof);
     expect(json).not.toContain('private/customer-file'); expect(json).not.toContain('unchecked model prose');
     expect(json).not.toContain('request-1'); expect(json).not.toContain('robot');
+  });
+  it('shows only proven missing manager note when communications remain incomplete', () => {
+    const f = fixture();
+    Object.assign(f.request, { check: 'deadline_agreement', subjectId: null, sources: [], maxDueAt: '2026-09-22T12:00:00Z' });
+    f.job.assessmentStatus = 'FAIL';
+    const decisive = crmControlMissingManagerNoteProof(f.request)!;
+    f.attempt.rawResponse.response = decisive.response;
+    expect(f.prove().findings).toEqual([{ fact: 'manager_note', label: 'Примечание менеджера', state: 'absent', date: null, evidence: [] }]);
+    f.request.coverage.notes = false;
+    expect(f.prove().findings).toEqual([]);
   });
 
   it.each(['quote', 'sourceId', 'sourceHash', 'subjectId', 'requestId', 'text', 'ownerId', 'coverage', 'inspectedSources'])

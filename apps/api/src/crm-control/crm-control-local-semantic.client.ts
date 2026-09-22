@@ -4,6 +4,7 @@ import path from 'node:path';
 import { CRM_CONTROL_SEMANTIC_FACTS, CrmControlSemanticRequest, CrmControlSemanticResponse,
   CrmControlSemanticValidation, crmControlSemanticInstructionRisk, validateCrmControlSemanticResponse } from './crm-control-semantic.validation';
 import { crmControlSemanticInputHash } from './crm-control-semantic.identity';
+import { crmControlMissingManagerNoteProof } from './crm-control-semantic.policy';
 
 export const CRM_CONTROL_LOCAL_PROMPT_VERSION = '4';
 const MAX_RESPONSE_BYTES = 64 * 1024;
@@ -127,6 +128,17 @@ export class CrmControlLocalSemanticClient {
       origin = localCrmAnalysisOrigin(this.options.origin);
       if (!HASH.test(this.options.modelSha256) || !this.options.model || !path.isAbsolute(this.options.cacheDirectory)) throw new Error();
     } catch { return { status: 'ERROR', code: 'LOCAL_AI_NOT_CONFIGURED', retryable: false }; }
+    // A required manager note is independently decisive. Do not spend model context on other channels
+    // when a complete note read already proves that this necessary part of the exception is missing.
+    // Preserve the existing fully-empty, fully-covered response, which can establish all absent facts.
+    const missingManagerNote = input.sources.length || input.coverage.communications !== true
+      ? crmControlMissingManagerNoteProof(input) : null;
+    if (missingManagerNote) {
+      const inputHash = crmControlSemanticInputHash(input, { promptVersion: CRM_CONTROL_LOCAL_PROMPT_VERSION,
+        model: this.options.model, modelSha256: this.options.modelSha256 });
+      return { status: 'READY', inputHash, cacheHit: false, completedAt: new Date().toISOString(), model: this.options.model,
+        modelSha256: this.options.modelSha256, promptVersion: CRM_CONTROL_LOCAL_PROMPT_VERSION, ...missingManagerNote };
+    }
     const prepared = prompt(input);
     if (prepared.content.length > MAX_INPUT_CHARACTERS || input.sources.length > 24
       || input.check === 'task_action' && input.sources.length > 0 && (input.sources.length !== 1 || input.sources[0].text.length > 2000)) {
@@ -134,12 +146,17 @@ export class CrmControlLocalSemanticClient {
     }
     const inputHash = crmControlSemanticInputHash(input, { promptVersion: CRM_CONTROL_LOCAL_PROMPT_VERSION,
       model: this.options.model, modelSha256: this.options.modelSha256 });
-    // Explicit instructions embedded in CRM data cannot be promoted by a model or an older cached answer.
-    // No text also stays UNKNOWN: an empty filtered set is not proof that a required note never existed.
-    if (!input.sources.length || crmControlSemanticInstructionRisk(input.stageName) || input.sources.some(source => crmControlSemanticInstructionRisk(source.text))) {
+    // Completeness is attested by the server's snapshot builder. An empty complete source set needs no model.
+    // Stage/date/scope validation still runs below; task absence belongs to the deterministic task-count rule.
+    const instructionRisk = crmControlSemanticInstructionRisk(input.stageName)
+      || input.sources.some(source => crmControlSemanticInstructionRisk(source.text));
+    const unverifiedCall = input.sources.some(source => source.kind === 'call_transcript');
+    if (!input.sources.length || instructionRisk || unverifiedCall) {
+      const completeEmpty = !input.sources.length && !instructionRisk && input.check !== 'task_action'
+        && input.coverage.notes === true && (input.check === 'proposal_note' || input.coverage.communications === true);
       const response: CrmControlSemanticResponse = { schemaVersion: 1, requestId: input.requestId, check: input.check,
         subjectId: input.subjectId, inspectedSourceIds: input.sources.map(source => source.id),
-        findings: CRM_CONTROL_SEMANTIC_FACTS[input.check].map(fact => ({ fact, state: 'uncertain', evidence: [] })) };
+        findings: CRM_CONTROL_SEMANTIC_FACTS[input.check].map(fact => ({ fact, state: completeEmpty ? 'absent' : 'uncertain', evidence: [] })) };
       return { status: 'READY', inputHash, cacheHit: false, completedAt: new Date().toISOString(), model: this.options.model,
         modelSha256: this.options.modelSha256, promptVersion: CRM_CONTROL_LOCAL_PROMPT_VERSION, response,
         validation: validateCrmControlSemanticResponse(input, response) };

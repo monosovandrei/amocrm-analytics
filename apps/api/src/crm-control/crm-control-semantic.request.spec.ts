@@ -44,4 +44,24 @@ describe('trusted semantic request builder', () => {
     expect(built.sources.map(source => source.id)).toEqual(['note:n']);
     expect(built.coverage.notes).toBe(false);
   });
+  it.each([null, '2026-09-23T10:00:00Z'])('does not turn an undated/future note into a complete empty note window: %s', date => {
+    const f = fixture(); f.result.ruleCode = 'proposal_note'; f.result.subjectId = '';
+    f.snapshot.notes[0].createdAt = date;
+    const built = buildCrmControlSemanticRequest(f.observation, f.result)!;
+    expect(built.sources).toEqual([]); expect(built.coverage.notes).toBe(false);
+  });
+  it('keeps a known old note separate from an incomplete current stage read', () => {
+    const f = fixture(); f.result.ruleCode = 'proposal_note'; f.result.subjectId = '';
+    f.snapshot.notes[0].createdAt = '2026-09-20T10:00:00Z';
+    const built = buildCrmControlSemanticRequest(f.observation, f.result)!;
+    expect(built.sources).toEqual([]); expect(built.coverage.notes).toBe(true);
+  });
+  it('does not certify absent communications after excluding a future-dated message', () => {
+    const f = fixture(); f.result.ruleCode = 'stage_duration'; f.result.subjectId = '';
+    f.result.details = { maximumDueAt: '2026-09-22T16:00:00Z' };
+    f.snapshot.communicationSources.messages[0].message.occurredAt = '2026-09-23T10:00:00Z';
+    const built = buildCrmControlSemanticRequest(f.observation, f.result)!;
+    expect(built.sources.map(source => source.kind)).toEqual(['manager_note']);
+    expect(built.coverage.communications).toBe(false);
+  });
 });

@@ -61,6 +61,52 @@ describe('archived offer assessment integration', () => {
     expect(output.validation.offerBudget.status).toBe('PASS');
     expect(output.validation.proposalFile.status).toBe('PASS');
   });
+  function addLaterInvoice(f: ReturnType<typeof fixture>, textSuffix = '') {
+    const invoiceSha = hash('synthetic-invoice-bytes'), invoiceOutput = hash('synthetic-invoice-extraction');
+    const invoiceArtifact = { ...artifact, sha256: invoiceSha, storageKey: `${invoiceSha}.bin` };
+    f.snapshot.browserSources.documents.push({ binding: 'DEAL', threadId: 'invoice-thread', messageId: 'invoice-message',
+      attachmentId: 'invoice-attachment', sentAt: '2026-09-22T13:00:00Z', artifact: invoiceArtifact });
+    f.snapshot.documentAnalysis.documents.push({ sourceSha256: invoiceSha, status: 'COMPLETE', issues: [], outputSha256: invoiceOutput,
+      storageKey: `local-documents-v1/${invoiceSha}.${invoiceOutput}.json` });
+    const lines = ['Счёт на оплату № 17 от 22.09.2026', 'Поставщик: ООО Синтетический поставщик', 'Покупатель: ООО Синтетический покупатель',
+      'БИК: 044525000', 'Р/с: 40702810000000000000', 'Итого 100 RUB', textSuffix].filter(Boolean);
+    const payload: CrmControlDocumentPayload = { ...f.payload, sourceSha256: invoiceSha, units: lines.map((text, index) => ({
+      text, complete: true, method: 'native', locator: { kind: 'pdf', page: 1, line: index + 1, bbox: [0, index * 20, 400, index * 20 + 15], coordinateSpace: 'pdf-points' } })) };
+    f.reader.read.mockImplementation(async (reference: any) => reference.sourceSha256 === invoiceSha ? payload : f.payload);
+    return { payload, invoiceSha, invoiceArtifact };
+  }
+  it('does not let a later verified invoice block the last offer when the full sending history is independently proven', async () => {
+    const f = fixture(); f.complete(); const invoice = addLaterInvoice(f);
+    const output = await assessArchivedOffer(f.input, f.reader);
+    expect(output.validation.offerBudget.status).toBe('PASS'); expect(output.validation.proposalFile.status).toBe('PASS');
+    const classified = output.details.candidates.find(candidate => candidate.artifactSha256 === invoice.invoiceSha)!;
+    expect(classified).toMatchObject({ classification: 'NON_OFFER', selectionStatus: 'CLASSIFIED', amount: null,
+      nonOffer: { kind: 'PAYMENT_INVOICE', policyVersion: 'native-non-offer-v1' } });
+    expect(classified.nonOffer?.evidence).toHaveLength(5);
+    expect(classified.nonOffer?.evidence.every(citation => citation.artifactSha256 === invoice.invoiceSha && citation.outgoingSourceId === 'mail:invoice-thread:invoice-message')).toBe(true);
+  });
+  it('never upgrades incomplete sending history just because one unrelated attachment has been classified', async () => {
+    const f = fixture(); addLaterInvoice(f);
+    const output = await assessArchivedOffer(f.input, f.reader);
+    expect(output.details.candidates.some(candidate => candidate.classification === 'NON_OFFER')).toBe(true);
+    expect(output.validation.offerBudget.status).toBe('UNKNOWN'); expect(output.validation.proposalFile.status).toBe('UNKNOWN');
+    expect(output.details.historyStatus).toBe('UNVERIFIED');
+  });
+  it.each(['conflict', 'ocr', 'incomplete'])('keeps an unreadable or possibly commercial later invoice unresolved: %s', async variant => {
+    const f = fixture(); f.complete(); const invoice = addLaterInvoice(f, variant === 'conflict' ? 'Дополнительное коммерческое предложение для клиента' : '');
+    if (variant === 'ocr') invoice.payload.units[0].method = 'ocr';
+    if (variant === 'incomplete') invoice.payload.units[0].complete = false;
+    const output = await assessArchivedOffer(f.input, f.reader);
+    expect(output.details.candidates.find(candidate => candidate.artifactSha256 === invoice.invoiceSha)?.classification).toBe('UNRESOLVED');
+    expect(output.validation.offerBudget.status).toBe('UNKNOWN'); expect(output.validation.proposalFile.status).toBe('UNKNOWN');
+  });
+  it('still flags an invoice stored in the КП field as an extra file', async () => {
+    const f = fixture(); f.complete(); const invoice = addLaterInvoice(f);
+    f.snapshot.proposalSources.fieldFiles.push({ artifact: invoice.invoiceArtifact });
+    const output = await assessArchivedOffer(f.input, f.reader);
+    expect(output.validation.offerBudget.status).toBe('PASS');
+    expect(output.validation.proposalFile).toMatchObject({ status: 'FAIL', issues: ['EXTRA_OR_OLDER_PROPOSAL_FILE'] });
+  });
   it('produces FAIL for a proven different budget and extra/old file', async () => {
     const f = fixture(); f.complete(); f.snapshot.deal.amount = '1000';
     const old = hash('old-proposal');

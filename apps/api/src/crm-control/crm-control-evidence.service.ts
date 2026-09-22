@@ -25,10 +25,13 @@ export interface CrmControlCaptureResult {
   retryable?: boolean;
 }
 
-export type CrmSourceCardJob = Pick<CrmControlCaptureJob, 'sourceUrl' | 'dealExternalId'>;
+export type CrmSourceCardJob = Pick<CrmControlCaptureJob, 'sourceUrl' | 'dealExternalId'> & {
+  connectionId?: string; accountExternalId?: string;
+};
 export type CrmSourceReadResult<T> = { ok: true; value: T } | { ok: false; errorCode: string; message: string; retryable: boolean };
 export interface CrmSourceRequestSession {
   context: BrowserContext; origin: string; mailAccountId: string;
+  accountExternalId?: string | null;
   currencyValues: { accountCode: string | null; localeCode: string | null }; currencyObservedAt: string;
 }
 export class CrmSourceAuthExpiredError extends Error { constructor() { super('SOURCE_AUTH_EXPIRED'); } }
@@ -46,7 +49,18 @@ export type CaptureHealth = { status: 'UNVERIFIED' | 'READY' | 'ERROR'; checkedA
 type CaptureConfiguration = { origin: string; executable: string; statePath: string; rawHash: string; state: StorageState; fingerprint: string };
 type AuthSession = { config: CaptureConfiguration; context: BrowserContext; lease: CrmBrowserSessionLease;
   rawHash: string; tail: Promise<void>; closing?: Promise<void>; invalid?: CaptureFailure;
-  sourceAccess?: { mailAccountId: string; currencyValues: CrmSourceRequestSession['currencyValues']; currencyObservedAt: string; verifiedAt: number } };
+  sourceAccess?: { mailAccountId: string; accountExternalId: string | null; currencyValues: CrmSourceRequestSession['currencyValues']; currencyObservedAt: string; verifiedAt: number } };
+
+/** Loading a CRM card must not acknowledge messages or invoke chat write actions. */
+export function isCrmCollectorChatMutation(target: string, method: string, origin: string): boolean {
+  if (['GET', 'HEAD', 'OPTIONS'].includes(method)) return false;
+  let url: URL; try { url = new URL(target); } catch { return false; }
+  const chatHost = /(^|\.)amocrm\.ru$/.test(url.hostname) && url.origin !== origin && /amojo/.test(url.hostname);
+  const crmChat = url.origin === origin && /^\/ajax\/v\d+\/chats\//.test(url.pathname);
+  const authorizationOnly = chatHost && url.pathname === '/session/refresh_token'
+    || url.origin === origin && /^\/ajax\/v1\/chats\/session\/?$/.test(url.pathname);
+  return !authorizationOnly && (chatHost || crmChat || /\/(?:read|read_all|mark_read)\/?$/.test(url.pathname));
+}
 
 class CaptureFailure extends Error {
   constructor(readonly code: string, message: string, readonly retryable = false) { super(message); }
@@ -353,7 +367,21 @@ export class CrmControlEvidenceService implements OnModuleDestroy {
 
   private queueCard<T>(session: AuthSession, job: CrmSourceCardJob,
     createReader: (page: Page) => { collect(title: string): Promise<T>; dispose(): void }): Promise<T> {
-    const result = session.tail.then(() => this.readSessionCard(session, job, createReader));
+    const result = session.tail.then(async () => {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try { return await this.readSessionCard(session, job, createReader, attempt === 1); }
+        catch (error) {
+          if (!(error instanceof CrmSourceAuthExpiredError)) throw error;
+          session.sourceAccess = undefined;
+          if (attempt === 1) {
+            session.invalid = new CaptureFailure('AUTH_REQUIRED', HEALTH_ERRORS.AUTH_REQUIRED);
+            this.health = { status: 'ERROR', checkedAt: new Date().toISOString(), errorCode: 'AUTH_REQUIRED', message: HEALTH_ERRORS.AUTH_REQUIRED };
+            throw session.invalid;
+          }
+        }
+      }
+      throw new CaptureFailure('AUTH_REQUIRED', HEALTH_ERRORS.AUTH_REQUIRED);
+    });
     session.tail = result.then(() => undefined, () => undefined);
     return result;
   }
@@ -375,14 +403,19 @@ export class CrmControlEvidenceService implements OnModuleDestroy {
       return { dispose: () => page.off('response', listener), collect: async () => {
         // readSessionCard has already verified real timeline and compose response schemas for this exact card.
         if (!mailAccountId || conflict) throw new CaptureFailure('SOURCE_NOT_READY', HEALTH_ERRORS.SOURCE_NOT_READY, true);
-        const currencyValues = await page.evaluate(() => {
+        const accountValues = await page.evaluate(() => {
           const amo = (window as any).AMOCRM;
           const code = (value: unknown) => typeof value === 'string' && /^[a-zA-Z]{3}$/.test(value) ? value : null;
           let accountCode: unknown = null;
           try { accountCode = amo?.constant?.('account')?.currency; } catch { /* Account authority remains unknown. */ }
-          return { accountCode: code(accountCode), localeCode: code(amo?.system?.locale?.currency) };
-        }).catch(() => ({ accountCode: null, localeCode: null }));
-        return { mailAccountId, currencyValues, currencyObservedAt: new Date().toISOString(), verifiedAt: Date.now() };
+          const accountId = amo?.constant?.('account')?.id;
+          return { accountCode: code(accountCode), localeCode: code(amo?.system?.locale?.currency),
+            accountExternalId: (typeof accountId === 'number' && Number.isSafeInteger(accountId) || typeof accountId === 'string')
+              && /^[1-9]\d{0,19}$/.test(String(accountId)) ? String(accountId) : null };
+        }).catch(() => ({ accountCode: null, localeCode: null, accountExternalId: null }));
+        return { mailAccountId, accountExternalId: accountValues.accountExternalId ?? null,
+          currencyValues: { accountCode: accountValues.accountCode, localeCode: accountValues.localeCode },
+          currencyObservedAt: new Date().toISOString(), verifiedAt: Date.now() };
       } };
     }, forceRefresh);
     session.sourceAccess = access;
@@ -401,6 +434,7 @@ export class CrmControlEvidenceService implements OnModuleDestroy {
       let reader: ReturnType<typeof createReader> | undefined, authorized = true;
       try {
         reader = createReader({ context: session.context, origin: session.config.origin, mailAccountId: access.mailAccountId,
+          accountExternalId: access.accountExternalId,
           currencyValues: { ...access.currencyValues }, currencyObservedAt: access.currencyObservedAt });
         return await reader.collect();
       } catch (error) {
@@ -443,6 +477,9 @@ export class CrmControlEvidenceService implements OnModuleDestroy {
       page.setDefaultTimeout(20_000);
       await page.route('**/*', async route => {
         const request = route.request();
+        if (isCrmCollectorChatMutation(request.url(), request.method(), session.config.origin)) {
+          await route.abort('blockedbyclient'); return;
+        }
         if (request.isNavigationRequest() && request.frame() === page!.mainFrame()) {
           try { validateCrmCaptureUrl(request.url(), job.dealExternalId, session.config.origin); }
           catch { navigationBlocked = true; await route.abort('blockedbyclient'); return; }
@@ -489,6 +526,7 @@ export class CrmControlEvidenceService implements OnModuleDestroy {
       stage = 'action';
       return await reader.collect(await title.inputValue());
     } catch (error) {
+      if (error instanceof CrmSourceAuthExpiredError) throw error;
       const failure = navigationBlocked ? new CaptureFailure('AUTH_REQUIRED', HEALTH_ERRORS.AUTH_REQUIRED)
         : this.failure(error, stage === 'card' ? 'CARD_NOT_READY' : 'CAPTURE_FAILED', stage === 'card' ? HEALTH_ERRORS.CARD_NOT_READY : HEALTH_ERRORS.CAPTURE_FAILED, true);
       if (['AUTH_REQUIRED', 'SESSION_CONFLICT', 'SESSION_TRANSFERRED'].includes(failure.code)) session.invalid = failure;

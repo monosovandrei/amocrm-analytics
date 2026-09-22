@@ -2,6 +2,11 @@ export type CrmControlResultStatus = 'PASS' | 'FAIL' | 'REVIEW' | 'UNKNOWN' | 'N
 export type CrmControlEvidenceStatus = 'DISABLED' | 'PENDING' | 'RUNNING' | 'READY' | 'ERROR';
 export type CrmControlCaseStatus = 'OPEN' | 'REVIEW' | 'DISPUTED' | 'EXEMPTED' | 'RESOLVED' | 'SUPERSEDED';
 
+export interface CrmControlRunRequest { sourceRunId?: string; requestKey?: string; managerId?: string }
+export interface CrmControlRunSelection {
+  kind: 'MANAGER'; managerId: string; managerExternalId: string; managerName: string;
+}
+
 export interface CrmControlStageRule {
   allowedTaskTypeIds?: number[];
   deadlineMode?: 'elapsed' | 'business_days' | 'end_of_day' | 'unlimited';

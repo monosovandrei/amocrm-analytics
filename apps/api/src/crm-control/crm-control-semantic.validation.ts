@@ -162,13 +162,14 @@ function citedDate(quote: string, source: CrmControlSemanticSource, formatter: I
 }
 
 function supportsFact(source: CrmControlSemanticSource, fact: CrmControlSemanticFact, request: CrmControlSemanticRequest) {
+  // No server-attested transcription quality/speaker proof exists in this contract yet.
+  if (source.kind === 'call_transcript') return false;
   if (fact === 'action' || fact === 'stage_relevance') return source.kind === 'task'
     && source.subjectId === request.subjectId && source.assignedManagerId === request.ownerId;
   if (!source.actorId || source.actor === 'unknown' || source.actor === 'bot') return false;
   if (fact === 'manager_note' || fact === 'transfer_reason' || fact === 'presentation_date') return source.kind === 'manager_note' && source.actor === 'manager';
-  const external = (party: 'customer' | 'supplier') => source.actor === party && (
-    (source.kind === 'call_transcript' && ['incoming', 'outgoing'].includes(source.direction))
-    || (['message', `${party}_message`].includes(source.kind) && source.direction === 'incoming'));
+  const external = (party: 'customer' | 'supplier') => source.actor === party
+    && ['message', `${party}_message`].includes(source.kind) && source.direction === 'incoming';
   if (fact === 'customer_agreement' || fact === 'agreed_deadline') return external('customer');
   return external('customer') || external('supplier');
 }
@@ -221,6 +222,8 @@ export function validateCrmControlSemanticResponse(request: CrmControlSemanticRe
       || (source.kind === 'task' && !source.subjectId)) return invalid('SOURCE_SUBJECT_MISMATCH', undefined, source.id);
     if (source.kind === 'task' && source.assignedManagerId !== request.ownerId) return invalid('TASK_ASSIGNEE_MISMATCH', undefined, source.id);
     if (source.sourceHash !== crmControlSemanticTextHash(source.text)) return invalid('SOURCE_HASH_MISMATCH', undefined, source.id);
+    // Matching text and a claimed actor prove neither accurate ASR nor who spoke. This also blocks false absence.
+    if (source.kind === 'call_transcript') unknown('CALL_TRANSCRIPT_UNVERIFIED', undefined, source.id);
     if (crmControlSemanticInstructionRisk(source.text)) unknown('SOURCE_INSTRUCTION_TO_ANALYZER', undefined, source.id);
     characters += source.text.length;
     if (characters > 128_000) return invalid('SOURCE_LIMIT_EXCEEDED');
@@ -264,6 +267,17 @@ export function validateCrmControlSemanticResponse(request: CrmControlSemanticRe
     const finding: CrmControlSemanticFinding = { fact, state: item.state as CrmControlSemanticFinding['state'], evidence };
     if (item.state === 'uncertain') unknown('ANALYZER_UNCERTAIN', fact);
     if (item.state === 'present' && !witnesses.length) unknown('MISSING_TRUSTED_WITNESS', fact);
+    if (item.state === 'present' && ['customer_agreement', 'agreed_deadline'].includes(fact) && witnesses.length) {
+      const witnessedAt = Math.min(...witnesses.map(witness => instant(witness.source.createdAt)!.getTime()));
+      for (const source of request.sources) {
+        const createdAt = instant(source.createdAt);
+        if (!supportsFact(source, fact, request) || !createdAt || createdAt.getTime() < witnessedAt || createdAt > observedAt) continue;
+        const text = source.text.replace(/\s+/gu, ' ');
+        if (/(?:не\s+соглас(?:ен|на|ны)[^.!?]{0,50}(?:перенос|срок)|(?:отменяю|отменяем)\s+(?:договор[её]нность|перенос|согласование)|(?:договор[её]нность|перенос|согласование|срок)\s+отмен[её]н(?:а|о)?|(?:новый|этот|указанный|согласованный)\s+срок\s+не\s+подходит|не\s+переносим\s+(?:срок|встречу|презентацию))/iu.test(text)) {
+          unknown('CONFLICTING_CUSTOMER_AGREEMENT', fact, source.id);
+        }
+      }
+    }
     if (item.state === 'absent') {
       // Missing/undated source records cannot certify absence, even if the model lists all their IDs.
       const relevant = request.sources.filter(source => supportsFact(source, fact, request));
@@ -286,6 +300,12 @@ export function validateCrmControlSemanticResponse(request: CrmControlSemanticRe
     result.findings.push(finding);
   }
   const coverage = request.check === 'task_action' ? ['tasks'] : request.check === 'proposal_note' ? ['notes'] : ['notes', 'communications'];
-  for (const kind of coverage) if (!request.coverage[kind as keyof typeof request.coverage]) unknown(`INCOMPLETE_${kind.toUpperCase()}`);
+  for (const kind of coverage) if (!request.coverage[kind as keyof typeof request.coverage]) {
+    // A grounded incoming quotation proves presence. It cannot prove absence in unread email/call/chat channels.
+    const communicationsFacts = request.check === 'deadline_agreement' ? ['customer_agreement', 'agreed_deadline'] : ['price_delay_reason'];
+    const positiveCommunications = kind === 'communications' && communicationsFacts.every(fact =>
+      result.findings.some(finding => finding.fact === fact && finding.state === 'present'));
+    if (!positiveCommunications) unknown(`INCOMPLETE_${kind.toUpperCase()}`);
+  }
   return result;
 }

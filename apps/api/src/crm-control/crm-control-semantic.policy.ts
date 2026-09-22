@@ -1,8 +1,34 @@
 import { civilTime } from './crm-control-deadline';
-import { CrmControlSemanticRequest, CrmControlSemanticValidation } from './crm-control-semantic.validation';
+import { CRM_CONTROL_SEMANTIC_FACTS, CrmControlSemanticRequest, CrmControlSemanticResponse,
+  CrmControlSemanticValidation, validateCrmControlSemanticResponse } from './crm-control-semantic.validation';
 
-export const CRM_CONTROL_SEMANTIC_POLICY_VERSION = '1';
+export const CRM_CONTROL_SEMANTIC_POLICY_VERSION = '2';
 export interface CrmControlSemanticAssessment { status: 'PASS' | 'FAIL' | 'UNKNOWN'; message: string; policyVersion: string }
+
+const unrelatedToMissingManagerNote = (issue: CrmControlSemanticValidation['issues'][number]) =>
+  issue.code === 'INCOMPLETE_COMMUNICATIONS'
+  || issue.code === 'ANALYZER_UNCERTAIN' && ['customer_agreement', 'agreed_deadline'].includes(issue.fact ?? '');
+
+/** A necessary manager note cannot exist in a complete, verified empty note set. No model or communication inference is involved. */
+export function crmControlMissingManagerNoteProof(request: CrmControlSemanticRequest): {
+  response: CrmControlSemanticResponse; validation: CrmControlSemanticValidation;
+} | null {
+  if (request?.check !== 'deadline_agreement' || request.coverage?.notes !== true || !Array.isArray(request.sources)
+    || !request.maxDueAt) return null;
+  const stage = Date.parse(request.stageEnteredAt ?? ''), observed = Date.parse(request.observedAt);
+  if (!Number.isFinite(stage) || !Number.isFinite(observed) || stage > observed) return null;
+  if (request.sources.some(source => source?.kind === 'manager_note' && source.actor === 'manager' && source.actorId
+    && typeof source.text === 'string' && source.text.trim() && source.createdAt
+    && Date.parse(source.createdAt) >= stage && Date.parse(source.createdAt) <= observed)) return null;
+  const response: CrmControlSemanticResponse = { schemaVersion: 1, requestId: request.requestId, check: request.check,
+    subjectId: request.subjectId, inspectedSourceIds: request.sources.map(source => source?.id),
+    findings: CRM_CONTROL_SEMANTIC_FACTS.deadline_agreement.map(fact => ({ fact,
+      state: fact === 'manager_note' ? 'absent' : 'uncertain', evidence: [] })) };
+  // The native validator checks every source's scope/hash and all note attribution/date/coverage constraints.
+  const validation = validateCrmControlSemanticResponse(request, response);
+  if (validation.status === 'INVALID' || validation.issues.some(issue => !unrelatedToMissingManagerNote(issue))) return null;
+  return { response, validation };
+}
 
 /** Model findings never decide a violation directly: required facts and allowed deadlines are our policy. */
 export function assessCrmControlSemantic(request: CrmControlSemanticRequest, validation: CrmControlSemanticValidation,
@@ -10,6 +36,12 @@ export function assessCrmControlSemantic(request: CrmControlSemanticRequest, val
   const result = (status: CrmControlSemanticAssessment['status'], message: string) => ({ status, message, policyVersion: CRM_CONTROL_SEMANTIC_POLICY_VERSION });
   if (validation.requestId !== request.requestId || validation.check !== request.check
     || validation.subjectId !== request.subjectId) return result('UNKNOWN', 'Для смысловой проверки пока недостаточно подтверждённых данных.');
+  if (validation.status !== 'INVALID' && request.check === 'deadline_agreement'
+    && ['task_stage_deadline', 'stage_duration'].includes(ruleCode)
+    && validation.findings.find(finding => finding.fact === 'manager_note')?.state === 'absent'
+    && validation.issues.every(unrelatedToMissingManagerNote) && crmControlMissingManagerNoteProof(request)) {
+    return result('FAIL', 'Превышение срока не обосновано примечанием менеджера.');
+  }
   if (validation.status !== 'VALIDATED') return result('UNKNOWN', validation.status === 'UNKNOWN' && !request.sources.length
     ? 'В сохранённом срезе нет текстовых источников для смысловой проверки. Отсутствие нужного примечания этим не подтверждено.'
     : 'Для смысловой проверки пока недостаточно подтверждённых данных.');

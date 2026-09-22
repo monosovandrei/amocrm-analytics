@@ -1,5 +1,6 @@
 import { crmControlAnalysisProjection, CrmControlAnalysisSummary } from './crm-control-analysis.projection';
 import { CrmControlSemanticRequest, validateCrmControlSemanticResponse } from './crm-control-semantic.validation';
+import { assessCrmControlSemantic } from './crm-control-semantic.policy';
 
 const factNames: Record<string, string> = {
   action: 'Следующее действие', stage_relevance: 'Соответствие этапу', transfer_reason: 'Причина переноса презентации',
@@ -19,9 +20,11 @@ export function crmControlAnalysisProof(job: CrmControlAnalysisSummary & { snaps
   const request = job.request as CrmControlSemanticRequest;
   const response = (attempt.rawResponse as { response?: unknown }).response;
   const validation = validateCrmControlSemanticResponse(request, response);
-  if (validation.status !== 'VALIDATED') return empty;
+  const missingNote = validation.status === 'UNKNOWN' && summary.outcome === 'FAIL' && request.check === 'deadline_agreement'
+    && assessCrmControlSemantic(request, validation, 'stage_duration').status === 'FAIL';
+  if (validation.status !== 'VALIDATED' && !missingNote) return empty;
   const sources = new Map(request.sources.map(source => [source.id, source]));
-  return { analysis: summary, findings: validation.findings.map(finding => ({ fact: finding.fact, label: factNames[finding.fact],
+  return { analysis: summary, findings: validation.findings.filter(finding => !missingNote || finding.fact === 'manager_note').map(finding => ({ fact: finding.fact, label: factNames[finding.fact],
     state: finding.state, date: finding.date ?? null, evidence: finding.evidence.map(citation => {
       const source = sources.get(citation.sourceId)!;
       return { sourceId: source.id, sourceHash: source.sourceHash, label: sourceNames[source.kind], createdAt: source.createdAt,

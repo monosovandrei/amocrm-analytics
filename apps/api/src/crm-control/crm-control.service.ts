@@ -23,10 +23,11 @@ import { publicEvidenceManifest } from './crm-control-evidence-manifest';
 import { CRM_CONTROL_RULE_CATALOG, CRM_CONTROL_RULE_VERSION, evaluateCrmControlDeal } from './crm-control.rules';
 import { hasStageDeadline, stageDeadlineConfigError } from './crm-control-deadline';
 import { CrmControlConfig, CrmControlCounts, CrmControlDecisionInput, CrmControlManualReviewInput, CrmControlRuleInput, CrmControlRuleResult,
-  CrmControlScope, DEFAULT_CRM_CONTROL_CONFIG } from './crm-control.types';
+  CrmControlScope, CrmControlRunRequest, CrmControlRunSelection, DEFAULT_CRM_CONTROL_CONFIG } from './crm-control.types';
 import { addControlCounts, controlCompletion, controlManualReviewAllowed, controlManualReviewGuidance, controlScheduleSlot, emptyControlCounts, nextControlCaseState, observationCounts } from './crm-control.logic';
 
 type Access = { role: 'OWNER' | 'ROP' | 'MANAGER'; managerId?: string; groupId?: string; actorId: string; actorName: string };
+type RunConfig = CrmControlConfig & { _access?: Access; _selection?: CrmControlRunSelection };
 type Pipeline = Prisma.PipelineGetPayload<{ include: { stages: true } }>;
 const isWorkingStage = (stage: Pipeline['stages'][number]) => !stage.isWon && !stage.isLost
   && !(stage.raw && typeof stage.raw === 'object' && !Array.isArray(stage.raw) && stage.raw.type === 1);
@@ -217,16 +218,36 @@ export class CrmControlService {
       maxDealAge: value.maxDealAge, excludeBaseFromAge: value.excludeBaseFromAge, scopes: value.scopes };
   }
 
-  async enqueue(actor: AuthUser, body: { sourceRunId?: string; requestKey?: string } = {}) {
-    if (!body || typeof body !== 'object' || Array.isArray(body) || (body.sourceRunId !== undefined && typeof body.sourceRunId !== 'string') || (body.requestKey !== undefined && typeof body.requestKey !== 'string')) throw new BadRequestException('Неверные параметры запуска');
+  async enqueue(actor: AuthUser, body: CrmControlRunRequest = {}) {
+    if (!body || typeof body !== 'object' || Array.isArray(body) || (body.sourceRunId !== undefined && typeof body.sourceRunId !== 'string')
+      || (body.requestKey !== undefined && typeof body.requestKey !== 'string')
+      || (body.managerId !== undefined && (typeof body.managerId !== 'string' || !body.managerId.trim()
+        || body.managerId !== body.managerId.trim() || body.managerId.length > 100))) throw new BadRequestException('Неверные параметры запуска');
     const access = await this.access(actor);
+    if (body.managerId !== undefined && access.role !== 'OWNER') throw new ForbiddenException('Выбирать менеджера для проверки может только владелец.');
     const stored = await this.storedSettings();
     if (!stored.config.scopes.length) throw new BadRequestException('Сначала выберите воронки в регламенте');
-    if (body.sourceRunId) await this.run(actor, body.sourceRunId);
+    const source = body.sourceRunId ? await this.run(actor, body.sourceRunId) : null;
+    const managerId = body.managerId ?? (source?.run.scope.kind === 'MANAGER' ? source.run.scope.managerId : undefined);
+    let selection: CrmControlRunSelection | undefined;
+    if (managerId) {
+      const manager = await this.prisma.crmUser.findUnique({ where: { id: managerId },
+        select: { id: true, externalId: true, name: true, isActive: true, groupId: true } });
+      if (!manager?.isActive || !/^[1-9]\d*$/.test(manager.externalId)) throw new BadRequestException('Выберите действующего менеджера amoCRM.');
+      if ((access.role === 'MANAGER' && manager.id !== access.managerId) || (access.role === 'ROP' && manager.groupId !== access.groupId)) {
+        throw new ForbiddenException('Выбранный менеджер вне вашей области доступа.');
+      }
+      selection = { kind: 'MANAGER', managerId: manager.id, managerExternalId: manager.externalId,
+        managerName: manager.name.trim() || `Менеджер amoCRM #${manager.externalId}` };
+    }
     const requestKey = body.requestKey ? String(body.requestKey).slice(0, 120) : randomUUID();
     const run = await this.prisma.crmControlRun.upsert({ where: { requestKey: `manual:${actor.id}:${requestKey}` },
       create: { requestKey: `manual:${actor.id}:${requestKey}`, trigger: body.sourceRunId ? 'RECHECK' : 'MANUAL', requestedBy: actor.id,
-        sourceRunId: body.sourceRunId, scheduledFor: new Date(), config: json({ ...stored.config, _access: access }), configVersion: stored.version, ruleVersion: CRM_CONTROL_RULE_VERSION }, update: {} });
+        sourceRunId: body.sourceRunId, scheduledFor: new Date(), config: json({ ...stored.config, _access: access,
+          ...(selection ? { _selection: selection } : {}) }), configVersion: stored.version, ruleVersion: CRM_CONTROL_RULE_VERSION }, update: {} });
+    if (((run.config as unknown as RunConfig)?._selection?.managerId ?? null) !== (selection?.managerId ?? null)) {
+      throw new ConflictException('Ключ запуска уже использован для другой области проверки.');
+    }
     return this.publicRun(run, emptyControlCounts());
   }
 
@@ -260,8 +281,16 @@ export class CrmControlService {
   }
 
   private publicRun(run: any, counts: CrmControlCounts) {
+    const config = run.config as RunConfig | null, selection = config?._selection, access = config?._access;
+    const scope = selection ? { kind: 'MANAGER' as const, managerId: selection.managerId, managerName: selection.managerName,
+      label: `Менеджер: ${selection.managerName}` }
+      : access?.role === 'MANAGER' ? { kind: 'MANAGER' as const, managerId: access.managerId!, managerName: access.actorName,
+        label: `Менеджер: ${access.actorName}` }
+        : access?.role === 'ROP' ? { kind: 'GROUP' as const, groupId: access.groupId!, label: 'Группа руководителя' }
+          : { kind: 'ALL' as const, label: 'Все сделки настроенных воронок' };
     return { id: run.id, status: run.status, trigger: run.trigger, scheduledFor: run.scheduledFor, startedAt: run.startedAt,
       finishedAt: run.finishedAt, sourceSyncAt: run.sourceSyncAt, error: run.error, counts, configVersion: run.configVersion, ruleVersion: run.ruleVersion,
+      scope,
       completion: controlCompletion(run.status, counts, Array.isArray(run.issues) ? run.issues : []) };
   }
 
@@ -641,13 +670,18 @@ export class CrmControlService {
 
   private async executeRun(run: Prisma.CrmControlRunGetPayload<Record<string, never>>) {
     if (!run.startedAt) throw new ControlRunError('Не удалось подтвердить попытку выполнения проверки.');
-    const config = run.config as unknown as CrmControlConfig & { _access?: Access };
+    const config = run.config as unknown as RunConfig;
     const localDay = (date: Date) => new Intl.DateTimeFormat('en-CA', { timeZone: config.timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
     if (localDay(run.scheduledFor) !== localDay(new Date())) throw new ControlRunError('Проверка не выполнена в назначенный день. Нужен новый запуск; прошлое состояние не восстановлено.');
     const [pipelines, users, connection] = await Promise.all([
       this.prisma.pipeline.findMany({ include: { stages: true } }), this.prisma.crmUser.findMany({ include: { group: true } }),
       this.amo.getActiveConnectionOrFail(),
     ]);
+    const selection = config._selection;
+    if (selection && (selection.kind !== 'MANAGER' || !selection.managerId || !/^[1-9]\d*$/.test(selection.managerExternalId)
+      || !users.some(user => user.id === selection.managerId && user.externalId === selection.managerExternalId && user.isActive))) {
+      throw new ControlRunError('Выбранный менеджер amoCRM больше не активен или область проверки не подтверждена. Нужен новый запуск.');
+    }
     const requestedInterval = Number(process.env.CRM_CONTROL_REQUEST_INTERVAL_MS ?? 250);
     const client = await this.amo.getClient(connection, { minRequestIntervalMs: Number.isFinite(requestedInterval) ? Math.max(250, requestedInterval) : 250 });
     const issues = [...new Set([...this.configurationIssues(config, pipelines),
@@ -727,6 +761,7 @@ export class CrmControlService {
         if (!stage) { if (!issues.includes('Часть этапов отсутствует в справочнике. Обновите синхронизацию amoCRM.')) issues.push('Часть этапов отсутствует в справочнике. Обновите синхронизацию amoCRM.'); return; }
         if (!isWorkingStage(stage) || listedLead.is_deleted) return;
         const user = users.find((item) => item.externalId === String(listedLead.responsible_user_id));
+        if (selection && user?.id !== selection.managerId) return;
         if (config._access?.role === 'MANAGER' && user?.id !== config._access.managerId) return;
         if (config._access?.role === 'ROP' && user?.groupId !== config._access.groupId) return;
         const sourceReadStartedAt = new Date();
@@ -739,6 +774,7 @@ export class CrmControlService {
         stage = currentMatch.pipeline.stages.find((item) => item.externalId === String(lead.status_id));
         if (!stage || !isWorkingStage(stage) || lead.is_deleted) return;
         const responsible = users.find((item) => item.externalId === String(lead.responsible_user_id));
+        if (selection && responsible?.id !== selection.managerId) return;
         if (config._access?.role === 'MANAGER' && responsible?.id !== config._access.managerId) return;
         if (config._access?.role === 'ROP' && responsible?.groupId !== config._access.groupId) return;
         let taskRows: any[] = [], noteRows: any[] = [];
@@ -764,6 +800,7 @@ export class CrmControlService {
         const messageEvidence = messageIndex.byDeal.get(String(lead.id)) ?? [];
         const proposalSources = await proposalCollector.collect(lead.custom_fields_values ?? [], proposalFieldId, messageEvidence);
         const browserSources = sourceBatch ? await sourceBatch.collectCurrent({ dealExternalId: String(lead.id),
+          connectionId: connection.id, accountExternalId: connection.accountId ?? undefined,
           sourceUrl: `https://${client.domain.replace(/^https?:\/\//, '').replace(/\/$/, '')}/leads/detail/${lead.id}` }) : null;
         await heartbeat();
         const documentAnalysis = this.documentAnalysis ? await this.documentAnalysis.collect(proposalSources, browserSources) : null;
@@ -851,10 +888,12 @@ export class CrmControlService {
         reconciled.add(item.dealId);
         const prior = await this.prisma.crmControlObservation.findUnique({ where: { id: item.latestObservationId } });
         if (!prior || observedDealIds.has(prior.dealExternalId) || !config.scopes.some((scope) => scope.pipelineId === prior.pipelineId)) continue;
+        if (selection && prior.managerId !== selection.managerId) continue;
         if (config._access && ((config._access.role === 'MANAGER' && prior.managerId !== config._access.managerId) || (config._access.role === 'ROP' && prior.groupId !== config._access.groupId))) continue;
         let current: any = null;
         try { current = await client.get(`/leads/${prior.dealExternalId}`); } catch { /* Keep historical cases open when the source is unavailable. */ }
         const currentResponsible = current ? users.find((user) => user.externalId === String(current.responsible_user_id)) : null;
+        if (current && selection && currentResponsible?.id !== selection.managerId) continue;
         if (current && config._access && ((config._access.role === 'MANAGER' && currentResponsible?.id !== config._access.managerId)
           || (config._access.role === 'ROP' && currentResponsible?.groupId !== config._access.groupId))) continue;
         const pipeline = pipelines.find((candidate) => candidate.externalId === String(current?.pipeline_id));

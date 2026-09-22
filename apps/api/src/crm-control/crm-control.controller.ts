@@ -2,7 +2,7 @@ import { Body, Controller, Get, Header, Param, Post, Put, Query, Req, Streamable
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { AuthUser } from '../auth/jwt.strategy';
 import { CrmControlService } from './crm-control.service';
-import { CrmControlDecisionInput, CrmControlManualReviewInput } from './crm-control.types';
+import { CrmControlDecisionInput, CrmControlManualReviewInput, CrmControlRunRequest } from './crm-control.types';
 
 @Controller('crm-control')
 @UseGuards(JwtAuthGuard)
@@ -12,7 +12,7 @@ export class CrmControlController {
   @Get('settings') settings(@Req() request: { user: AuthUser }) { return this.service.settings(request.user); }
   @Put('settings') saveSettings(@Req() request: { user: AuthUser }, @Body() body: unknown) { return this.service.saveSettings(request.user, body); }
   @Get('runs') runs(@Req() request: { user: AuthUser }, @Query('cursor') cursor?: string) { return this.service.runs(request.user, cursor); }
-  @Post('runs') enqueue(@Req() request: { user: AuthUser }, @Body() body: { sourceRunId?: string; requestKey?: string }) { return this.service.enqueue(request.user, body); }
+  @Post('runs') enqueue(@Req() request: { user: AuthUser }, @Body() body: CrmControlRunRequest) { return this.service.enqueue(request.user, body); }
   @Get('runs/:id') run(@Req() request: { user: AuthUser }, @Param('id') id: string) { return this.service.run(request.user, id); }
   @Post('runs/:id/recheck-remaining') recheckRemaining(@Req() request: { user: AuthUser }, @Param('id') id: string,
     @Body() body: { requestKey?: string }) { return this.service.recheckRemaining(request.user, id, body); }

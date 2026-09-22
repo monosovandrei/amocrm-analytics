@@ -11,12 +11,13 @@ export interface CrmControlOfferSelectionInput {
   textUnits: CrmControlOfferTextUnit[];
 }
 export interface CrmControlOfferSelection {
-  /** NON_OFFER is reserved for a future explicit policy; this selector never excludes an unrecognised attachment. */
+  /** NON_OFFER requires the explicit document-local policy below, never a filename or missing offer heading alone. */
   classification: 'OFFER' | 'NON_OFFER' | 'UNRESOLVED';
-  status: 'SELECTED' | 'UNKNOWN';
+  status: 'SELECTED' | 'CLASSIFIED' | 'UNKNOWN';
   amount: CrmControlSelectedOfferAmount | null;
   headingEvidence: CrmControlOfferCitation[];
   issues: string[];
+  nonOffer?: { policyVersion: 'native-non-offer-v1'; kind: 'PAYMENT_INVOICE' | 'COMPLETION_ACT' | 'SIGNATURE_REPORT'; evidence: CrmControlOfferCitation[] };
 }
 
 const HASH = /^[a-f0-9]{64}$/;
@@ -66,6 +67,50 @@ function citation(unit: CrmControlOfferTextUnit, line: string, start: number): C
     artifactSha256: unit.artifactSha256, locator: { ...unit.locator }, quote: line, start, end: start + line.length };
 }
 
+type SourceLine = { unit: CrmControlOfferTextUnit; text: string; start: number };
+const DOCUMENT_NUMBER = '(?:[ \\t\\u00a0\\u202f]+№[ \\t\\u00a0\\u202f]*[A-Za-zА-Яа-яЁё0-9/._-]{1,80}(?:[ \\t\\u00a0\\u202f]+от[ \\t\\u00a0\\u202f]+\\d{2}\\.\\d{2}\\.\\d{4})?)?';
+const invoiceHeading = new RegExp(`^${SPACE}*Сч[её]т${SPACE}+на${SPACE}+оплату${DOCUMENT_NUMBER}${SPACE}*$`, 'iu');
+const actHeading = new RegExp(`^${SPACE}*Акт${SPACE}+(?:выполненных${SPACE}+работ|оказанных${SPACE}+услуг)${DOCUMENT_NUMBER}${SPACE}*$`, 'iu');
+const signatureHeading = /^\s*(?:Отч[её]т о проверке электронной подписи|Сведения об электронной подписи)\s*$/iu;
+// A commercial component, acceptance clause, sample/draft or instruction to the checker keeps the entire attachment unresolved.
+// These are conflict indicators, not proof that a document is an offer.
+const offerOrUncertain = /(?:коммерческ[а-яё]*\s+предложени[а-яё]*|оферт[а-яё]*|(?:^|[^А-Яа-яЁёA-Za-z])КП(?:$|[^А-Яа-яЁёA-Za-z])|\b(?:offer|quotation|quote|proposal|proforma)\b|акцепт[а-яё]*|оплата[^\r\n]{0,60}(?:означает|подтверждает)\s+согласие|предлагаем\s+(?:вам|приобрести|купить|поставить)|образец|пример|шаблон|инструкци[а-яё]*|проект\s+(?:сч[её]та|акта)|\b(?:sample|template|draft)\b|игнориру[а-яё]*\s+(?:инструкц|правил)|\b(?:ignore|disregard)\s+(?:instructions?|rules?)\b)/iu;
+
+/** All lines have already passed native completeness, immutable scope, hash and locator checks. */
+function explicitNonOffer(lines: SourceLine[]): CrmControlOfferSelection | null {
+  // Joining here detects conflicts split across native paragraphs; it never manufactures a citation.
+  if (offerOrUncertain.test(lines.map(line => line.text).join('\n').replace(/\s+/gu, ' '))) return null;
+  const headers = lines.filter(line => invoiceHeading.test(line.text) || actHeading.test(line.text) || signatureHeading.test(line.text));
+  if (headers.length !== 1) return null; // Do not classify concatenated or repeated documents as one administrative attachment.
+  const title = headers[0], first = lines[0];
+  // A title in a footer, appendix or spreadsheet cell is not enough. Keep this initial policy to PDF/DOCX native text.
+  if (!first || lines.indexOf(title) > 19 || title.unit.locator.kind === 'xlsx'
+    || (title.unit.locator.kind === 'pdf' && title.unit.locator.page !== 1)
+    || (title.unit.locator.kind === 'docx' && title.unit.locator.part !== 'word/document.xml')) return null;
+  const find = (pattern: RegExp) => lines.find(line => pattern.test(line.text));
+  const supports: Array<SourceLine | undefined> = [];
+  let kind: NonNullable<CrmControlOfferSelection['nonOffer']>['kind'];
+  if (invoiceHeading.test(title.text)) {
+    kind = 'PAYMENT_INVOICE';
+    supports.push(find(/^\s*Поставщик(?:\s*\([^\r\n()]{1,50}\))?\s*:\s*\S.{2,1000}$/iu),
+      find(/^\s*Покупатель(?:\s*\([^\r\n()]{1,50}\))?\s*:\s*\S.{2,1000}$/iu),
+      find(/^\s*БИК\s*:?\s*\d{9}\s*$/iu),
+      find(/^\s*(?:Р\/с|Расч[её]тный\s+сч[её]т)\s*:?\s*\d{20}\s*$/iu));
+  } else if (actHeading.test(title.text)) {
+    kind = 'COMPLETION_ACT';
+    supports.push(find(/^\s*(?:Работы выполнены|Услуги оказаны)\s+в полном объ[её]ме(?:\s+и в (?:установленный|согласованный) срок)?\s*[.]?\s*$/iu),
+      find(/^\s*Заказчик\s+(?:не имеет претензий(?:\s+по объ[её]му, качеству и срокам)?|претензий по объ[её]му, качеству и срокам (?:выполнения работ|оказания услуг) не имеет)\s*[.]?\s*$/iu));
+  } else {
+    kind = 'SIGNATURE_REPORT';
+    supports.push(find(/^\s*Документ подписан электронной подписью\s*[.]?\s*$/iu),
+      find(/^\s*Сертификат\s*:\s*[a-f0-9]{16,128}\s*$/iu));
+  }
+  if (supports.some(line => !line)) return null;
+  const evidence = [title, ...supports as SourceLine[]].map(line => citation(line.unit, line.text, line.start));
+  return { classification: 'NON_OFFER', status: 'CLASSIFIED', amount: null, issues: [], headingEvidence: [evidence[0]],
+    nonOffer: { policyVersion: 'native-non-offer-v1', kind, evidence } };
+}
+
 export function selectCrmControlOfferCandidate(input: CrmControlOfferSelectionInput): CrmControlOfferSelection {
   const unknown = (issue: string, headingEvidence: CrmControlOfferCitation[] = []): CrmControlOfferSelection => ({
     classification: headingEvidence.length ? 'OFFER' : 'UNRESOLVED', status: 'UNKNOWN', amount: null, headingEvidence, issues: [issue],
@@ -83,6 +128,7 @@ export function selectCrmControlOfferCandidate(input: CrmControlOfferSelectionIn
   }
   if (textSize > 200_000) return unknown('ATTACHMENT_TEXT_LIMIT');
   const headings: CrmControlOfferCitation[] = [];
+  const sourceLines: SourceLine[] = [];
   const totals: Array<{ unit: CrmControlOfferTextUnit; text: string; start: number; match: RegExpMatchArray | null }> = [];
   const currencies = new Set<string>();
   let qualified = false, ambiguousSymbol = false;
@@ -98,11 +144,12 @@ export function selectCrmControlOfferCandidate(input: CrmControlOfferSelectionIn
     const lines = /[^\r\n]+/g;
     for (const match of unit.text.matchAll(lines)) {
       const line = match[0], start = match.index!;
+      if (line.trim()) sourceLines.push({ unit, text: line, start });
       if (heading.test(line)) headings.push(citation(unit, line, start));
       if (totalMarker.test(line)) totals.push({ unit, text: line, start, match: line.match(totalLine) });
     }
   }
-  if (!headings.length) return unknown('EXPLICIT_OFFER_HEADING_NOT_FOUND');
+  if (!headings.length) return explicitNonOffer(sourceLines) ?? unknown('EXPLICIT_OFFER_HEADING_NOT_FOUND');
   if (qualified) return unknown('OFFER_AMOUNT_QUALIFIED_OR_ALTERNATIVE', headings);
   if (ambiguousSymbol || currencies.size !== 1) return unknown('OFFER_CURRENCY_AMBIGUOUS', headings);
   if (totals.length !== 1) return unknown(totals.length ? 'MULTIPLE_OFFER_TOTALS' : 'EXPLICIT_FINAL_TOTAL_NOT_FOUND', headings);

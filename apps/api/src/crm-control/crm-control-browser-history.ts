@@ -18,6 +18,14 @@ export interface BrowserTimelineEntry {
   chat: { chatId: string; messageId: string; text: string | null } | null;
 }
 
+/** Private amomail participant metadata. A contact type alone does not identify a customer or a manager. */
+export interface BrowserMailParticipant { email: string; name: string; type: string; id: string | null }
+export interface BrowserMailParticipants {
+  from: BrowserMailParticipant[] | null;
+  to: BrowserMailParticipant[] | null;
+  cc: BrowserMailParticipant[] | null;
+  reasonCodes: string[];
+}
 export interface BrowserMailMessage {
   id: string;
   occurredAt: string;
@@ -28,6 +36,8 @@ export interface BrowserMailMessage {
   attachments: Array<{ id: string; name: string; declaredSizeBytes: number | null; downloadBlocked: boolean; state: string | null; sourceHash: string }>;
   attachmentCount: number;
   sourceHash: string;
+  /** Absent on older archived manifests; no retrospective attribution is invented. */
+  participants?: BrowserMailParticipants;
 }
 
 export interface BrowserMailThread {
@@ -149,6 +159,29 @@ export function parseBrowserMailThread(value: unknown, threadId: string, dealId:
   return entity?.type === 'lead' && numericId(entity.id) === dealId ? 'DEAL' : 'RELATED_ENTITY';
 }
 
+export function parseBrowserMailParticipants(value: unknown): BrowserMailParticipants {
+  const source = object(value), reasonCodes: string[] = [];
+  const read = (key: 'from' | 'to' | 'cc'): BrowserMailParticipant[] | null => {
+    const raw = source?.[key];
+    if (key === 'cc' && raw === null) return [];
+    if (!Array.isArray(raw) || raw.length > 100) { reasonCodes.push(`MAIL_${key.toUpperCase()}_UNVERIFIED`); return null; }
+    const output: BrowserMailParticipant[] = [];
+    for (const item of raw) {
+      const participant = object(item);
+      if (!participant || typeof participant.email !== 'string' || !/^[^\s<>@\u0000-\u001f\u007f]{1,128}@[^\s<>@\u0000-\u001f\u007f]{1,190}$/.test(participant.email)
+        || participant.email.length > 254 || typeof participant.name !== 'string' || participant.name.length > 1000
+        || typeof participant.type !== 'string' || !participant.type || participant.type.length > 100
+        || (participant.id !== undefined && !(typeof participant.id === 'number' && Number.isSafeInteger(participant.id) && participant.id > 0))) {
+        reasonCodes.push(`MAIL_${key.toUpperCase()}_UNVERIFIED`); return null;
+      }
+      output.push({ email: participant.email, name: participant.name, type: participant.type, id: participant.id === undefined ? null : String(participant.id) });
+    }
+    return output;
+  };
+  const from = read('from'), to = read('to'), cc = read('cc');
+  return { from, to, cc, reasonCodes };
+}
+
 export function parseBrowserMailPage(value: unknown): { messages: BrowserMailMessage[]; total: number; nextPageToken: string | null } {
   const root = object(value);
   if (!root || !Array.isArray(root.items) || root.items.length > MAX_MESSAGES || !Number.isSafeInteger(root.total) || root.total < 0
@@ -173,7 +206,7 @@ export function parseBrowserMailPage(value: unknown): { messages: BrowserMailMes
         downloadBlocked: attachment.download_blocked, state: attachment.state, sourceHash: hash(attachment) };
     });
     return { id, occurredAt, sent: message.sent, subject: message.subject, content: message.content,
-      attachments, attachmentCount: attachments.length, sourceHash: hash(message) };
+      attachments, attachmentCount: attachments.length, sourceHash: hash(message), participants: parseBrowserMailParticipants(message) };
   });
   return { messages, total: root.total, nextPageToken: root.next_page_token };
 }

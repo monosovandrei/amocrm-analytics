@@ -12,6 +12,7 @@ ExecStart=/usr/bin/node dist/crm-control-worker.js
 Restart=always
 RestartSec=5
 TimeoutStopSec=300
+KillMode=mixed
 User=ameri
 Group=ameri
 Nice=10

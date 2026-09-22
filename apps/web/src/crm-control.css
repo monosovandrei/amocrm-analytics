@@ -557,6 +557,19 @@
   overflow-wrap: anywhere;
 }
 
+.crm-control .crm-run-picker .field-combobox-trigger {
+  height: auto;
+  min-height: 36px;
+  align-items: flex-start;
+}
+
+.crm-control .crm-run-picker .truncate {
+  white-space: normal;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+
 @media (max-width: 900px) {
   .crm-control .crm-form-grid-three {
     grid-template-columns: repeat(2, minmax(0, 1fr));

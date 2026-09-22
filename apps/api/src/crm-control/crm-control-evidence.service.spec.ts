@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { chromium } from 'playwright-core';
-import { CrmControlEvidenceService, CrmSourceAuthExpiredError, sanitizeCrmCaptureHealth, validateCrmCaptureUrl } from './crm-control-evidence.service';
+import { CrmControlEvidenceService, CrmSourceAuthExpiredError, isCrmCollectorChatMutation, sanitizeCrmCaptureHealth, validateCrmCaptureUrl } from './crm-control-evidence.service';
 import { collectCrmEvidenceFrames } from './crm-control-evidence-frames';
 import { crmBrowserNeedsRefresh, observeCrmBrowserAccess, refreshCrmBrowserAccess } from './crm-control-browser-auth';
 import { acquireCrmBrowserSessionLease } from './crm-control-browser-session';
@@ -114,6 +114,69 @@ describe('CRM screenshot evidence', () => {
     expect(page.close).toHaveBeenCalledTimes(2);
     expect(contexts[0].close).toHaveBeenCalledTimes(1);
     expect(factories[0].mock.invocationCallOrder[0]).toBeLessThan(page.goto.mock.invocationCallOrder[0]);
+  });
+
+  test('a native card401 discards the reader and page, persists a forced refresh and replays the whole read once', async () => {
+    const pages = [0, 1].map(() => ({ ...page, goto: jest.fn().mockResolvedValue({ status: () => 200 }),
+      close: jest.fn().mockResolvedValue(undefined) }));
+    const readers: Array<{ collect: jest.Mock; dispose: jest.Mock }> = [];
+    const factory = jest.fn((_page: any) => {
+      const attempt = readers.length, fragments: string[] = [];
+      const reader = { collect: jest.fn(async () => {
+        if (attempt === 0) { fragments.push('partial-old-history'); throw new CrmSourceAuthExpiredError(); }
+        expect(fragments).toEqual([]);
+        expect(JSON.parse(await readFile(process.env.CRM_CONTROL_BROWSER_STATE_FILE!, 'utf8')).cookies[0].value).toBe('native-replay-rotation');
+        fragments.push('fresh-history-page-1', 'fresh-history-page-2'); return fragments.slice();
+      }), dispose: jest.fn(() => { fragments.length = 0; }) };
+      readers.push(reader); return reader;
+    });
+    (refreshCrmBrowserAccess as jest.Mock).mockImplementation(async () => {
+      sessionState.cookies[0].value = 'native-replay-rotation'; return 'READY';
+    });
+    const result = await service.withSourceBatch(async batch => {
+      contexts[0].newPage.mockReset().mockResolvedValueOnce(pages[0]).mockResolvedValueOnce(pages[1]);
+      return batch.readCard(job, factory);
+    });
+    expect(result).toEqual({ ok: true, value: { ok: true, value: ['fresh-history-page-1', 'fresh-history-page-2'] } });
+    expect(factory.mock.calls.map(([readerPage]) => readerPage)).toEqual(pages);
+    expect(contexts[0].newPage).toHaveBeenCalledTimes(2);
+    expect(readers.every(reader => reader.collect.mock.calls.length === 1 && reader.dispose.mock.calls.length === 1)).toBe(true);
+    expect(readers[0].dispose.mock.invocationCallOrder[0]).toBeLessThan(pages[0].close.mock.invocationCallOrder[0]);
+    expect(pages[0].close.mock.invocationCallOrder[0]).toBeLessThan(factory.mock.invocationCallOrder[1]);
+    expect(refreshCrmBrowserAccess).toHaveBeenCalledTimes(1);
+    expect(refreshCrmBrowserAccess).toHaveBeenCalledWith(pages[1]);
+    expect(pages[0].goto).toHaveBeenCalledTimes(1);
+    expect(pages[1].goto).toHaveBeenCalledTimes(2); // New page, then native refresh and navigation replay.
+    expect(pages.every(readerPage => readerPage.close.mock.calls.length === 1)).toBe(true);
+    expect(contexts[0].storageState.mock.invocationCallOrder.at(-1)).toBeGreaterThan(pages[1].close.mock.invocationCallOrder[0]);
+    expect(browser.newContext).toHaveBeenCalledTimes(1);
+    expect(contexts[0].close).toHaveBeenCalledTimes(1);
+  });
+
+  test('a second native card401 invalidates the shared session and prevents further card reads', async () => {
+    const pages = [0, 1].map(() => ({ ...page, goto: jest.fn().mockResolvedValue({ status: () => 200 }),
+      close: jest.fn().mockResolvedValue(undefined) }));
+    const disposals: jest.Mock[] = [];
+    const factory = jest.fn(() => {
+      const dispose = jest.fn(); disposals.push(dispose);
+      return { collect: async () => { throw new CrmSourceAuthExpiredError(); }, dispose };
+    });
+    const result = await service.withSourceBatch(async batch => {
+      contexts[0].newPage.mockReset().mockResolvedValueOnce(pages[0]).mockResolvedValueOnce(pages[1]);
+      return [await batch.readCard(job, factory), await batch.readCard(job, factory)];
+    });
+    expect(result).toMatchObject({ ok: true, value: [
+      { ok: false, errorCode: 'AUTH_REQUIRED', retryable: false },
+      { ok: false, errorCode: 'AUTH_REQUIRED', retryable: false },
+    ] });
+    expect(factory).toHaveBeenCalledTimes(2);
+    expect(contexts[0].newPage).toHaveBeenCalledTimes(2);
+    expect(disposals.every(dispose => dispose.mock.calls.length === 1)).toBe(true);
+    expect(pages.every(readerPage => readerPage.close.mock.calls.length === 1)).toBe(true);
+    expect(refreshCrmBrowserAccess).toHaveBeenCalledTimes(1);
+    expect(refreshCrmBrowserAccess).toHaveBeenCalledWith(pages[1]);
+    expect(service.capabilities().health).toMatchObject({ status: 'ERROR', errorCode: 'AUTH_REQUIRED' });
+    expect(contexts[0].close).toHaveBeenCalledTimes(1);
   });
 
   test('a source batch closes its context on action failure without returning secrets', async () => {
@@ -360,11 +423,34 @@ describe('CRM screenshot evidence', () => {
     expect(contexts[0].close).toHaveBeenCalled();
     const handler = page.route.mock.calls[0][1];
     const route = {
-      request: () => ({ isNavigationRequest: () => true, frame: () => 'main-frame', url: () => 'https://evil.example/' }),
+      request: () => ({ method: () => 'GET', isNavigationRequest: () => true, frame: () => 'main-frame', url: () => 'https://evil.example/' }),
       abort: jest.fn(), continue: jest.fn(),
     };
     await handler(route);
     expect(route.abort).toHaveBeenCalled();
+    expect(route.continue).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ['https://amojo.amocrm.ru/v1/chats/chat/read', 'POST', true],
+    ['https://amojo.amocrm.ru/v1/chats/chat/messages', 'POST', true],
+    [`${origin}/ajax/v3/chats/chat/read`, 'POST', true],
+    [`${origin}/api/v4/talks/42/read`, 'POST', true],
+    [`${origin}/ajax/v1/chats/session`, 'POST', false],
+    ['https://amojo.amocrm.ru/session/refresh_token', 'POST', false],
+    [`${origin}/oauth2/access_token`, 'POST', false],
+    ['https://amojo.amocrm.ru/v1/chats/chat/messages', 'GET', false],
+  ])('allows native auth and reads while blocking chat writes: %s %s', (url, method, expected) => {
+    expect(isCrmCollectorChatMutation(url as string, method as string, origin)).toBe(expected);
+  });
+
+  test('the page route blocks an automatic read receipt before any collector action', async () => {
+    await service.capture(job);
+    const handler = page.route.mock.calls[0][1];
+    const route = { request: () => ({ method: () => 'POST', url: () => 'https://amojo.amocrm.ru/v1/chats/example/read' }),
+      abort: jest.fn(), continue: jest.fn() };
+    await handler(route);
+    expect(route.abort).toHaveBeenCalledWith('blockedbyclient');
     expect(route.continue).not.toHaveBeenCalled();
   });
 

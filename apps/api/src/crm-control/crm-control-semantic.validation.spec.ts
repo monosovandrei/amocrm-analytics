@@ -126,6 +126,35 @@ describe('local semantic response validation', () => {
     expect(result.status).toBe('VALIDATED');
     expect(result.findings.find(item => item.fact === 'agreed_deadline')?.date).toEqual({ value: '2026-09-23T12:30:00.000Z', precision: 'minute' });
     request.coverage.communications = false;
+    expect(validateCrmControlSemanticResponse(request, response).status).toBe('VALIDATED');
+    response.findings.find(finding => finding.fact === 'customer_agreement')!.state = 'absent';
+    response.findings.find(finding => finding.fact === 'customer_agreement')!.evidence = [];
+    expect(codes(validateCrmControlSemanticResponse(request, response))).toContain('INCOMPLETE_COMMUNICATIONS');
+  });
+
+  it('does not overlook a known later cancellation when the model cites the earlier agreement', () => {
+    const note = source({ text: 'Клиент согласовал презентацию 23.09.2026 в 15:30.' });
+    const customer = source({ id: 'customer-1', kind: 'customer_message', actor: 'customer', actorId: 'contact-8',
+      direction: 'incoming', text: 'Да, согласен: презентация 23.09.2026 в 15:30.' });
+    const cancellation = source({ ...customer, id: 'customer-2', sourceHash: undefined, createdAt: '2026-09-22T11:00:00+03:00',
+      text: 'Отменяю договорённость о переносе. Новый срок пока неизвестен.' });
+    const { request, response } = fixture('deadline_agreement', [note, customer, cancellation]);
+    request.coverage.communications = false;
+    for (const finding of response.findings.filter(item => item.fact !== 'manager_note')) {
+      finding.evidence = [{ sourceId: customer.id, sourceHash: customer.sourceHash, quote: customer.text }];
+    }
+    expect(validateCrmControlSemanticResponse(request, response).status).toBe('UNKNOWN');
+    expect(codes(validateCrmControlSemanticResponse(request, response))).toContain('CONFLICTING_CUSTOMER_AGREEMENT');
+    cancellation.createdAt = '2026-09-21T11:00:00+03:00';
+    expect(validateCrmControlSemanticResponse(request, response).status).toBe('VALIDATED');
+  });
+
+  it('allows positive price-delay evidence from a partial channel read but never certifies absent evidence', () => {
+    const customer = source({ kind: 'customer_message', actor: 'customer', actorId: 'contact-8', direction: 'incoming',
+      text: 'Для расчёта нашей цены нужны дополнительные два дня.' });
+    const { request, response } = fixture('price_delay', [customer]); request.coverage.communications = false;
+    expect(validateCrmControlSemanticResponse(request, response).status).toBe('VALIDATED');
+    response.findings[0] = { fact: 'price_delay_reason', state: 'absent', evidence: [] };
     expect(codes(validateCrmControlSemanticResponse(request, response))).toContain('INCOMPLETE_COMMUNICATIONS');
   });
 
@@ -150,12 +179,23 @@ describe('local semantic response validation', () => {
     expect(validateCrmControlSemanticResponse(supplier.request, supplier.response).status).toBe('VALIDATED');
   });
 
-  it('requires an identified speaker for a customer call transcript', () => {
+  it('does not accept an identified actor as proof of call transcription quality', () => {
     const { request, response } = fixture('price_delay', [source({ kind: 'call_transcript', actor: 'customer', actorId: null,
       direction: 'outgoing', text: 'Переносим расчёт цены до конца недели.' })]);
     expect(validateCrmControlSemanticResponse(request, response).status).toBe('UNKNOWN');
     request.sources[0].actorId = 'contact-8';
-    expect(validateCrmControlSemanticResponse(request, response).status).toBe('VALIDATED');
+    expect(validateCrmControlSemanticResponse(request, response).status).toBe('UNKNOWN');
+    expect(codes(validateCrmControlSemanticResponse(request, response))).toContain('CALL_TRANSCRIPT_UNVERIFIED');
+  });
+  it.each(['present','absent'] as const)('unverified call text cannot certify %s evidence even with fabricated quality claims', state => {
+    const { request, response } = fixture('price_delay', [source({ kind: 'call_transcript', actor: 'customer', actorId: 'contact-8',
+      direction: 'incoming', text: 'Переносим расчёт цены до конца недели.' })]);
+    Object.assign(request.sources[0], { quality: 'VERIFIED', channelBinding: 'SERVER_VERIFIED_STEREO' });
+    response.findings[0].state = state;
+    if (state === 'absent') response.findings[0].evidence = [];
+    const result = validateCrmControlSemanticResponse(request, response);
+    expect(result.status).toBe('UNKNOWN'); expect(codes(result)).toContain('CALL_TRANSCRIPT_UNVERIFIED');
+    if (state === 'present') expect(codes(result)).toContain('MISSING_TRUSTED_WITNESS');
   });
 
   it('preserves uncertainty and does not certify absence from partial or undated sources', () => {

@@ -9,8 +9,11 @@ import { CRM_CONTROL_SEMANTIC_FACTS, CrmControlSemanticRequest, validateCrmContr
 import { buildCrmControlSemanticRequest } from './crm-control-semantic.request';
 import { CRM_CONTROL_SEMANTIC_POLICY_VERSION, assessCrmControlSemantic } from './crm-control-semantic.policy';
 import { canonicalCrmControlSemanticJson as canonical, crmControlSemanticInputHash } from './crm-control-semantic.identity';
+import { CrmControlBrowserSourceService } from './crm-control-browser-source.service';
+import { appendCrmControlArchivedChatSources } from './crm-control-semantic.chat';
+import { appendCrmControlArchivedMailSources } from './crm-control-semantic.mail';
 
-export const CRM_CONTROL_ANALYZER_VERSION = '2';
+export const CRM_CONTROL_ANALYZER_VERSION = '4';
 const ATTEMPTS_PER_REQUEST = 3;
 const LEASE_MS = 5 * 60_000; // Longer than the client's hard 180-second request limit.
 const ACTIVE_KEY = 'local-semantic';
@@ -40,7 +43,7 @@ export function crmControlLocalAnalysisOptions(env: NodeJS.ProcessEnv = process.
 @Injectable()
 export class CrmControlAnalysisService {
   private busy = false;
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(private readonly prisma: PrismaService, private readonly browserSources?: CrmControlBrowserSourceService) {}
 
   /** Internal only: callers build sources from this archived observation, never from a fresh CRM read. */
   async enqueue(resultId: string, snapshotHash: string, supplied: CrmControlSemanticRequest) {
@@ -64,12 +67,25 @@ export class CrmControlAnalysisService {
     if (!expected || canonical({ ...supplied, requestId: undefined }) !== canonical({ ...expected, requestId: undefined })) {
       throw new BadRequestException('Источники анализа не соответствуют сохранённым данным проверки.');
     }
-    const preflight = validateCrmControlSemanticResponse(supplied, { schemaVersion: 1, requestId: supplied.requestId,
-      check: supplied.check, subjectId: supplied.subjectId, inspectedSourceIds: supplied.sources.map(source => source?.id),
-      findings: CRM_CONTROL_SEMANTIC_FACTS[supplied.check]?.map(fact => ({ fact, state: 'uncertain', evidence: [] })) });
+    let trusted = expected;
+    const browser = snapshot?.browserSources;
+    if (this.browserSources && ['deadline_agreement', 'price_delay'].includes(expected.check) && browser?.manifest
+      && typeof browser.connectionId === 'string' && typeof browser.accountExternalId === 'string' && observation.dealExternalId) {
+      const connection = await this.prisma.amoConnection.findUnique({ where: { id: browser.connectionId }, select: { id: true, accountId: true } });
+      if (connection && connection.accountId === browser.accountExternalId) {
+        try {
+          const manifest = await this.browserSources.readManifest(browser.manifest, observation.dealExternalId);
+          trusted = appendCrmControlArchivedChatSources(observation, expected, manifest, connection);
+          trusted = appendCrmControlArchivedMailSources(observation, trusted, manifest, connection);
+        } catch { /* A missing/corrupt private archive is never replaced with caller-provided chat text. */ }
+      }
+    }
+    const preflight = validateCrmControlSemanticResponse(trusted, { schemaVersion: 1, requestId: trusted.requestId,
+      check: trusted.check, subjectId: trusted.subjectId, inspectedSourceIds: trusted.sources.map(source => source?.id),
+      findings: CRM_CONTROL_SEMANTIC_FACTS[trusted.check]?.map(fact => ({ fact, state: 'uncertain', evidence: [] })) });
     if (preflight.status === 'INVALID') throw new BadRequestException('Некорректные источники анализа.');
     // Preserve the trusted builder's stable ID; ignore only an arbitrary caller's replacement ID.
-    const request = JSON.parse(canonical(expected)) as CrmControlSemanticRequest;
+    const request = JSON.parse(canonical(trusted)) as CrmControlSemanticRequest;
     const inputHash = crmControlSemanticInputHash(request, { promptVersion: CRM_CONTROL_LOCAL_PROMPT_VERSION,
       model: options.model, modelSha256: options.modelSha256 });
     return this.prisma.crmControlAnalysisJob.upsert({
@@ -170,10 +186,10 @@ export class CrmControlAnalysisService {
       : outcome.status === 'ERROR' ? outcome.code : null;
     const retryable = outcome.status === 'ERROR' && outcome.retryable && TRANSIENT.has(outcome.code) && job.attemptCount < job.attemptLimit;
     const cycleAttempt = Math.max(1, job.attemptCount - (job.attemptLimit - ATTEMPTS_PER_REQUEST));
-    const status = errorCode ? 'ERROR' : validation?.status === 'VALIDATED' ? 'READY' : 'UNKNOWN';
     const rule = validation && !errorCode ? await this.prisma.crmControlResult.findUnique({ where: { id: job.resultId }, select: { ruleCode: true } }) : null;
     const assessment = validation && !errorCode && rule ? assessCrmControlSemantic(job.request as unknown as CrmControlSemanticRequest, validation, rule.ruleCode)
       : { status: 'UNKNOWN', message: 'Локальный анализ пока не дал проверенного результата.', policyVersion: CRM_CONTROL_SEMANTIC_POLICY_VERSION };
+    const status = errorCode ? 'ERROR' : assessment.status !== 'UNKNOWN' ? 'READY' : 'UNKNOWN';
     await this.prisma.$transaction(async tx => {
       const changed = await tx.crmControlAnalysisJob.updateMany({ where: { id: job.id, status: 'RUNNING', activeKey: ACTIVE_KEY,
         leaseToken: job.leaseToken, attemptCount: job.attemptCount, leaseUntil: { gt: now } }, data: {
