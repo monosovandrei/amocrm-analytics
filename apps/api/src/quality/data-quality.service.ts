@@ -31,7 +31,7 @@ const REPORT_SOURCE_TOLERANCE_MS = 90_000;
 const FRESHNESS_WARNING_MS = 3 * 60_000;
 const FRESHNESS_BLOCK_MS = 10 * 60_000;
 const CONFIRMATION_WINDOW_MS = 10 * 60_000;
-const REQUIRED_WORKER_ROLES = ['sync', 'report', 'notification', 'export', 'bootstrap'];
+const REQUIRED_WORKER_ROLES = ['sync', 'report', 'notification', 'export', 'bootstrap', 'crm-control'];
 
 @Injectable()
 export class DataQualityService {

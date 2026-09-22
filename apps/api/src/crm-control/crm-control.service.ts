@@ -1,10 +1,17 @@
 import { BadRequestException, ConflictException, ForbiddenException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { createHash, randomUUID } from 'crypto';
+import path from 'node:path';
+import { CrmControlSourceService } from './crm-control-source.service';
+import { indexCrmControlSourcesForDeals } from './crm-control-source.normalizer';
+import { CrmControlSourceWindow } from './crm-control-source.types';
+import { CrmControlDriveReader } from './crm-control-drive';
+import { CrmControlProposalSourceCollector } from './crm-control-proposal-sources';
 import { Prisma } from '../generated/prisma';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthUser } from '../auth/jwt.strategy';
 import { AmoService } from '../amo/amo.service';
-import { CrmControlEvidenceService } from './crm-control-evidence.service';
+import { AmoRequestError } from '../amo/amo-client';
+import { CaptureHealth, CrmControlEvidenceService, sanitizeCrmCaptureHealth } from './crm-control-evidence.service';
 import { CRM_CONTROL_RULE_CATALOG, CRM_CONTROL_RULE_VERSION, evaluateCrmControlDeal } from './crm-control.rules';
 import { hasStageDeadline, stageDeadlineConfigError } from './crm-control-deadline';
 import { CrmControlConfig, CrmControlCounts, CrmControlDecisionInput, CrmControlManualReviewInput, CrmControlRuleInput, CrmControlRuleResult,
@@ -30,6 +37,15 @@ const normal = (value: string) => value.trim().toLocaleLowerCase('ru').replace(/
 const timestamp = (value: unknown): Date | null => Number.isFinite(Number(value)) && Number(value) > 0 ? new Date(Number(value) * 1000) : null;
 const opaqueError = () => 'Не удалось прочитать данные amoCRM. Проверьте подключение и повторите проверку.';
 class ControlRunError extends Error {}
+const runAttempts = (run: { counts: unknown; startedAt?: Date | null }) => {
+  const stored = Number((run.counts as any)?.executionAttempts);
+  return Number.isInteger(stored) && stored > 0 ? stored : run.startedAt ? 1 : 0;
+};
+const runDay = (run: { config: unknown }, date: Date) => new Intl.DateTimeFormat('en-CA', {
+  timeZone: (run.config as CrmControlConfig).timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+}).format(date);
+const transientRunError = (error: unknown) => error instanceof AmoRequestError ? error.transient
+  : !!error && typeof error === 'object' && 'code' in error && ['P1001', 'P1002', 'P1008', 'P1017', 'P2024', 'P2034'].includes(String(error.code));
 
 @Injectable()
 export class CrmControlService {
@@ -66,8 +82,12 @@ export class CrmControlService {
       this.taskTypeCatalog(),
     ]);
     const capture = this.evidenceProvider.capabilities();
+    const health = await this.readEvidenceHealth(capture);
+    const captureMessage = !capture.screenshots ? capture.message : health.status === 'READY'
+      ? 'Вход сборщика проверен на карточке amoCRM. Доступ проверяется при каждом снимке.'
+      : health.status === 'ERROR' ? health.message : 'Сессия подготовлена, но текущий вход в amoCRM ещё не подтверждён сборщиком.';
     return { ...stored, canManage: access.role === 'OWNER', canReview: access.role !== 'MANAGER', canDispute: true,
-      capabilities: { ...capture, communications: false, proposalFiles: false, taskTypes: taskTypes.available },
+      capabilities: { ...capture, health, message: captureMessage, communications: false, proposalFiles: false, taskTypes: taskTypes.available },
       options: { pipelines: pipelines.map((pipeline) => ({ id: pipeline.id, name: pipeline.name,
         stages: pipeline.stages.filter(isWorkingStage).map(({ id, name, isWon, isLost }) => ({ id, name, isWon, isLost })) })),
         taskTypes: taskTypes.items },
@@ -425,8 +445,59 @@ export class CrmControlService {
         managerId: row.managerId, groupId: row.groupId, action: `VERIFY_${body.outcome}`,
         reason: `${body.reason.trim()}\nИсточник: ${evidence.href}`, validUntil: null,
         createdAt: new Date(Math.max(Date.now(), last ? last.createdAt.getTime() + 1 : 0)) } });
+      if (body.outcome === 'FAIL') await this.ensureEvidenceForObservation(tx, row);
       return this.manualReviewResponse(decision);
     });
+  }
+
+  private async ensureEvidenceForObservation(tx: Prisma.TransactionClient, observation: { id: string; dealUrl: string }) {
+    const capability = this.evidenceProvider.capabilities();
+    // A later manual FAIL may be the first violation in this observation. Never replace an existing image or retry history.
+    return tx.crmControlEvidence.upsert({ where: { observationId: observation.id }, update: {},
+      create: { observationId: observation.id, sourceUrl: observation.dealUrl,
+        status: capability.screenshots ? 'PENDING' : 'DISABLED', error: capability.screenshots ? null : capability.message } });
+  }
+
+  private async persistEvidenceHealth() {
+    const runtime = this.evidenceProvider.runtimeHealth();
+    const config = json({ configurationFingerprint: runtime.configurationFingerprint,
+      health: sanitizeCrmCaptureHealth(runtime.health) });
+    try {
+      await this.prisma.crmControlSettings.upsert({ where: { id: 'runtime:screenshot-health' },
+        create: { id: 'runtime:screenshot-health', config }, update: { config } });
+    } catch { this.logger.warn('CRM screenshot runtime health could not be saved; no session data is logged'); }
+  }
+
+  private async readEvidenceHealth(capture: { screenshots: boolean; health?: CaptureHealth }): Promise<CaptureHealth> {
+    if (!capture.screenshots) return sanitizeCrmCaptureHealth(capture.health);
+    const runtime = this.evidenceProvider.runtimeHealth();
+    const local = sanitizeCrmCaptureHealth(runtime.health);
+    if (!runtime.configurationFingerprint) return local;
+    const saved = await this.prisma.crmControlSettings.findUnique({ where: { id: 'runtime:screenshot-health' }, select: { config: true } });
+    const envelope = saved?.config;
+    if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)
+      || envelope.configurationFingerprint !== runtime.configurationFingerprint) return local;
+    const shared = sanitizeCrmCaptureHealth(envelope.health);
+    if (local.checkedAt && (!shared.checkedAt || Date.parse(local.checkedAt) > Date.parse(shared.checkedAt))) return local;
+    return shared;
+  }
+
+  async probeEvidence(actor: AuthUser, observationId: string) {
+    const { row, access } = await this.visibleObservation(actor, observationId);
+    if (access.role !== 'OWNER') throw new ForbiddenException('Подключение сборщика проверяет владелец');
+    if (!await this.captureOwnerMatches(row, row.dealUrl)) throw new BadRequestException('Ответственный или группа изменились. Выберите актуальную проверку сделки');
+    const health = await this.evidenceProvider.probe({ observationId: row.id, dealExternalId: row.dealExternalId, sourceUrl: row.dealUrl, dealTitle: row.dealTitle });
+    await this.persistEvidenceHealth();
+    return sanitizeCrmCaptureHealth(health);
+  }
+
+  async requeueDisabledEvidence(actor: AuthUser, observationId: string) {
+    const health = await this.probeEvidence(actor, observationId);
+    if (health.status !== 'READY') throw new BadRequestException(health.message || 'Сначала восстановите вход сборщика в amoCRM');
+    // Only jobs that could not start are resumed. ERROR and READY retain their existing history.
+    const updated = await this.prisma.crmControlEvidence.updateMany({ where: { status: 'DISABLED' },
+      data: { status: 'PENDING', attempts: 0, startedAt: null, nextAttemptAt: null, error: null } });
+    return { queued: updated.count, health };
   }
 
   async evidenceFile(actor: AuthUser, id: string) {
@@ -451,23 +522,45 @@ export class CrmControlService {
   }
 
   async processQueue() {
-    // Expired leases are visible failures. Existing immutable observations are never overwritten.
-    await this.prisma.crmControlRun.updateMany({ where: { status: 'RUNNING', heartbeatAt: { lt: new Date(Date.now() - 30 * 60_000) } },
-      data: { status: 'ERROR', activeKey: null, finishedAt: new Date(), error: 'Проверка прервана. Запустите повторную проверку.' } });
+    const expiredBefore = new Date(Date.now() - 30 * 60_000);
+    const expired = await this.prisma.crmControlRun.findMany({ where: { status: 'RUNNING', activeKey: 'global', OR: [
+      { heartbeatAt: { lt: expiredBefore } }, { heartbeatAt: null, startedAt: { lt: expiredBefore } },
+    ] } });
+    for (const item of expired) {
+      const resumable = runAttempts(item) < 3 && item.ruleVersion === CRM_CONTROL_RULE_VERSION
+        && runDay(item, item.scheduledFor) === runDay(item, new Date());
+      await this.prisma.crmControlRun.updateMany({ where: { id: item.id, status: 'RUNNING', activeKey: 'global', startedAt: item.startedAt, heartbeatAt: item.heartbeatAt },
+        data: { status: resumable ? 'QUEUED' : 'ERROR', activeKey: null, finishedAt: resumable ? null : new Date(),
+          error: resumable ? null : 'Проверка прервана. Продолжение в тот же день и с прежней версией правил недоступно либо исчерпаны три попытки. Нужен новый запуск.' } });
+    }
     if (await this.prisma.crmControlRun.count({ where: { activeKey: 'global' } })) return;
     const pending = await this.prisma.crmControlRun.findFirst({ where: { status: 'QUEUED' }, orderBy: { createdAt: 'asc' } });
     if (!pending) return;
+    if (runAttempts(pending) > 0 && (runAttempts(pending) >= 3 || pending.ruleVersion !== CRM_CONTROL_RULE_VERSION)) {
+      await this.prisma.crmControlRun.updateMany({ where: { id: pending.id, status: 'QUEUED', startedAt: pending.startedAt },
+        data: { status: 'ERROR', finishedAt: new Date(), error: 'Продолжение с прежней версией правил недоступно либо исчерпаны три попытки. Нужен новый запуск.' } });
+      return;
+    }
     let claimed: { count: number };
-    try { claimed = await this.prisma.crmControlRun.updateMany({ where: { id: pending.id, status: 'QUEUED' },
-      data: { status: 'RUNNING', activeKey: 'global', startedAt: new Date(), heartbeatAt: new Date(), ruleVersion: CRM_CONTROL_RULE_VERSION } }); }
+    const claimedAt = new Date(Math.max(Date.now(), (pending.startedAt?.getTime() ?? 0) + 1));
+    const attempt = runAttempts(pending) + 1;
+    try { claimed = await this.prisma.crmControlRun.updateMany({ where: { id: pending.id, status: 'QUEUED', startedAt: pending.startedAt },
+      data: { status: 'RUNNING', activeKey: 'global', startedAt: claimedAt, heartbeatAt: new Date(), ruleVersion: CRM_CONTROL_RULE_VERSION,
+        sourceSyncAt: pending.sourceSyncAt ?? claimedAt, error: null, counts: json({ ...(pending.counts as object), executionAttempts: attempt }) } }); }
     catch (error) { if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') return; throw error; }
     if (claimed.count !== 1) return;
-    try { await this.executeRun(pending); }
-    catch (error) { await this.prisma.crmControlRun.updateMany({ where: { id: pending.id, activeKey: 'global', status: 'RUNNING' }, data: { status: 'ERROR', activeKey: null, finishedAt: new Date(), error: error instanceof ControlRunError ? error.message : opaqueError() } });
+    try { await this.executeRun({ ...pending, startedAt: claimedAt, sourceSyncAt: pending.sourceSyncAt ?? claimedAt,
+      ruleVersion: CRM_CONTROL_RULE_VERSION, counts: { ...(pending.counts as object), executionAttempts: attempt } }); }
+    catch (error) {
+      const retry = transientRunError(error) && attempt < 3 && runDay(pending, pending.scheduledFor) === runDay(pending, new Date());
+      await this.prisma.crmControlRun.updateMany({ where: { id: pending.id, activeKey: 'global', status: 'RUNNING', startedAt: claimedAt },
+        data: { status: retry ? 'QUEUED' : 'ERROR', activeKey: null, finishedAt: retry ? null : new Date(),
+          error: retry ? null : error instanceof ControlRunError ? error.message : opaqueError() } });
       this.logger.warn(`CRM control run ${pending.id} failed; source credentials and responses are omitted`); }
   }
 
   private async executeRun(run: Prisma.CrmControlRunGetPayload<Record<string, never>>) {
+    if (!run.startedAt) throw new ControlRunError('Не удалось подтвердить попытку выполнения проверки.');
     const config = run.config as unknown as CrmControlConfig & { _access?: Access };
     const localDay = (date: Date) => new Intl.DateTimeFormat('en-CA', { timeZone: config.timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
     if (localDay(run.scheduledFor) !== localDay(new Date())) throw new ControlRunError('Проверка не выполнена в назначенный день. Нужен новый запуск; прошлое состояние не восстановлено.');
@@ -475,8 +568,10 @@ export class CrmControlService {
       this.prisma.pipeline.findMany({ include: { stages: true } }), this.prisma.crmUser.findMany({ include: { group: true } }),
       this.amo.getActiveConnectionOrFail(),
     ]);
-    const client = await this.amo.getClient(connection);
-    const issues = this.configurationIssues(config, pipelines);
+    const requestedInterval = Number(process.env.CRM_CONTROL_REQUEST_INTERVAL_MS ?? 250);
+    const client = await this.amo.getClient(connection, { minRequestIntervalMs: Number.isFinite(requestedInterval) ? Math.max(250, requestedInterval) : 250 });
+    const issues = [...new Set([...this.configurationIssues(config, pipelines),
+      ...(Array.isArray(run.issues) ? run.issues.filter((issue): issue is string => typeof issue === 'string') : [])])];
     const counts = emptyControlCounts();
     const scopeByExternalId = new Map(config.scopes.flatMap((scope) => {
       const pipeline = pipelines.find((item) => item.id === scope.pipelineId);
@@ -490,7 +585,7 @@ export class CrmControlService {
         throw new ControlRunError(`${pipeline.name}: в настройках выбран системный или закрытый этап. Выберите рабочие этапы перед запуском.`);
       }
     }
-    const sourceStartedAt = new Date();
+    const sourceStartedAt = run.sourceSyncAt ?? new Date();
     const sourceParams: Record<string, string | number> = { 'order[id]': 'asc' };
     let statusIndex = 0;
     for (const { pipeline } of scopeByExternalId.values()) for (const stage of pipeline.stages.filter(isWorkingStage)) {
@@ -500,47 +595,94 @@ export class CrmControlService {
     }
     if (!statusIndex) throw new ControlRunError('В выбранных воронках нет доступных открытых этапов.');
     const observedDealIds = new Set<string>();
+    // Resume reads only missing deals; saved observations retain their original observedAt and raw facts.
+    let observationCursor: string | undefined;
+    while (true) {
+      const saved = await this.prisma.crmControlObservation.findMany({ where: { runId: run.id }, orderBy: { id: 'asc' }, take: 250,
+        select: { id: true, dealExternalId: true, counts: true }, ...(observationCursor ? { cursor: { id: observationCursor }, skip: 1 } : {}) });
+      if (!saved.length) break;
+      for (const observation of saved) {
+        observedDealIds.add(observation.dealExternalId);
+        addControlCounts(counts, observation.counts as unknown as CrmControlCounts);
+      }
+      observationCursor = saved[saved.length - 1].id;
+    }
+    const lease = { id: run.id, status: 'RUNNING', activeKey: 'global', startedAt: run.startedAt };
+    const heartbeat = async () => {
+      const updated = await this.prisma.crmControlRun.updateMany({ where: lease,
+        data: { heartbeatAt: new Date(), counts: json({ ...counts, executionAttempts: runAttempts(run) }), issues: json(issues) } });
+      if (updated.count !== 1) throw new ControlRunError('Проверка прервана другим процессом.');
+    };
+    await heartbeat();
+    const communicationReadAt = new Date();
+    let sourceWindow: CrmControlSourceWindow | null = null;
+    try {
+      sourceWindow = await new CrmControlSourceService(this.prisma).loadWindow({ connectionId: connection.id,
+        receivedFrom: new Date(0), receivedTo: communicationReadAt, maxRows: 50_000 });
+    } catch { issues.push('Не удалось прочитать сохранённые сообщения amoCRM. Сверка отправленных документов не завершена.'); }
+    const messageIndex = indexCrmControlSourcesForDeals(sourceWindow?.messages ?? [], { connectionId: connection.id,
+      dealExternalIds: [...new Set((sourceWindow?.messages ?? []).flatMap(message => message.binding.leadExternalId ? [message.binding.leadExternalId] : []))],
+      observedAt: communicationReadAt });
+    const proposalFields = await this.prisma.customFieldDefinition.findMany({ where: { entityType: 'LEAD', type: 'file' },
+      select: { externalId: true, name: true } });
+    const namedProposalFields = proposalFields.filter(field => normal(field.name) === 'кп');
+    const proposalFieldId = namedProposalFields.length === 1 ? namedProposalFields[0].externalId : null;
+    let driveReader: CrmControlDriveReader | null = null;
+    try {
+      const account = await client.get<any>('/account', { with: 'drive_url' });
+      driveReader = new CrmControlDriveReader(client, account.drive_url);
+    } catch { issues.push('Не удалось подключить хранилище файлов amoCRM для сверки КП.'); }
+    const proposalCollector = new CrmControlProposalSourceCollector(driveReader,
+      process.env.CRM_CONTROL_EVIDENCE_DIR ? path.join(process.env.CRM_CONTROL_EVIDENCE_DIR, 'documents') : null);
     // Enumerate the source itself. A fresh local sync timestamp cannot prove a complete task/notes list.
     await client.paginateBatch<any>('/leads', 'leads', sourceParams, async (leads) => {
-      for (const listedLead of leads) {
+      const uniqueLeads = [...new Map(leads.map((lead) => [String(lead.id), lead])).values()];
+      for (let offset = 0; offset < uniqueLeads.length; offset += 3) {
+        const collected = await Promise.allSettled(uniqueLeads.slice(offset, offset + 3).map(async (listedLead) => {
         if (localDay(new Date()) !== localDay(sourceStartedAt)) throw new ControlRunError('Обход пересёк полночь. Сохранена только выполненная часть; запустите новую проверку.');
-        if (observedDealIds.has(String(listedLead.id))) continue;
+        if (observedDealIds.has(String(listedLead.id))) return;
         const match = scopeByExternalId.get(String(listedLead.pipeline_id));
-        if (!match) continue;
+        if (!match) return;
         let stage = match.pipeline.stages.find((item) => item.externalId === String(listedLead.status_id));
-        if (!stage) { if (!issues.includes('Часть этапов отсутствует в справочнике. Обновите синхронизацию amoCRM.')) issues.push('Часть этапов отсутствует в справочнике. Обновите синхронизацию amoCRM.'); continue; }
-        if (!isWorkingStage(stage) || listedLead.is_deleted) continue;
+        if (!stage) { if (!issues.includes('Часть этапов отсутствует в справочнике. Обновите синхронизацию amoCRM.')) issues.push('Часть этапов отсутствует в справочнике. Обновите синхронизацию amoCRM.'); return; }
+        if (!isWorkingStage(stage) || listedLead.is_deleted) return;
         const user = users.find((item) => item.externalId === String(listedLead.responsible_user_id));
-        if (config._access?.role === 'MANAGER' && user?.id !== config._access.managerId) continue;
-        if (config._access?.role === 'ROP' && user?.groupId !== config._access.groupId) continue;
+        if (config._access?.role === 'MANAGER' && user?.id !== config._access.managerId) return;
+        if (config._access?.role === 'ROP' && user?.groupId !== config._access.groupId) return;
         const sourceReadStartedAt = new Date();
         let lead = listedLead;
         let dealComplete = true, tasksComplete = true, notesComplete = true;
         try { lead = await client.get(`/leads/${listedLead.id}`); } catch { dealComplete = false; }
         // A deal may have moved while the source list was being paginated.
         const currentMatch = scopeByExternalId.get(String(lead.pipeline_id));
-        if (!currentMatch) continue;
+        if (!currentMatch) return;
         stage = currentMatch.pipeline.stages.find((item) => item.externalId === String(lead.status_id));
-        if (!stage || !isWorkingStage(stage) || lead.is_deleted) continue;
+        if (!stage || !isWorkingStage(stage) || lead.is_deleted) return;
         const responsible = users.find((item) => item.externalId === String(lead.responsible_user_id));
-        if (config._access?.role === 'MANAGER' && responsible?.id !== config._access.managerId) continue;
-        if (config._access?.role === 'ROP' && responsible?.groupId !== config._access.groupId) continue;
+        if (config._access?.role === 'MANAGER' && responsible?.id !== config._access.managerId) return;
+        if (config._access?.role === 'ROP' && responsible?.groupId !== config._access.groupId) return;
         let taskRows: any[] = [], noteRows: any[] = [];
-        try { taskRows = await client.paginate('/tasks', 'tasks', { 'filter[entity_type]': 'leads', 'filter[entity_id]': String(lead.id), 'filter[is_completed]': 0 }); } catch { tasksComplete = false; }
-        try { noteRows = await client.paginate(`/leads/${lead.id}/notes`, 'notes'); } catch { notesComplete = false; }
+        const [tasksRead, notesRead, eventsRead] = await Promise.allSettled([
+          client.paginate('/tasks', 'tasks', { 'filter[entity_type]': 'leads', 'filter[entity_id]': String(lead.id), 'filter[is_completed]': 0 }),
+          client.paginate(`/leads/${lead.id}/notes`, 'notes'),
+          client.paginate<any>('/events', 'events', { 'filter[entity]': 'lead', 'filter[entity_id][]': String(lead.id),
+            'filter[type]': 'lead_status_changed', limit: 100 }),
+        ]);
+        if (tasksRead.status === 'fulfilled') taskRows = tasksRead.value; else tasksComplete = false;
+        if (notesRead.status === 'fulfilled') noteRows = notesRead.value; else notesComplete = false;
         // Source identity stays stable even if the first audit precedes the local CRM sync.
         const dealId = `amo:${lead.id}`;
         let stageEnteredAt: Date | null = null;
         let stageEvent: any = null;
-        try {
-          const events = await client.paginate<any>('/events', 'events', { 'filter[entity]': 'lead', 'filter[entity_id][]': String(lead.id),
-            'filter[type]': 'lead_status_changed', limit: 100 });
-          stageEvent = events.sort((a, b) => Number(b.created_at) - Number(a.created_at))[0] ?? null;
+        if (eventsRead.status === 'fulfilled') {
+          stageEvent = eventsRead.value.sort((a, b) => Number(b.created_at) - Number(a.created_at))[0] ?? null;
           const changedTo = stageEvent?.value_after?.[0]?.lead_status;
           if (String(changedTo?.id) === String(lead.status_id) && String(changedTo?.pipeline_id) === String(lead.pipeline_id)) {
             stageEnteredAt = timestamp(stageEvent.created_at);
           }
-        } catch { /* Unknown stage entry never becomes an invented creation-date deadline. */ }
+        }
+        const messageEvidence = messageIndex.byDeal.get(String(lead.id)) ?? [];
+        const proposalSources = await proposalCollector.collect(lead.custom_fields_values ?? [], proposalFieldId, messageEvidence);
         let finalLead: any = null;
         try {
           finalLead = await client.get(`/leads/${lead.id}`);
@@ -552,11 +694,12 @@ export class CrmControlService {
         }
         if (finalLead && String(finalLead.responsible_user_id) !== String(lead.responsible_user_id)) {
           if (!issues.includes('Часть сделок сменила ответственного во время обхода; нужен повтор.')) issues.push('Часть сделок сменила ответственного во время обхода; нужен повтор.');
-          continue;
+          return;
         }
         const finalStage = finalLead && pipelines.find((pipeline) => pipeline.externalId === String(finalLead.pipeline_id))?.stages.find((item) => item.externalId === String(finalLead.status_id));
-        if (finalLead && (finalLead.is_deleted || (finalStage && !isWorkingStage(finalStage)))) continue;
+        if (finalLead && (finalLead.is_deleted || (finalStage && !isWorkingStage(finalStage)))) return;
         const observedAt = new Date();
+        if (localDay(observedAt) !== localDay(sourceStartedAt)) throw new ControlRunError('Обход пересёк полночь. Сохранена только выполненная часть; запустите новую проверку.');
         const input: CrmControlRuleInput = {
           deal: { id: dealId, externalId: String(lead.id), title: String(lead.name ?? ''), amount: Number(lead.price ?? 0),
             createdAt: timestamp(lead.created_at) ?? new Date(NaN), pipelineId: currentMatch.pipeline.id, stageId: stage.id,
@@ -565,25 +708,33 @@ export class CrmControlService {
             dueAt: timestamp(task.complete_till), isCompleted: Boolean(task.is_completed), raw: task })),
           notes: noteRows.map((note) => ({ id: `amo:${note.id}`, externalId: String(note.id), type: String(note.note_type ?? ''), text: note.params?.text ?? null,
             createdAt: timestamp(note.created_at) ?? new Date(NaN), raw: note })),
+          communications: finalLead ? messageEvidence.map(({ message }) => ({ id: message.messageId!, createdAt: message.occurredAt!,
+            type: message.direction, text: message.text ?? '' })) : [],
           stageEnteredAt, observedAt, sourceCompleteness: { deal: dealComplete && Boolean(timestamp(lead.created_at)), tasks: tasksComplete, notes: notesComplete,
             stageHistory: Boolean(stageEnteredAt), communications: false }, config, scope: currentMatch.scope,
         };
         const results = evaluateCrmControlDeal(input);
         const snapshot = { ...input, config: undefined, scope: input.scope, sourceReadStartedAt, sourceReadFinishedAt: observedAt,
-          currency: lead.currency ?? (connection.config as any)?.currency ?? null, finalLead, stageEvent, historySource: 'amoCRM_event' };
+          currency: lead.currency ?? (connection.config as any)?.currency ?? null, finalLead, stageEvent, historySource: 'amoCRM_event',
+          proposalSources: finalLead ? proposalSources : null,
+          communicationSources: finalLead ? { readAt: communicationReadAt, datasetReadComplete: sourceWindow?.datasetReadComplete ?? false,
+            sourceCoverage: 'UNVERIFIED', messages: messageEvidence.map(({ message, bindingProof }) => ({ bindingProof,
+              message: { ...message, attachments: message.attachments.map(({ url: _privateDownloadUrl, ...attachment }) => attachment) } })) } : null };
         await this.persistObservation(run.id, input, results, snapshot, {
           pipelineName: currentMatch.pipeline.name, stageName: stage.name,
           managerName: responsible?.name ?? (lead.responsible_user_id ? `Менеджер amoCRM #${lead.responsible_user_id}` : null),
           groupId: responsible?.groupId ?? null, groupName: responsible?.group?.name ?? null,
           dealUrl: `https://${client.domain.replace(/^https?:\/\//, '').replace(/\/$/, '')}/leads/detail/${lead.id}`,
-        });
+        }, run.startedAt!);
         observedDealIds.add(String(lead.id));
         addControlCounts(counts, observationCounts(results));
-        const heartbeat = await this.prisma.crmControlRun.updateMany({ where: { id: run.id, status: 'RUNNING', activeKey: 'global' }, data: { heartbeatAt: new Date(), counts: json(counts) } });
-        if (heartbeat.count !== 1) throw new ControlRunError('Проверка прервана другим процессом.');
+        }));
+        // Wait for all in-flight writers before releasing the lease or starting another attempt.
+        const failure = collected.find((item): item is PromiseRejectedResult => item.status === 'rejected');
+        await heartbeat();
+        if (failure) throw failure.reason;
       }
-      const heartbeat = await this.prisma.crmControlRun.updateMany({ where: { id: run.id, status: 'RUNNING', activeKey: 'global' }, data: { heartbeatAt: new Date() } });
-      if (heartbeat.count !== 1) throw new ControlRunError('Проверка прервана другим процессом.');
+      await heartbeat();
     });
     // Previously observed cases are re-read even if the source's open-deal list no longer contains them.
     // A 404 is not evidence of correction: permissions and deletion must not erase a violation.
@@ -613,6 +764,7 @@ export class CrmControlService {
         if (current && stage && !isWorkingStage(stage) && !closed) continue;
         const scope = config.scopes.find((scope) => scope.pipelineId === prior.pipelineId)!;
         const observedAt = new Date();
+        if (localDay(observedAt) !== localDay(sourceStartedAt)) throw new ControlRunError('Обход пересёк полночь. Сохранена только выполненная часть; запустите новую проверку.');
         const openCases = await this.prisma.crmControlCase.findMany({ where: { dealId: item.dealId, activeKey: { not: null } } });
         const results: CrmControlRuleResult[] = openCases.map((openCase) => {
           const definition = CRM_CONTROL_RULE_CATALOG.find((rule) => rule.code === openCase.ruleCode);
@@ -632,24 +784,23 @@ export class CrmControlService {
           { pipelineName: pipeline?.name ?? prior.pipelineName, stageName: stage?.name ?? prior.stageName,
             managerName: current ? currentResponsible?.name ?? null : prior.managerName,
             groupId: current ? currentResponsible?.groupId ?? null : prior.groupId,
-            groupName: current ? currentResponsible?.group?.name ?? null : prior.groupName, dealUrl: prior.dealUrl });
+            groupName: current ? currentResponsible?.group?.name ?? null : prior.groupName, dealUrl: prior.dealUrl }, run.startedAt!);
         addControlCounts(counts, observationCounts(results));
-        const heartbeat = await this.prisma.crmControlRun.updateMany({ where: { id: run.id, activeKey: 'global', status: 'RUNNING' }, data: { heartbeatAt: new Date(), counts: json(counts) } });
-        if (heartbeat.count !== 1) throw new ControlRunError('Проверка прервана другим процессом.');
+        await heartbeat();
       }
     }
     if (!counts.deals) issues.push('В выбранной области нет открытых сделок. Это не подтверждение соблюдения всех правил.');
-    await this.prisma.crmControlRun.updateMany({ where: { id: run.id, status: 'RUNNING', activeKey: 'global' }, data: {
-      status: issues.length || counts.unknown > 0 || counts.review > 0 ? 'PARTIAL' : 'COMPLETED', counts: json(counts), issues: json(issues),
+    await this.prisma.crmControlRun.updateMany({ where: lease, data: {
+      status: issues.length || counts.unknown > 0 || counts.review > 0 ? 'PARTIAL' : 'COMPLETED', counts: json({ ...counts, executionAttempts: runAttempts(run) }), issues: json(issues),
       activeKey: null, sourceSyncAt: sourceStartedAt, finishedAt: new Date(), heartbeatAt: new Date(),
     } });
   }
 
   private async persistObservation(runId: string, input: CrmControlRuleInput, results: CrmControlRuleResult[], snapshot: unknown,
-    meta: { pipelineName: string; stageName: string; managerName: string | null; groupId: string | null; groupName: string | null; dealUrl: string }) {
+    meta: { pipelineName: string; stageName: string; managerName: string | null; groupId: string | null; groupName: string | null; dealUrl: string }, leaseStartedAt: Date) {
     const snapshotJson = json(snapshot);
     return this.prisma.$transaction(async (tx) => {
-      const lease = await tx.$queryRaw<Array<{ id: string }>>`SELECT "id" FROM "CrmControlRun" WHERE "id" = ${runId} AND "status" = 'RUNNING' AND "activeKey" = 'global' FOR UPDATE`;
+      const lease = await tx.$queryRaw<Array<{ id: string }>>`SELECT "id" FROM "CrmControlRun" WHERE "id" = ${runId} AND "status" = 'RUNNING' AND "activeKey" = 'global' AND "startedAt" = ${leaseStartedAt} FOR UPDATE`;
       if (!lease.length) throw new ControlRunError('Проверка больше не выполняется.');
       await tx.$queryRaw`SELECT "id" FROM "CrmControlCase" WHERE "dealId" = ${input.deal.id} FOR UPDATE`;
       const existing = await tx.crmControlObservation.findUnique({ where: { runId_dealId: { runId, dealId: input.deal.id } } });
@@ -735,6 +886,7 @@ export class CrmControlService {
       }
       const capture = await this.evidenceProvider.capture({ dealExternalId: job.observation.dealExternalId, dealTitle: job.observation.dealTitle,
         sourceUrl: job.sourceUrl, observationId: job.observationId });
+      await this.persistEvidenceHealth();
       if (capture.status === 'READY' && !await this.captureOwnerMatches(job.observation, job.sourceUrl)) {
         await this.prisma.crmControlEvidence.updateMany({ where: lease, data: { status: 'ERROR', nextAttemptAt: null,
           error: 'Ответственный или группа изменились во время съёмки. Снимок не прикреплён.' } });
@@ -742,7 +894,7 @@ export class CrmControlService {
       }
       await this.prisma.crmControlEvidence.updateMany({ where: lease, data: { status: capture.status, storageKey: capture.storageKey,
         contentType: capture.mimeType, sha256: capture.sha256, capturedAt: capture.capturedAt,
-        nextAttemptAt: capture.status === 'ERROR' ? retryAt() : null,
+        nextAttemptAt: capture.status === 'ERROR' && capture.retryable !== false ? retryAt() : null,
         coverage: capture.status === 'READY' ? capture.message : null, error: capture.status === 'READY' ? null : capture.message } });
     } catch { await this.prisma.crmControlEvidence.updateMany({ where: lease,
       data: { status: 'ERROR', nextAttemptAt: retryAt(), error: 'Не удалось проверить доступ к текущей карточке или сохранить снимок amoCRM' } }); }

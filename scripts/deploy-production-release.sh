@@ -17,11 +17,12 @@ SERVICES=(
   analytics-sync-worker.service
   analytics-report-worker.service
   analytics-notification-worker.service
+  analytics-crm-control-worker.service
   analytics-export-worker.service
   analytics-bootstrap-worker.service
 )
 
-REQUIRED_WORKERS=(sync report notification export bootstrap)
+REQUIRED_WORKERS=(sync report notification export bootstrap crm-control)
 
 require() {
   command -v "$1" >/dev/null 2>&1 || {

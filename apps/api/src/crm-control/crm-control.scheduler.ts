@@ -9,7 +9,7 @@ export class CrmControlScheduler {
   private evidenceBusy = false;
   constructor(private readonly service: CrmControlService) {}
 
-  private enabledWorker() { return ['all', 'notification', 'crm-control'].includes(process.env.WORKER_ROLE || 'all'); }
+  private enabledWorker() { return ['all', 'crm-control'].includes(process.env.WORKER_ROLE || 'all'); }
 
   @Interval(30_000)
   async check() {

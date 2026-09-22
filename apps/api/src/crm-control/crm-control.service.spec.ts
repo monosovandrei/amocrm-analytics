@@ -2,6 +2,7 @@ import { CrmControlService } from './crm-control.service';
 import { controlScheduleSlot, nextControlCaseState, observationCounts } from './crm-control.logic';
 import { CrmControlRuleInput, CrmControlRuleResult, DEFAULT_CRM_CONTROL_CONFIG } from './crm-control.types';
 import { CRM_CONTROL_RULE_VERSION, evaluateCrmControlDeal } from './crm-control.rules';
+import { CrmControlProposalSourceCollector, CrmControlProposalSources } from './crm-control-proposal-sources';
 
 const actor = { id: 'actor', email: 'owner@example.test', role: 'ADMIN' as const, businessRole: 'OWNER' as const };
 const result = (status: CrmControlRuleResult['status'], extra: Partial<CrmControlRuleResult> = {}): CrmControlRuleResult => ({
@@ -43,11 +44,26 @@ function memory() {
   const service = new CrmControlService(prisma as any, {} as any, { capabilities: () => ({ screenshots: false, message: 'Не подключено' }) } as any);
   const persist = (runId: string, value: CrmControlRuleInput, rows: CrmControlRuleResult[]) => (service as any).persistObservation(runId, value, rows,
     { deal: value.deal, tasks: value.tasks, observedAt: value.observedAt },
-    { pipelineName: 'Продажи', stageName: 'В работе', managerName: 'Менеджер', groupId: 'group', groupName: 'ОПНК', dealUrl: 'https://example.amocrm.ru/leads/detail/12' });
+    { pipelineName: 'Продажи', stageName: 'В работе', managerName: 'Менеджер', groupId: 'group', groupName: 'ОПНК', dealUrl: 'https://example.amocrm.ru/leads/detail/12' }, observedAt);
   return { service, tx, observations, cases, results, evidence, persist };
 }
 
 describe('CRM control immutable observations and case episodes', () => {
+  it('fences a writer from an earlier attempt before creating an observation or changing a case', async () => {
+    const fixture = memory();
+    const latestAttempt = new Date(observedAt.getTime() + 1);
+    fixture.tx.$queryRaw.mockImplementation(async (sql: TemplateStringsArray, ...values: unknown[]) => {
+      if (sql.join('?').includes('"CrmControlRun"')) {
+        expect(sql.join('?')).toContain('"startedAt" = ?');
+        return values[values.length - 1] === latestAttempt ? [{ id: 'run' }] : [];
+      }
+      return [];
+    });
+    await expect(fixture.persist('run', input(), [result('FAIL')])).rejects.toThrow('Проверка больше не выполняется');
+    expect(fixture.tx.crmControlObservation.create).not.toHaveBeenCalled();
+    expect(fixture.tx.crmControlCase.upsert).not.toHaveBeenCalled();
+  });
+
   it('keeps an unresolved violation in one episode across daily observations', async () => {
     const fixture = memory();
     await fixture.persist('day-1', input(), [result('FAIL')]);
@@ -201,7 +217,7 @@ describe('CRM control source coverage, access and scheduling', () => {
   });
 
   it('does not execute another run while a durable global lease is held', async () => {
-    const prisma = { crmControlRun: { updateMany: jest.fn().mockResolvedValue({ count: 0 }), count: jest.fn().mockResolvedValue(1), findFirst: jest.fn() } };
+    const prisma = { crmControlRun: { findMany: jest.fn().mockResolvedValue([]), updateMany: jest.fn().mockResolvedValue({ count: 0 }), count: jest.fn().mockResolvedValue(1), findFirst: jest.fn() } };
     const service = new CrmControlService(prisma as any, {} as any, {} as any);
     await service.processQueue();
     expect(prisma.crmControlRun.findFirst).not.toHaveBeenCalled();
@@ -346,6 +362,8 @@ describe('CRM control source coverage, access and scheduling', () => {
 });
 
 describe('CRM control direct source reads', () => {
+  afterEach(() => jest.restoreAllMocks());
+
   function sourceFixture(total = 1) {
     const pipeline = { id: 'pipeline', externalId: '100', name: 'Продажи', stages: [
       { id: 'stage', externalId: '200', name: 'Назначен ответственный', isWon: false, isLost: false },
@@ -354,7 +372,12 @@ describe('CRM control direct source reads', () => {
     ] };
     const leads = Array.from({ length: total }, (_, index) => ({ id: index + 1, name: `Сделка ${index + 1}`, pipeline_id: 100, status_id: 200,
       responsible_user_id: 300, updated_at: 1700000000, created_at: 1700000000, price: 450 }));
-    const client = { domain: 'example.amocrm.ru', get: jest.fn(async (path: string) => leads[Number(path.split('/').pop()) - 1]),
+    const readLead = jest.fn<Promise<any>, [number]>(async (id) => leads[id - 1]);
+    const client = { domain: 'example.amocrm.ru', get: jest.fn(async (path: string) => {
+      if (path === '/account') return { id: 1, drive_url: 'https://drive.amocrm.ru' };
+      if (/^\/leads\/\d+$/.test(path)) return readLead(Number(path.split('/').pop()));
+      throw new Error(`Unexpected test source path: ${path}`);
+    }),
       paginate: jest.fn(async () => []),
       paginateBatch: jest.fn(async (_path, _key, _params, callback) => {
         for (let offset = 0; offset < leads.length; offset += 250) await callback(leads.slice(offset, offset + 250));
@@ -363,14 +386,109 @@ describe('CRM control direct source reads', () => {
     const prisma = { pipeline: { findMany: jest.fn().mockResolvedValue([pipeline]) },
       crmUser: { findMany: jest.fn().mockResolvedValue([{ id: 'manager', externalId: '300', name: 'Менеджер', groupId: 'group', group: { name: 'ОПНК' } }]) },
       crmControlRun: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+      crmControlObservation: { findMany: jest.fn().mockResolvedValue([]) },
       crmControlCase: { findMany: jest.fn().mockResolvedValue([]) },
+      rawAmoEventInbox: { findMany: jest.fn().mockResolvedValue([]) },
+      customFieldDefinition: { findMany: jest.fn().mockResolvedValue([{ externalId: '900', name: 'КП' }]) },
     };
-    const service = new CrmControlService(prisma as any, { getActiveConnectionOrFail: jest.fn().mockResolvedValue({ config: {} }),
+    const service = new CrmControlService(prisma as any, { getActiveConnectionOrFail: jest.fn().mockResolvedValue({ id: 'connection', config: {} }),
       getClient: jest.fn().mockResolvedValue(client) } as any, {} as any);
     const persist = jest.spyOn(service as any, 'persistObservation').mockResolvedValue({});
-    const run = { id: 'run', scheduledFor: new Date(), config: { ...DEFAULT_CRM_CONTROL_CONFIG, scopes: [{ pipelineId: 'pipeline', department: 'sales', assignedStageId: 'stage' }] } };
-    return { client, prisma, service, persist, run, leads };
+    const run = { id: 'run', startedAt: new Date(), scheduledFor: new Date(), config: { ...DEFAULT_CRM_CONTROL_CONFIG, scopes: [{ pipelineId: 'pipeline', department: 'sales', assignedStageId: 'stage' }] } };
+    return { client, readLead, prisma, service, persist, run, leads };
   }
+
+  function addMessageSource(fixture: ReturnType<typeof sourceFixture>) {
+    const receivedAt = new Date(Date.now() - 1000);
+    const message = { id: 'inbox-1', connectionId: 'connection', entity: 'outgoing_message', action: 'add', receivedAt,
+      payload: { id: 'message-1', created_at: Math.floor(receivedAt.getTime() / 1000) - 1, type: 'outgoing', text: 'Предложение во вложении.',
+        author: { id: 'sender', user_id: '300', type: 'internal' }, recipient: { id: 'customer', type: 'external' },
+        entity_type: 'lead', entity_id: '1', element_type: 2, element_id: '1' } };
+    fixture.prisma.rawAmoEventInbox.findMany.mockResolvedValue([message]);
+    return message;
+  }
+
+  function archivedProposal(): CrmControlProposalSources {
+    return { fieldId: '900', fieldReadComplete: true, fieldFiles: [], sentHistoryComplete: false, problems: [],
+      sentAttachments: [{ messageId: 'message-1', sentAt: new Date().toISOString(), name: 'test-proposal.pdf',
+        artifact: { sha256: 'a'.repeat(64), size: 100, storageKey: `${'a'.repeat(64)}.bin`, contentType: 'application/pdf', capturedAt: new Date().toISOString() } }] };
+  }
+
+  it('collects and archives proposal sources before the final card read while retaining unverified communication coverage', async () => {
+    const fixture = sourceFixture();
+    addMessageSource(fixture);
+    const events: string[] = [];
+    fixture.readLead.mockImplementation(async () => { events.push(events.includes('initial') ? 'final' : 'initial'); return fixture.leads[0]; });
+    const archive = archivedProposal();
+    const collect = jest.spyOn(CrmControlProposalSourceCollector.prototype, 'collect').mockImplementation(async () => {
+      events.push('collect'); return archive;
+    });
+    fixture.persist.mockImplementation(async () => { events.push('persist'); return {}; });
+    await (fixture.service as any).executeRun(fixture.run);
+    expect(events).toEqual(['initial', 'collect', 'final', 'persist']);
+    expect(collect).toHaveBeenCalledWith([], '900', [expect.objectContaining({ message: expect.objectContaining({ messageId: 'message-1' }) })]);
+    expect(fixture.prisma.rawAmoEventInbox.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ connectionId: 'connection', entity: { in: ['message', 'outgoing_message'] } }),
+    }));
+    const input = fixture.persist.mock.calls[0][1] as CrmControlRuleInput;
+    const snapshot = fixture.persist.mock.calls[0][3] as any;
+    expect(input.communications).toEqual([expect.objectContaining({ id: 'message-1', type: 'outgoing', text: 'Предложение во вложении.' })]);
+    expect(input.sourceCompleteness.communications).toBe(false);
+    expect(snapshot.proposalSources).toEqual(archive);
+    expect(snapshot.communicationSources).toMatchObject({ datasetReadComplete: true, sourceCoverage: 'UNVERIFIED',
+      messages: [expect.objectContaining({ message: expect.objectContaining({ messageId: 'message-1', rawSha256: expect.stringMatching(/^[a-f0-9]{64}$/) }) })] });
+    expect(snapshot.sourceReadFinishedAt.getTime()).toBeGreaterThanOrEqual(snapshot.sourceReadStartedAt.getTime());
+  });
+
+  it('never attaches collected documents or message sources to the former owner after a transfer', async () => {
+    const fixture = sourceFixture();
+    addMessageSource(fixture);
+    const collect = jest.spyOn(CrmControlProposalSourceCollector.prototype, 'collect').mockResolvedValue(archivedProposal());
+    fixture.readLead.mockResolvedValueOnce(fixture.leads[0]).mockResolvedValueOnce({ ...fixture.leads[0], responsible_user_id: 999 });
+    await (fixture.service as any).executeRun(fixture.run);
+    expect(collect).toHaveBeenCalledTimes(1);
+    expect(fixture.persist).not.toHaveBeenCalled();
+    expect(fixture.prisma.crmControlRun.updateMany).toHaveBeenLastCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: 'PARTIAL' }) }));
+  });
+
+  it('omits collected documents and messages when the final ownership read is unavailable', async () => {
+    const fixture = sourceFixture();
+    addMessageSource(fixture);
+    jest.spyOn(CrmControlProposalSourceCollector.prototype, 'collect').mockResolvedValue(archivedProposal());
+    fixture.readLead.mockResolvedValueOnce(fixture.leads[0]).mockRejectedValueOnce(new Error('source unavailable'));
+    await (fixture.service as any).executeRun(fixture.run);
+    const input = fixture.persist.mock.calls[0][1] as CrmControlRuleInput;
+    const results = fixture.persist.mock.calls[0][2] as CrmControlRuleResult[];
+    const snapshot = fixture.persist.mock.calls[0][3] as any;
+    expect(input.communications).toEqual([]);
+    expect(input.sourceCompleteness.deal).toBe(false);
+    expect(input.sourceCompleteness.communications).toBe(false);
+    expect(results.every((result) => result.status === 'UNKNOWN')).toBe(true);
+    expect(snapshot.proposalSources).toBeNull();
+    expect(snapshot.communicationSources).toBeNull();
+  });
+
+  it('does not equate a complete empty inbox read with complete CRM conversation history', async () => {
+    const fixture = sourceFixture();
+    await (fixture.service as any).executeRun(fixture.run);
+    const input = fixture.persist.mock.calls[0][1] as CrmControlRuleInput;
+    const snapshot = fixture.persist.mock.calls[0][3] as any;
+    expect(input.communications).toEqual([]);
+    expect(input.sourceCompleteness.communications).toBe(false);
+    expect(snapshot.communicationSources).toMatchObject({ datasetReadComplete: true, sourceCoverage: 'UNVERIFIED', messages: [] });
+    expect(snapshot.proposalSources).toMatchObject({ fieldId: '900', fieldReadComplete: true, sentHistoryComplete: false });
+  });
+
+  it('keeps the communication source incomplete and reports an inbox read failure', async () => {
+    const fixture = sourceFixture();
+    fixture.prisma.rawAmoEventInbox.findMany.mockRejectedValue(new Error('database source unavailable'));
+    await (fixture.service as any).executeRun(fixture.run);
+    const snapshot = fixture.persist.mock.calls[0][3] as any;
+    expect(snapshot.communicationSources).toMatchObject({ datasetReadComplete: false, sourceCoverage: 'UNVERIFIED', messages: [] });
+    expect((fixture.persist.mock.calls[0][1] as CrmControlRuleInput).sourceCompleteness.communications).toBe(false);
+    const finish = fixture.prisma.crmControlRun.updateMany.mock.calls.at(-1)![0] as any;
+    expect(finish.data.issues).toContain('Не удалось прочитать сохранённые сообщения amoCRM. Сверка отправленных документов не завершена.');
+  });
 
   it('reads all source pages beyond 1000 deals and limits the query to configured open stages', async () => {
     const fixture = sourceFixture(1001);
@@ -379,7 +497,67 @@ describe('CRM control direct source reads', () => {
     expect(fixture.client.paginateBatch).toHaveBeenCalledWith('/leads', 'leads', {
       'order[id]': 'asc', 'filter[statuses][0][pipeline_id]': '100', 'filter[statuses][0][status_id]': '200',
     }, expect.any(Function));
-    expect(fixture.client.get).toHaveBeenCalledTimes(2002);
+    expect(fixture.readLead).toHaveBeenCalledTimes(2002);
+    expect(fixture.client.get).toHaveBeenCalledWith('/account', { with: 'drive_url' });
+  });
+
+  it('reads three deals and their independent sources concurrently without starting a fourth', async () => {
+    const fixture = sourceFixture(4);
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    fixture.client.paginate.mockImplementation(async () => { await blocked; return []; });
+    const running = (fixture.service as any).executeRun(fixture.run);
+    for (let i = 0; i < 40; i += 1) await Promise.resolve();
+    expect(fixture.readLead).toHaveBeenCalledTimes(3);
+    expect(fixture.client.paginate).toHaveBeenCalledTimes(9);
+    expect(fixture.persist).not.toHaveBeenCalled();
+    release(); await running;
+    expect(fixture.persist).toHaveBeenCalledTimes(4);
+    expect(fixture.readLead).toHaveBeenCalledTimes(8);
+  });
+
+  it('resumes only missing deals and retains prior UNKNOWN observations and their original counts', async () => {
+    const fixture = sourceFixture(2);
+    const saved = { id: 'saved', dealExternalId: '1', counts: observationCounts([result('UNKNOWN')]), observedAt };
+    const before = JSON.stringify(saved);
+    fixture.prisma.crmControlObservation.findMany.mockResolvedValueOnce([saved] as never).mockResolvedValue([]);
+    await (fixture.service as any).executeRun(fixture.run);
+    expect(fixture.client.get).not.toHaveBeenCalledWith('/leads/1');
+    expect(fixture.persist).toHaveBeenCalledTimes(1);
+    expect((fixture.persist.mock.calls[0][1] as CrmControlRuleInput).deal.externalId).toBe('2');
+    expect(JSON.stringify(saved)).toBe(before);
+    const finish = fixture.prisma.crmControlRun.updateMany.mock.calls.at(-1)![0] as any;
+    expect(finish.where.startedAt).toEqual(fixture.run.startedAt);
+    expect(finish.data.counts.deals).toBe(2);
+    expect(finish.data.counts.unknown).toBeGreaterThanOrEqual(1);
+    expect(fixture.prisma.crmControlObservation.findMany).toHaveBeenLastCalledWith(expect.objectContaining({ cursor: { id: 'saved' }, skip: 1 }));
+  });
+
+  it('deduplicates repeated deal IDs inside a concurrent source batch', async () => {
+    const fixture = sourceFixture(2);
+    fixture.leads[1] = fixture.leads[0];
+    await (fixture.service as any).executeRun(fixture.run);
+    expect(fixture.persist).toHaveBeenCalledTimes(1);
+    expect(fixture.readLead).toHaveBeenCalledTimes(2);
+    expect((fixture.prisma.crmControlRun.updateMany.mock.calls.at(-1)![0] as any).data.counts.deals).toBe(1);
+  });
+
+  it('waits for other in-flight readers before propagating a failed write', async () => {
+    const fixture = sourceFixture(3);
+    let finish!: () => void;
+    const blocked = new Promise<void>((resolve) => { finish = resolve; });
+    fixture.persist.mockImplementation(async (...args: any[]) => {
+      if (args[1].deal.externalId === '1') throw new Error('temporary database failure');
+      await blocked;
+      return {};
+    });
+    let settled = false;
+    const running = (fixture.service as any).executeRun(fixture.run).catch((error: Error) => { settled = true; return error; });
+    for (let i = 0; i < 60; i += 1) await Promise.resolve();
+    expect(fixture.persist).toHaveBeenCalledTimes(3);
+    expect(settled).toBe(false);
+    finish();
+    expect((await running).message).toBe('temporary database failure');
   });
 
   it('marks task coverage unknown when its source request fails', async () => {
@@ -416,15 +594,15 @@ describe('CRM control direct source reads', () => {
 
   it.each(['initial', 'final'])('does not evaluate a deal moved to unsorted during its %s source reread', async (phase) => {
     const fixture = sourceFixture();
-    if (phase === 'final') fixture.client.get.mockResolvedValueOnce(fixture.leads[0]);
-    fixture.client.get.mockResolvedValueOnce({ ...fixture.leads[0], status_id: 199 });
+    if (phase === 'final') fixture.readLead.mockResolvedValueOnce(fixture.leads[0]);
+    fixture.readLead.mockResolvedValueOnce({ ...fixture.leads[0], status_id: 199 });
     await (fixture.service as any).executeRun(fixture.run);
     expect(fixture.persist).not.toHaveBeenCalled();
   });
 
   it('does not write mixed source facts as an accusation when the lead changes during collection', async () => {
     const fixture = sourceFixture();
-    fixture.client.get.mockResolvedValueOnce(fixture.leads[0]).mockResolvedValueOnce({ ...fixture.leads[0], updated_at: 1800000000 });
+    fixture.readLead.mockResolvedValueOnce(fixture.leads[0]).mockResolvedValueOnce({ ...fixture.leads[0], updated_at: 1800000000 });
     await (fixture.service as any).executeRun(fixture.run);
     const evaluated = fixture.persist.mock.calls[0][2] as CrmControlRuleResult[];
     expect(evaluated.every((row) => row.status === 'UNKNOWN')).toBe(true);
@@ -432,7 +610,7 @@ describe('CRM control direct source reads', () => {
 
   it('never archives the new owner’s raw card under the previous owner after a transfer', async () => {
     const fixture = sourceFixture();
-    fixture.client.get.mockResolvedValueOnce(fixture.leads[0]).mockResolvedValueOnce({ ...fixture.leads[0], responsible_user_id: 999 });
+    fixture.readLead.mockResolvedValueOnce(fixture.leads[0]).mockResolvedValueOnce({ ...fixture.leads[0], responsible_user_id: 999 });
     await (fixture.service as any).executeRun(fixture.run);
     expect(fixture.persist).not.toHaveBeenCalled();
     expect(fixture.prisma.crmControlRun.updateMany).toHaveBeenLastCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: 'PARTIAL' }) }));

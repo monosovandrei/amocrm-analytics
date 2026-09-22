@@ -7,7 +7,7 @@ import { METRIC_VERSION, RELEASE_BUILD_ID } from '../quality/release-info';
 const MB = 1024 * 1024;
 const PROCESS_STARTED_AT = new Date();
 const REPORT_ACTIVITY_WINDOW_MS = 60 * 60_000;
-const REQUIRED_WORKER_ROLES = ['sync', 'report', 'notification', 'export', 'bootstrap'];
+const REQUIRED_WORKER_ROLES = ['sync', 'report', 'notification', 'export', 'bootstrap', 'crm-control'];
 
 @Controller('health')
 export class HealthController {
@@ -173,6 +173,7 @@ export class HealthController {
       apiP95: api.p95Ms > 3_000,
       workerRestarted: workerRestartedRecently,
       workerHeartbeatStale: staleWorkerHeartbeat,
+      crmControlWorkerMissing: !requiredWorkers.some((worker) => worker.role === 'crm-control'),
       reportFailures: reportQueue.failed > 0,
       syncFailures: failedRawAmoEvents > 0,
     };

@@ -12,10 +12,12 @@ function reviewFixture(options: { role?: string; status?: string; ruleCode?: str
   const result: any = { id: 'result', observationId: 'observation', ruleCode: options.ruleCode ?? 'offer_budget',
     status: options.status ?? 'UNKNOWN', subjectId: '', caseId: options.existingCase ? 'case' : null, message: 'Не подключён источник', details: {} };
   const row: any = { id: 'observation', runId: 'run', dealId: 'deal', managerId: 'manager', groupId: 'group', observedAt,
+    dealUrl: body.evidence,
     snapshot: { recorded: 'unchanged' }, snapshotHash: 'abcdef', counts: { unknown: 1 }, results: [result] };
   const decisions: any[] = [];
   const caseValue = { id: 'case', caseKey: 'canonical', activeKey: 'deal:offer_budget:', status: 'REVIEW', latestObservationId: row.id };
   const tx = {
+    crmControlEvidence: { upsert: jest.fn().mockResolvedValue({ id: 'evidence' }) },
     $queryRaw: jest.fn().mockResolvedValue([{ id: result.id }]),
     crmControlResult: {
       findUnique: jest.fn(async () => result),
@@ -37,8 +39,9 @@ function reviewFixture(options: { role?: string; status?: string; ruleCode?: str
     crmControlObservation: { findFirst: jest.fn().mockResolvedValue(options.visible === false ? null : row) },
     $transaction: jest.fn(async (callback) => callback(tx)),
   };
-  const service = new CrmControlService(prisma as any, {} as any, {} as any);
-  return { service, prisma, tx, row, result, decisions };
+  const provider = { capabilities: jest.fn().mockReturnValue({ screenshots: true }) };
+  const service = new CrmControlService(prisma as any, {} as any, provider as any);
+  return { service, prisma, tx, row, result, decisions, provider };
 }
 
 describe('CRM control completion', () => {
@@ -74,6 +77,7 @@ describe('CRM control manual review', () => {
     expect(fixture.tx.crmControlResult.updateMany).toHaveBeenCalledWith({ where: { id: 'result', caseId: null }, data: { caseId: 'review-case' } });
     expect(fixture.tx.crmControlCase.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ caseKey: 'review:result', activeKey: null }) }));
     expect(fixture.tx.crmControlCase.updateMany).not.toHaveBeenCalled();
+    expect(fixture.tx.crmControlEvidence.upsert).not.toHaveBeenCalled();
     const view = { ...fixture.result, case: { status: 'REVIEW', decisions: fixture.decisions } };
     expect((fixture.service as any).effectiveStatus(view, observedAt)).toBe('PASS');
     expect((fixture.service as any).effectiveCounts([view], observedAt).checkedDeals).toBe(1);
@@ -88,6 +92,16 @@ describe('CRM control manual review', () => {
     expect((fixture.service as any).effectiveStatus({ ...value, observationId: 'yesterday' }, new Date('2020-01-01'))).toBe('REVIEW');
     expect(fixture.tx.crmControlCase.create).not.toHaveBeenCalled();
     expect(fixture.tx.crmControlCase.updateMany).not.toHaveBeenCalled();
+    expect(fixture.tx.crmControlEvidence.upsert).toHaveBeenCalledWith({ where: { observationId: 'observation' }, update: {},
+      create: { observationId: 'observation', sourceUrl: body.evidence, status: 'PENDING', error: null } });
+  });
+
+  it('keeps a recoverable screenshot job for a manual FAIL even before the browser is configured', async () => {
+    const fixture = reviewFixture();
+    fixture.provider.capabilities.mockReturnValue({ screenshots: false, message: 'Вход не настроен' } as any);
+    await fixture.service.reviewResult(actor, 'observation', 'result', { ...body, outcome: 'FAIL' });
+    expect(fixture.tx.crmControlEvidence.upsert).toHaveBeenCalledWith(expect.objectContaining({ update: {},
+      create: expect.objectContaining({ status: 'DISABLED', error: 'Вход не настроен' }) }));
   });
 
   it('rejects a stale decision and orders a replacement strictly after the previous decision under the lock', async () => {

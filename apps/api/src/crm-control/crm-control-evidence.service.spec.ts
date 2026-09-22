@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { chromium } from 'playwright-core';
-import { CrmControlEvidenceService, validateCrmCaptureUrl } from './crm-control-evidence.service';
+import { CrmControlEvidenceService, sanitizeCrmCaptureHealth, validateCrmCaptureUrl } from './crm-control-evidence.service';
 
 jest.mock('playwright-core', () => ({ chromium: { launch: jest.fn() } }));
 
@@ -14,6 +14,7 @@ describe('CRM screenshot evidence', () => {
   let oldEnv: NodeJS.ProcessEnv;
   let service: CrmControlEvidenceService;
   let browser: any;
+  let contexts: any[];
   let page: any;
   let title: any;
   const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2l5kAAAAASUVORK5CYII=', 'base64');
@@ -25,7 +26,8 @@ describe('CRM screenshot evidence', () => {
     process.env.CRM_CONTROL_BROWSER_STATE_FILE = path.join(directory, 'test-session.json');
     process.env.CRM_CONTROL_CHROMIUM_EXECUTABLE = path.join(directory, 'test-browser');
     process.env.CRM_CONTROL_EVIDENCE_DIR = path.join(directory, 'evidence');
-    await writeFile(process.env.CRM_CONTROL_BROWSER_STATE_FILE, '{}');
+    await writeFile(process.env.CRM_CONTROL_BROWSER_STATE_FILE, JSON.stringify({ cookies: [{ name: 'fixture-session', value: 'test-only',
+      domain: 'example.amocrm.ru', path: '/', expires: -1, secure: true, httpOnly: true, sameSite: 'Lax' }], origins: [] }));
     await writeFile(process.env.CRM_CONTROL_CHROMIUM_EXECUTABLE, 'mock');
     title = { waitFor: jest.fn(), getAttribute: jest.fn().mockResolvedValue('Сделка #123'), inputValue: jest.fn().mockResolvedValue('Test lead') };
     page = {
@@ -34,12 +36,18 @@ describe('CRM screenshot evidence', () => {
       locator: jest.fn().mockImplementation((selector: string) => selector.includes('lead[NAME]') ? title : { waitFor: jest.fn(), isVisible: jest.fn().mockResolvedValue(false) }),
       screenshot: jest.fn().mockResolvedValue(png),
     };
-    browser = { newContext: jest.fn().mockResolvedValue({ newPage: jest.fn().mockResolvedValue(page) }), close: jest.fn().mockResolvedValue(undefined) };
+    contexts = [];
+    browser = { isConnected: jest.fn().mockReturnValue(true), newContext: jest.fn().mockImplementation(async () => {
+      const context = { newPage: jest.fn().mockResolvedValue(page), close: jest.fn().mockResolvedValue(undefined) };
+      contexts.push(context);
+      return context;
+    }), close: jest.fn().mockResolvedValue(undefined) };
     (chromium.launch as jest.Mock).mockReset().mockResolvedValue(browser);
     service = new CrmControlEvidenceService();
   });
 
   afterEach(async () => {
+    await service.onModuleDestroy();
     process.env = oldEnv;
     const absolute = path.resolve(directory);
     const tempRoot = path.resolve(os.tmpdir());
@@ -78,7 +86,7 @@ describe('CRM screenshot evidence', () => {
     page.url.mockReturnValue('https://example.amocrm.ru/');
     expect((await service.capture(job)).status).toBe('ERROR');
     expect(page.screenshot).not.toHaveBeenCalled();
-    expect(browser.close).toHaveBeenCalled();
+    expect(contexts[0].close).toHaveBeenCalled();
     const handler = page.route.mock.calls[0][1];
     const route = {
       request: () => ({ isNavigationRequest: () => true, frame: () => 'main-frame', url: () => 'https://evil.example/' }),
@@ -118,7 +126,7 @@ describe('CRM screenshot evidence', () => {
     const result = await service.capture(job);
     expect(result.status).toBe('ERROR');
     expect(result.message).not.toContain('secret');
-    expect(browser.close).toHaveBeenCalled();
+    expect(contexts[0].close).toHaveBeenCalled();
   });
 
   test('does not overwrite an existing source image when a job is retried', async () => {
@@ -127,5 +135,106 @@ describe('CRM screenshot evidence', () => {
     expect(first.status).toBe('READY');
     expect(second.status).toBe('READY');
     expect(second.storageKey).toBe(first.storageKey);
+    expect(chromium.launch).toHaveBeenCalledTimes(1);
+    expect(contexts).toHaveLength(2);
+    for (const context of contexts) expect(context.close).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([
+    ['{}', 'STATE_INVALID'],
+    ['not-json', 'STATE_INVALID'],
+    [JSON.stringify({ cookies: [], origins: [] }), 'STATE_EMPTY'],
+    [JSON.stringify({ cookies: [{ name: 'expired', value: 'test', domain: 'example.amocrm.ru', path: '/', expires: 1, secure: true, httpOnly: true, sameSite: 'Lax' }], origins: [] }), 'STATE_EXPIRED'],
+    [JSON.stringify({ cookies: [{ name: 'wrong-account', value: 'test', domain: 'other.amocrm.ru', path: '/', expires: -1, secure: true, httpOnly: true, sameSite: 'Lax' }], origins: [] }), 'STATE_EMPTY'],
+  ])('rejects unusable session before launching the browser (%s)', async (state, errorCode) => {
+    await writeFile(process.env.CRM_CONTROL_BROWSER_STATE_FILE!, state);
+    expect(service.capabilities()).toMatchObject({ screenshots: false, errorCode });
+    expect(await service.capture(job)).toMatchObject({ status: 'DISABLED', errorCode, retryable: false });
+    expect(chromium.launch).not.toHaveBeenCalled();
+  });
+
+  test('configuration alone never claims the login was checked; probe validates the actual card without saving an image', async () => {
+    expect(service.capabilities().health).toEqual({ status: 'UNVERIFIED', checkedAt: null });
+    expect(await service.probe(job)).toMatchObject({ status: 'READY', checkedAt: expect.any(String) });
+    expect(service.capabilities().health.status).toBe('READY');
+    expect(page.screenshot).not.toHaveBeenCalled();
+    expect(title.getAttribute).toHaveBeenCalledWith('placeholder');
+    expect(contexts[0].close).toHaveBeenCalledTimes(1);
+    await writeFile(process.env.CRM_CONTROL_BROWSER_STATE_FILE!, JSON.stringify({ cookies: [], origins: [{ origin, localStorage: [{ name: 'fixture-session', value: 'changed-test-only' }] }] }));
+    expect(service.capabilities().health.status).toBe('UNVERIFIED');
+  });
+
+  test('login form is non-retryable and is never captured', async () => {
+    const normalLocator = page.locator.getMockImplementation();
+    page.locator.mockImplementation((selector: string) => selector === 'input[type="password"]'
+      ? { isVisible: async () => true } : normalLocator(selector));
+    expect(await service.capture(job)).toMatchObject({ status: 'ERROR', errorCode: 'AUTH_REQUIRED', retryable: false });
+    expect(service.capabilities().health).toMatchObject({ status: 'ERROR', errorCode: 'AUTH_REQUIRED' });
+    expect(page.screenshot).not.toHaveBeenCalled();
+  });
+
+  test('network failures retry, browser launch failures require configuration repair, and neither exposes raw errors', async () => {
+    page.goto.mockRejectedValueOnce(new Error('network?session=secret'));
+    expect(await service.capture(job)).toMatchObject({ status: 'ERROR', errorCode: 'CARD_NOT_READY', retryable: true });
+    await service.onModuleDestroy();
+    service = new CrmControlEvidenceService();
+    (chromium.launch as jest.Mock).mockRejectedValueOnce(new Error('secret sandbox path'));
+    const result = await service.capture(job);
+    expect(result).toMatchObject({ status: 'ERROR', errorCode: 'BROWSER_START_FAILED', retryable: false });
+    expect(JSON.stringify(result)).not.toContain('secret');
+  });
+
+  test('concurrent captures share a protected browser but use separate contexts; module shutdown closes the browser', async () => {
+    const result = await Promise.all([service.capture(job), service.capture(job)]);
+    expect(result.map(item => item.status)).toEqual(['READY', 'READY']);
+    expect(chromium.launch).toHaveBeenCalledTimes(1);
+    expect(chromium.launch).toHaveBeenCalledWith(expect.objectContaining({ chromiumSandbox: true }));
+    expect(contexts).toHaveLength(2);
+    expect(browser.newContext.mock.calls[0][0].storageState).not.toBe(browser.newContext.mock.calls[1][0].storageState);
+    for (const context of contexts) expect(context.close).toHaveBeenCalledTimes(1);
+    expect(browser.close).not.toHaveBeenCalled();
+    await service.onModuleDestroy();
+    expect(browser.close).toHaveBeenCalledTimes(1);
+  });
+
+  test('reconnects after a browser crash and expires old login health', async () => {
+    await service.capture(job);
+    const now = Date.now();
+    const clock = jest.spyOn(Date, 'now').mockReturnValue(now + 6 * 60_000);
+    expect(service.capabilities().health.status).toBe('UNVERIFIED');
+    clock.mockRestore();
+    browser.isConnected.mockReturnValueOnce(false);
+    expect((await service.capture(job)).status).toBe('READY');
+    expect(chromium.launch).toHaveBeenCalledTimes(2);
+  });
+
+  test('shared health rejects stale or malformed success and never relays arbitrary fields or messages', () => {
+    const now = Date.now();
+    const checkedAt = new Date(now).toISOString();
+    expect(sanitizeCrmCaptureHealth({ status: 'READY', checkedAt, cookies: 'secret' }, now)).toEqual({ status: 'READY', checkedAt });
+    expect(sanitizeCrmCaptureHealth({ status: 'READY', checkedAt: new Date(now - 6 * 60_000).toISOString() }, now).status).toBe('UNVERIFIED');
+    expect(sanitizeCrmCaptureHealth({ status: 'READY', checkedAt: new Date(now + 60 * 60_000).toISOString() }, now).status).toBe('UNVERIFIED');
+    expect(sanitizeCrmCaptureHealth({ status: 'READY', checkedAt: 'invalid' }, now)).toEqual({ status: 'UNVERIFIED', checkedAt: null });
+    const safe = sanitizeCrmCaptureHealth({ status: 'ERROR', checkedAt, errorCode: '__proto__', message: 'token=secret' }, now);
+    expect(safe.errorCode).toBe('CAPTURE_FAILED');
+    expect(JSON.stringify(safe)).not.toContain('secret');
+  });
+
+  test('a probe started with an old session cannot mark a replacement session as verified', async () => {
+    let finishNavigation!: () => void;
+    let navigationStarted!: () => void;
+    const started = new Promise<void>(resolve => { navigationStarted = resolve; });
+    page.goto.mockImplementationOnce(async () => {
+      navigationStarted();
+      await new Promise<void>(resolve => { finishNavigation = resolve; });
+      return { status: () => 200 };
+    });
+    const pending = service.probe(job);
+    await started;
+    await writeFile(process.env.CRM_CONTROL_BROWSER_STATE_FILE!, JSON.stringify({ cookies: [], origins: [{ origin, localStorage: [{ name: 'fixture-session', value: 'replacement-test-only' }] }] }));
+    expect(service.capabilities().health.status).toBe('UNVERIFIED');
+    finishNavigation();
+    expect((await pending).status).toBe('UNVERIFIED');
+    expect(service.capabilities().health.status).toBe('UNVERIFIED');
   });
 });

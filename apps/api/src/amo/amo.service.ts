@@ -117,7 +117,7 @@ export class AmoService {
     return connection;
   }
 
-  async getClient(connection: AmoConnection): Promise<AmoClient> {
+  async getClient(connection: AmoConnection, options: { minRequestIntervalMs?: number } = {}): Promise<AmoClient> {
     const clientId = this.config.getOrThrow<string>('AMOCRM_CLIENT_ID');
     const clientSecret = this.config.getOrThrow<string>('AMOCRM_CLIENT_SECRET');
     const redirectUri =
@@ -127,6 +127,7 @@ export class AmoService {
 
     return this.clients.create({
       domain: connection.subdomain,
+      minRequestIntervalMs: options.minRequestIntervalMs,
       credentials,
       clientId,
       clientSecret,

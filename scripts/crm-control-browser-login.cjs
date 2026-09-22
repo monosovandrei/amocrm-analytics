@@ -1,7 +1,6 @@
 // Run interactively on the capture host. Credentials are entered only in the amoCRM page.
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const readline = require('node:readline/promises');
 const { createRequire } = require('node:module');
 const apiRequire = createRequire(path.resolve(__dirname, '../apps/api/package.json'));
 const { chromium } = apiRequire('playwright-core');
@@ -24,25 +23,25 @@ async function main() {
     && !relativeState.startsWith(`outputs${path.sep}`)) {
     throw new Error('Храните сессию вне репозитория или в исключённой из Git папке outputs.');
   }
-  const browser = await chromium.launch({ executablePath, headless: false, chromiumSandbox: true });
-  const terminal = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const browser = await chromium.launch({ executablePath, headless: false, chromiumSandbox: true, args: ['--start-maximized'] });
   try {
     const context = await browser.newContext({ locale: 'ru-RU' });
     const page = await context.newPage();
     await page.goto(origin.origin, { waitUntil: 'domcontentloaded' });
-    await terminal.question('Войдите в amoCRM в открывшемся браузере. Когда откроется рабочий стол, нажмите Enter здесь. ');
+    console.log('Войдите в amoCRM в отдельном окне «amoCRM: Авторизация». После входа сессия сохранится автоматически.');
+    await page.waitForURL(url => url.origin === origin.origin && /^\/(dashboard|leads|todo|contacts|settings)\//.test(url.pathname), { timeout: 30 * 60_000 });
+    await page.locator('#nav_menu').waitFor({ state: 'visible', timeout: 30_000 });
     const current = new URL(page.url());
-    if (current.origin !== origin.origin || !/^\/(dashboard|leads|todo|contacts)\//.test(current.pathname)) {
+    if (current.origin !== origin.origin || !/^\/(dashboard|leads|todo|contacts|settings)\//.test(current.pathname)) {
       throw new Error('Вход в нужный аккаунт не подтверждён. Сессия не сохранена.');
     }
-    if (!await page.locator('#nav_menu').isVisible() || await page.locator('input[type="password"]').isVisible()) {
+    if (!await page.locator('#nav_menu').isVisible() || await page.locator('input[type="password"]:visible').count()) {
       throw new Error('Рабочий экран amoCRM не найден. Сессия не сохранена.');
     }
     await fs.mkdir(path.dirname(statePath), { recursive: true, mode: 0o700 });
     await fs.writeFile(statePath, JSON.stringify(await context.storageState()), { mode: 0o600 });
     console.log('Сессия сборщика сохранена. Не добавляйте этот файл в Git и не передавайте его менеджерам.');
   } finally {
-    terminal.close();
     await browser.close();
   }
 }

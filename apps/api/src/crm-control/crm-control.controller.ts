@@ -23,6 +23,12 @@ export class CrmControlController {
   }
   @Post('cases/:id/decisions') decide(@Req() request: { user: AuthUser }, @Param('id') id: string, @Body() body: CrmControlDecisionInput) { return this.service.decide(request.user, id, body); }
   @Post('evidence/:id/retry') retryEvidence(@Req() request: { user: AuthUser }, @Param('id') id: string) { return this.service.retryEvidence(request.user, id); }
+  @Post('observations/:id/evidence/probe') probeEvidence(@Req() request: { user: AuthUser }, @Param('id') id: string) {
+    return this.service.probeEvidence(request.user, id);
+  }
+  @Post('observations/:id/evidence/enable') enableEvidence(@Req() request: { user: AuthUser }, @Param('id') id: string) {
+    return this.service.requeueDisabledEvidence(request.user, id);
+  }
   @Get('evidence/:id/file')
   @Header('Cache-Control', 'private, no-store')
   async evidence(@Req() request: { user: AuthUser }, @Param('id') id: string) {
