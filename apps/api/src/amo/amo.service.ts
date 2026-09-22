@@ -184,6 +184,7 @@ export class AmoService {
   async recordWebhook(connectionId: string, events: AmoWebhookItem[]) {
     if (events.length === 0) return;
     await this.prisma.$transaction(async (tx) => {
+      const recordedAt = new Date();
       const webhookEvents = await tx.webhookEvent.createManyAndReturn({
         data: events.map((event) => ({
           connectionId,
@@ -191,6 +192,9 @@ export class AmoService {
           action: event.action,
           externalId: event.externalId,
           payload: event.payload as Prisma.InputJsonValue,
+          ...(event.externalId
+            ? {}
+            : { status: 'processed', processedAt: recordedAt }),
         })),
         select: {
           id: true,
@@ -213,6 +217,13 @@ export class AmoService {
           payload: event.payload as Prisma.InputJsonValue,
           amoUpdatedAt: this.webhookPayloadUpdatedAt(event.payload),
           receivedAt: event.receivedAt,
+          ...(event.externalId
+            ? {}
+            : {
+                status: 'skipped',
+                processedAt: recordedAt,
+                appliedAt: recordedAt,
+              }),
         })),
         skipDuplicates: true,
       });

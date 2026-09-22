@@ -181,4 +181,52 @@ describe('AmoService webhook parsing', () => {
     });
     expect(executeRaw).toHaveBeenCalled();
   });
+
+  it('marks webhook events without an entity id as skipped immediately', async () => {
+    const receivedAt = new Date('2026-09-22T15:00:23.811Z');
+    const webhookCreateManyAndReturn = jest.fn().mockResolvedValue([
+      {
+        id: 'webhook-note-1',
+        entity: 'contacts',
+        action: 'note',
+        externalId: null,
+        payload: { note: { id: '345984679' }, type: 'contact' },
+        receivedAt,
+      },
+    ]);
+    const rawInboxCreateMany = jest.fn().mockResolvedValue({});
+    const prisma = {
+      $transaction: jest.fn((callback: any) =>
+        callback({
+          webhookEvent: { createManyAndReturn: webhookCreateManyAndReturn },
+          rawAmoEventInbox: { createMany: rawInboxCreateMany },
+          $executeRaw: jest.fn().mockResolvedValue(0),
+        }),
+      ),
+    };
+    const localService = new AmoService(prisma as any, {} as any, {} as any, {} as any);
+
+    await localService.recordWebhook('connection-1', [
+      {
+        entity: 'contacts',
+        action: 'note',
+        externalId: null,
+        payload: { note: { id: '345984679' }, type: 'contact' },
+      },
+    ]);
+
+    expect(webhookCreateManyAndReturn).toHaveBeenCalledWith(expect.objectContaining({
+      data: [expect.objectContaining({
+        status: 'processed',
+        processedAt: expect.any(Date),
+      })],
+    }));
+    expect(rawInboxCreateMany).toHaveBeenCalledWith(expect.objectContaining({
+      data: [expect.objectContaining({
+        status: 'skipped',
+        processedAt: expect.any(Date),
+        appliedAt: expect.any(Date),
+      })],
+    }));
+  });
 });
