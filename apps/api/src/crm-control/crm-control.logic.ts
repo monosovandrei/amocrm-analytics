@@ -27,9 +27,9 @@ export function controlCompletion(status: string, counts: CrmControlCounts, issu
     ? 'Автоматический обход ещё не завершён.' : 'Автоматический обход не завершился. Повторите его после устранения ошибки.' });
   if (!counts.deals) reasons.push({ code: 'NO_DEALS', message: 'Нет проверенных сделок: полнота проверки не подтверждена.' });
   if (counts.unknown) reasons.push({ code: 'UNKNOWN_RESULTS', count: counts.unknown,
-    message: 'Остались непроверенные пункты. Для отсутствующих источников нужна ручная сверка; повторный запуск сам их не подключит.' });
+    message: 'По части пунктов ещё нет окончательного результата. Причины и доступные подтверждения указаны в сделках.' });
   if (counts.review) reasons.push({ code: 'REVIEW_RESULTS', count: counts.review,
-    message: 'Руководителю нужно проверить содержание записей и подтверждения по спорным пунктам.' });
+    message: 'Содержание записей и подтверждения ещё не проверены.' });
   if (counts.checkedDeals < counts.deals && !counts.unknown && !counts.review) reasons.push({ code: 'MISSING_RESULTS', count: counts.deals - counts.checkedDeals,
     message: 'У части сделок отсутствуют результаты правил. Требуется новая автоматическая проверка.' });
   if (issues.length) reasons.push({ code: 'RUN_ISSUES', count: issues.length,

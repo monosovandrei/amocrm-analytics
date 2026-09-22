@@ -11,10 +11,13 @@ Environment=NODE_OPTIONS=--max-old-space-size=512
 ExecStart=/usr/bin/node dist/crm-control-worker.js
 Restart=always
 RestartSec=5
+TimeoutStopSec=300
 User=ameri
 Group=ameri
-MemoryHigh=1100M
-MemoryMax=1400M
+Nice=10
+CPUQuota=100%
+MemoryHigh=1400M
+MemoryMax=1800M
 StandardOutput=journal
 StandardError=journal
 

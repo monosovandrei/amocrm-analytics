@@ -51,7 +51,7 @@ export interface ControlSettings {
   canManage: boolean;
   canReview: boolean;
   canDispute: boolean;
-  capabilities: { screenshots: boolean; communications: boolean; proposalFiles: boolean };
+  capabilities: { screenshots: boolean; communications: boolean; proposalFiles: boolean; localAnalysis?: boolean };
   options: {
     pipelines: Array<{ id: string; name: string; stages: Array<{ id: string; name: string; isWon: boolean; isLost: boolean }> }>;
     taskTypes: Array<{ id: number; name: string }>;
@@ -93,6 +93,7 @@ export interface ControlRunDetail {
   managers: ControlManager[];
   configurationIssues: string[];
   ruleBreakdown?: ControlRuleBreakdown[];
+  analysis?: { queued: number; running: number; completed: number; failed: number; unresolved: number; preparing: boolean };
 }
 
 export interface ControlRuleBreakdown {
@@ -122,12 +123,34 @@ export interface ControlResult {
   details?: Record<string, unknown>;
   caseId?: string | null;
   caseStatus?: ControlCaseStatus | null;
+  analysis?: { id: string; status: string; outcome: 'PASS' | 'FAIL' | null; message: string; completedAt: string | null; attempts: number } | null;
   review?: {
     allowed: boolean;
     expectedDecisionId: string | null;
     guidance: string;
     current: { decisionId: string; outcome: 'PASS' | 'FAIL' | 'NA'; reason: string; reviewedBy: string; reviewedAt: string } | null;
   };
+}
+
+export interface ControlOfferCitation {
+  quote: string;
+  locator: { kind: 'pdf'; page: number } | { kind: 'docx'; part: string; path: string }
+    | { kind: 'xlsx'; sheet: string; cell: string } | { kind: 'message' };
+}
+
+export interface ControlOfferAnalysis {
+  version: 1;
+  historyStatus: 'VERIFIED_COMPLETE' | 'UNVERIFIED';
+  reasons: string[];
+  evidence?: ControlOfferCitation[];
+  candidates: Array<{
+    status: 'CANDIDATE_ONLY';
+    source: 'field' | 'sent';
+    sourceId: string;
+    sentAt: string | null;
+    headingEvidence: ControlOfferCitation[];
+    amount: { decimal: string; currency: string; evidence: ControlOfferCitation[] } | null;
+  }>;
 }
 
 export interface ControlEvidence {
@@ -139,6 +162,19 @@ export interface ControlEvidence {
   contentType?: string;
   downloadUrl?: string;
   coverage?: string;
+}
+
+export interface ControlEvidenceManifest {
+  version: 0 | 1;
+  observedAt: string | null;
+  capturedAt: string | null;
+  finishedAt?: string;
+  truncated?: boolean;
+  limitation: string;
+  frames: Array<{ id: string; label: string; capturedAt: string | null; downloadUrl: string;
+    kind?: 'card' | 'task' | 'feed'; width?: number; height?: number }>;
+  coverage: Array<{ resultId: string; ruleCode: string; subjectId: string;
+    status: 'CONTEXT_ONLY' | 'VISIBLE_MATCH' | 'NOT_VISIBLE' | 'SOURCE_CHANGED'; frameIds: string[]; reason: string }>;
 }
 
 export interface ControlObservation {
@@ -169,6 +205,7 @@ export interface ControlDecision {
 
 export interface ControlObservationDetail extends ControlObservation {
   snapshot: Record<string, unknown>;
+  documents?: Array<{ sha256: string; size: number; capturedAt: string; label: string; source: 'field' | 'sent'; downloadUrl: string }>;
   cases: Array<{
     id: string;
     ruleCode: string;

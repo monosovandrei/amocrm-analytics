@@ -1,17 +1,25 @@
 import { BadRequestException, ConflictException, ForbiddenException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { createHash, randomUUID } from 'crypto';
-import path from 'node:path';
 import { CrmControlSourceService } from './crm-control-source.service';
 import { indexCrmControlSourcesForDeals } from './crm-control-source.normalizer';
 import { CrmControlSourceWindow } from './crm-control-source.types';
 import { CrmControlDriveReader } from './crm-control-drive';
 import { CrmControlProposalSourceCollector } from './crm-control-proposal-sources';
+import { CrmControlAnalysisBatchService } from './crm-control-analysis-batch.service';
+import { crmControlLocalAnalysisOptions } from './crm-control-analysis.service';
+import { crmControlAnalysisProof } from './crm-control-analysis-proof';
+import { crmControlDocumentDirectory, crmControlDocumentEvidence, readCrmControlDocument } from './crm-control-document-evidence';
+import { CrmBrowserSourceBatch, CrmControlBrowserSourceService } from './crm-control-browser-source.service';
+import { CrmControlDocumentAnalysisService } from './crm-control-document-analysis.service';
+import { assessArchivedOffer } from './crm-control-offer.assessment';
+import { CrmControlAnalysisSummary, crmControlAnalysisProjection, crmControlAnalysisSummaryInclude } from './crm-control-analysis.projection';
 import { Prisma } from '../generated/prisma';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthUser } from '../auth/jwt.strategy';
 import { AmoService } from '../amo/amo.service';
 import { AmoRequestError } from '../amo/amo-client';
 import { CaptureHealth, CrmControlEvidenceService, sanitizeCrmCaptureHealth } from './crm-control-evidence.service';
+import { publicEvidenceManifest } from './crm-control-evidence-manifest';
 import { CRM_CONTROL_RULE_CATALOG, CRM_CONTROL_RULE_VERSION, evaluateCrmControlDeal } from './crm-control.rules';
 import { hasStageDeadline, stageDeadlineConfigError } from './crm-control-deadline';
 import { CrmControlConfig, CrmControlCounts, CrmControlDecisionInput, CrmControlManualReviewInput, CrmControlRuleInput, CrmControlRuleResult,
@@ -22,10 +30,10 @@ type Access = { role: 'OWNER' | 'ROP' | 'MANAGER'; managerId?: string; groupId?:
 type Pipeline = Prisma.PipelineGetPayload<{ include: { stages: true } }>;
 const isWorkingStage = (stage: Pipeline['stages'][number]) => !stage.isWon && !stage.isLost
   && !(stage.raw && typeof stage.raw === 'object' && !Array.isArray(stage.raw) && stage.raw.type === 1);
-type Observation = Prisma.CrmControlObservationGetPayload<{ include: { results: { include: { case: { include: { decisions: true } } } }; evidence: true } }>;
-const observationInclude = { results: { include: { case: { include: { decisions: true } } } }, evidence: true } as const;
+const observationInclude = { results: { include: { case: { include: { decisions: true } }, analyses: crmControlAnalysisSummaryInclude } }, evidence: true } as const;
+type Observation = Prisma.CrmControlObservationGetPayload<{ include: typeof observationInclude }>;
 type AssessedDecision = { id?: string; action: string; observationId: string; createdAt: Date; validUntil: Date | null; reason?: string; actorName?: string };
-type AssessedResult = { status: string; observationId: string; case?: { status: string; confirmedAt?: Date | null;
+type AssessedResult = { status: string; observationId: string; analyses?: CrmControlAnalysisSummary[]; case?: { status: string; confirmedAt?: Date | null;
   decisions?: AssessedDecision[] } | null };
 const manualReviewActions = ['VERIFY_PASS', 'VERIFY_FAIL', 'VERIFY_NA'];
 const newestDecision = (items: AssessedDecision[]) => [...items].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime() || String(b.id ?? '').localeCompare(String(a.id ?? '')))[0];
@@ -51,7 +59,8 @@ const transientRunError = (error: unknown) => error instanceof AmoRequestError ?
 export class CrmControlService {
   private readonly logger = new Logger(CrmControlService.name);
   constructor(private readonly prisma: PrismaService, private readonly amo: AmoService,
-    private readonly evidenceProvider: CrmControlEvidenceService) {}
+    private readonly evidenceProvider: CrmControlEvidenceService, private readonly analysisBatches?: CrmControlAnalysisBatchService,
+    private readonly browserSources?: CrmControlBrowserSourceService, private readonly documentAnalysis?: CrmControlDocumentAnalysisService) {}
 
   async access(actor: AuthUser): Promise<Access> {
     const user = await this.prisma.user.findUnique({ where: { id: actor.id },
@@ -87,7 +96,8 @@ export class CrmControlService {
       ? 'Вход сборщика проверен на карточке amoCRM. Доступ проверяется при каждом снимке.'
       : health.status === 'ERROR' ? health.message : 'Сессия подготовлена, но текущий вход в amoCRM ещё не подтверждён сборщиком.';
     return { ...stored, canManage: access.role === 'OWNER', canReview: access.role !== 'MANAGER', canDispute: true,
-      capabilities: { ...capture, health, message: captureMessage, communications: false, proposalFiles: false, taskTypes: taskTypes.available },
+      capabilities: { ...capture, health, message: captureMessage, communications: false, proposalFiles: false, taskTypes: taskTypes.available,
+        localAnalysis: Boolean(crmControlLocalAnalysisOptions()) },
       options: { pipelines: pipelines.map((pipeline) => ({ id: pipeline.id, name: pipeline.name,
         stages: pipeline.stages.filter(isWorkingStage).map(({ id, name, isWon, isLost }) => ({ id, name, isWon, isLost })) })),
         taskTypes: taskTypes.items },
@@ -228,6 +238,18 @@ export class CrmControlService {
       create: { requestKey: `daily:${slot}`, trigger: 'SCHEDULED', scheduledFor: now, config: json(stored.config), configVersion: stored.version, ruleVersion: CRM_CONTROL_RULE_VERSION } });
   }
 
+  async recheckRemaining(actor: AuthUser, runId: string, body: { requestKey?: string } = {}) {
+    const access = await this.access(actor);
+    if (access.role === 'MANAGER') throw new ForbiddenException('Допроверку запускает владелец или руководитель.');
+    await this.run(actor, runId);
+    if (!this.analysisBatches) throw new BadRequestException('Локальная допроверка недоступна.');
+    if (!body || typeof body !== 'object' || Array.isArray(body) || (body.requestKey !== undefined && (typeof body.requestKey !== 'string' || body.requestKey.length > 120))) {
+      throw new BadRequestException('Неверные параметры допроверки.');
+    }
+    const batch = await this.analysisBatches.enqueue(runId, access, `manual:${runId}:${actor.id}:${body.requestKey || randomUUID()}`);
+    return { id: batch.id, status: batch.status, processed: batch.processed, queued: batch.queued, deferred: batch.deferred };
+  }
+
   async runs(actor: AuthUser, cursor?: string) {
     const access = await this.access(actor);
     const where: Prisma.CrmControlRunWhereInput = access.role === 'OWNER' ? {} : { OR: [{ requestedBy: actor.id }, { observations: { some: this.scopeWhere(access) } }] };
@@ -246,11 +268,12 @@ export class CrmControlService {
   private async summary(runId: string, access: Access) {
     const observations = await this.prisma.crmControlObservation.findMany({ where: { runId, ...this.scopeWhere(access) },
       select: { managerId: true, managerName: true, groupName: true, department: true, counts: true, observedAt: true,
-        results: { select: { status: true, ruleCode: true, ruleName: true, observationId: true, case: { select: { status: true,
+        results: { select: { status: true, ruleCode: true, ruleName: true, observationId: true, analyses: crmControlAnalysisSummaryInclude, case: { select: { status: true,
           decisions: { select: { id: true, action: true, observationId: true, createdAt: true, validUntil: true } } } } } } } });
     const counts = emptyControlCounts();
     const managers = new Map<string, CrmControlCounts & { managerId: string | null; managerName: string | null; groupName: string | null; department: string }>();
     const rules = new Map<string, RuleBreakdown>();
+    const analysis = { queued: 0, running: 0, completed: 0, failed: 0, unresolved: 0, preparing: false };
     for (const observation of observations) {
       const value = this.effectiveCounts(observation.results, observation.observedAt);
       addControlCounts(counts, value);
@@ -263,6 +286,14 @@ export class CrmControlService {
       // Several tasks may fail the same rule. Each cell counts the deal only once per status.
       const statusesByRule = new Map<string, { name: string; statuses: Set<string> }>();
       for (const result of observation.results) {
+        const automatic = crmControlAnalysisProjection(result.analyses);
+        if (automatic) {
+          if (automatic.status === 'QUEUED') analysis.queued++;
+          else if (automatic.status === 'RUNNING') analysis.running++;
+          else if (automatic.status === 'ERROR') analysis.failed++;
+          else if (automatic.outcome) analysis.completed++;
+          else analysis.unresolved++;
+        }
         const item = statusesByRule.get(result.ruleCode) ?? { name: result.ruleName, statuses: new Set<string>() };
         item.statuses.add(this.effectiveStatus(result, observation.observedAt));
         statusesByRule.set(result.ruleCode, item);
@@ -277,7 +308,9 @@ export class CrmControlService {
         rules.set(ruleCode, rule);
       }
     }
-    return { counts, managers: [...managers.values()].sort((a, b) => b.failedDeals - a.failedDeals || String(a.managerName).localeCompare(String(b.managerName), 'ru')),
+    if (crmControlLocalAnalysisOptions()) analysis.preparing = Boolean(await this.prisma.crmControlAnalysisBatch.findFirst({ where: { runId, status: { in: ['QUEUED','RUNNING'] },
+      ...(access.role === 'OWNER' ? {} : access.role === 'ROP' ? { OR: [{ scopeRole: 'OWNER' }, { groupId: access.groupId }] } : { OR: [{ scopeRole: 'OWNER' }, { managerId: access.managerId }] }) }, select: { id: true } }));
+    return { counts, analysis, managers: [...managers.values()].sort((a, b) => b.failedDeals - a.failedDeals || String(a.managerName).localeCompare(String(b.managerName), 'ru')),
       ruleBreakdown: [...rules.values()].sort((a, b) => b.failedDeals - a.failedDeals || a.ruleName.localeCompare(b.ruleName, 'ru')) };
   }
 
@@ -323,8 +356,9 @@ export class CrmControlService {
   private publicObservation(row: Observation) {
     const { snapshot, snapshotHash, results, evidence, ...rest } = row;
     const counts = this.effectiveCounts(results, row.observedAt);
-    return { ...rest, counts, results: results.map(({ case: caseValue, ...result }) => ({ ...result, effectiveStatus: this.effectiveStatus({ ...result, case: caseValue }, row.observedAt), caseStatus: caseValue?.status ?? null,
-      review: this.manualReviewState({ ...result, case: caseValue }) })),
+    return { ...rest, counts, results: results.map(({ case: caseValue, analyses, ...result }) => ({ ...result,
+      effectiveStatus: this.effectiveStatus({ ...result, analyses, case: caseValue }, row.observedAt), caseStatus: caseValue?.status ?? null,
+      analysis: crmControlAnalysisProjection(analyses), review: this.manualReviewState({ ...result, case: caseValue }) })),
       evidence: evidence.map(({ storageKey, ...item }) => ({ ...item, downloadUrl: item.status === 'READY' ? `/crm-control/evidence/${item.id}/file` : null })) };
   }
 
@@ -336,7 +370,7 @@ export class CrmControlService {
     if (decision && manualReviewActions.includes(decision.action)) return decision.action.slice('VERIFY_'.length);
     if (decision?.action === 'EXEMPT' && decision.validUntil && decision.validUntil >= observedAt) return 'NA';
     if (decision?.action === 'CONFIRM') return 'FAIL';
-    return result.status;
+    return crmControlAnalysisProjection(result.analyses)?.outcome ?? result.status;
   }
 
   private manualReviewState(result: AssessedResult & { ruleCode?: string; message?: string; details?: unknown }) {
@@ -375,7 +409,30 @@ export class CrmControlService {
         take: 100, select: { id: true, runId: true, observedAt: true, counts: true } }),
     ]);
     return { ...this.publicObservation(row), snapshot: row.snapshot, snapshotHash: row.snapshotHash, cases, history,
+      documents: crmControlDocumentEvidence(row.snapshot).map(item => ({ ...item,
+        downloadUrl: `/crm-control/observations/${encodeURIComponent(row.id)}/documents/${item.sha256}/file` })),
       historyLimited: history.length === 100 };
+  }
+
+  async documentEvidence(actor: AuthUser, observationId: string, sha256: string) {
+    const { row } = await this.visibleObservation(actor, observationId);
+    const artifact = crmControlDocumentEvidence(row.snapshot).find(item => item.sha256 === sha256);
+    const root = crmControlDocumentDirectory();
+    if (!artifact || !root) throw new NotFoundException('Сохранённый документ не найден');
+    try { return await readCrmControlDocument(root, artifact); }
+    catch { throw new NotFoundException('Сохранённый документ недоступен или не прошёл проверку целостности'); }
+  }
+
+  async analysisProof(actor: AuthUser, observationId: string, resultId: string) {
+    const { row } = await this.visibleObservation(actor, observationId);
+    const result = row.results.find(item => item.id === resultId);
+    if (!result) throw new NotFoundException('Результат проверки не найден');
+    const latest = result.analyses?.[0];
+    if (!latest) return { analysis: null, findings: [] };
+    const job = await this.prisma.crmControlAnalysisJob.findFirst({ where: { id: latest.id, resultId },
+      include: { attempts: { where: { status: 'READY' }, orderBy: { attemptNo: 'desc' }, take: 1 } } });
+    if (!job) return { analysis: null, findings: [] };
+    return crmControlAnalysisProof(job, row.snapshotHash, job.attempts[0] ?? null);
   }
 
   async decide(actor: AuthUser, id: string, body: CrmControlDecisionInput) {
@@ -503,9 +560,32 @@ export class CrmControlService {
   async evidenceFile(actor: AuthUser, id: string) {
     const evidence = await this.prisma.crmControlEvidence.findUnique({ where: { id } });
     if (!evidence) throw new NotFoundException('Подтверждение не найдено');
-    await this.visibleObservation(actor, evidence.observationId);
+    const { row } = await this.visibleObservation(actor, evidence.observationId);
     if (evidence.status !== 'READY' || !evidence.storageKey) throw new NotFoundException('Снимок ещё не готов');
-    return this.evidenceProvider.read(evidence.storageKey);
+    return this.evidenceProvider.read(evidence.storageKey, { observationId: row.id, dealExternalId: row.dealExternalId,
+      observedAt: row.observedAt, snapshotHash: row.snapshotHash, snapshot: row.snapshot, results: row.results });
+  }
+
+  async evidenceManifest(actor: AuthUser, id: string) {
+    const evidence = await this.prisma.crmControlEvidence.findUnique({ where: { id } });
+    if (!evidence) throw new NotFoundException('Подтверждение не найдено');
+    const { row } = await this.visibleObservation(actor, evidence.observationId);
+    if (evidence.status !== 'READY' || !evidence.storageKey) throw new NotFoundException('Снимок ещё не готов');
+    const manifest = await this.evidenceProvider.readManifest(evidence.storageKey, { observationId: row.id, dealExternalId: row.dealExternalId,
+      observedAt: row.observedAt, snapshotHash: row.snapshotHash, snapshot: row.snapshot, results: row.results });
+    return manifest ? publicEvidenceManifest(manifest, evidence.id) : { version: 0, observedAt: row.observedAt,
+      capturedAt: evidence.capturedAt, frames: [{ id: 'legacy', label: 'Ранее сохранённая карточка', capturedAt: evidence.capturedAt,
+        downloadUrl: `/crm-control/evidence/${encodeURIComponent(evidence.id)}/file` }], coverage: [],
+      limitation: evidence.coverage || 'Сохранён один кадр. Покрытие отдельных правил в этой версии не фиксировалось.' };
+  }
+
+  async evidenceFrameFile(actor: AuthUser, id: string, frameId: string) {
+    const evidence = await this.prisma.crmControlEvidence.findUnique({ where: { id } });
+    if (!evidence) throw new NotFoundException('Подтверждение не найдено');
+    const { row } = await this.visibleObservation(actor, evidence.observationId);
+    if (evidence.status !== 'READY' || !evidence.storageKey) throw new NotFoundException('Снимок ещё не готов');
+    return this.evidenceProvider.readFrame(evidence.storageKey, frameId, { observationId: row.id, dealExternalId: row.dealExternalId,
+      observedAt: row.observedAt, snapshotHash: row.snapshotHash, snapshot: row.snapshot, results: row.results });
   }
 
   async retryEvidence(actor: AuthUser, id: string) {
@@ -632,9 +712,9 @@ export class CrmControlService {
       const account = await client.get<any>('/account', { with: 'drive_url' });
       driveReader = new CrmControlDriveReader(client, account.drive_url);
     } catch { issues.push('Не удалось подключить хранилище файлов amoCRM для сверки КП.'); }
-    const proposalCollector = new CrmControlProposalSourceCollector(driveReader,
-      process.env.CRM_CONTROL_EVIDENCE_DIR ? path.join(process.env.CRM_CONTROL_EVIDENCE_DIR, 'documents') : null);
+    const proposalCollector = new CrmControlProposalSourceCollector(driveReader, crmControlDocumentDirectory());
     // Enumerate the source itself. A fresh local sync timestamp cannot prove a complete task/notes list.
+    const collectOpenDeals = async (sourceBatch?: CrmBrowserSourceBatch) => {
     await client.paginateBatch<any>('/leads', 'leads', sourceParams, async (leads) => {
       const uniqueLeads = [...new Map(leads.map((lead) => [String(lead.id), lead])).values()];
       for (let offset = 0; offset < uniqueLeads.length; offset += 3) {
@@ -683,6 +763,10 @@ export class CrmControlService {
         }
         const messageEvidence = messageIndex.byDeal.get(String(lead.id)) ?? [];
         const proposalSources = await proposalCollector.collect(lead.custom_fields_values ?? [], proposalFieldId, messageEvidence);
+        const browserSources = sourceBatch ? await sourceBatch.collectCurrent({ dealExternalId: String(lead.id),
+          sourceUrl: `https://${client.domain.replace(/^https?:\/\//, '').replace(/\/$/, '')}/leads/detail/${lead.id}` }) : null;
+        await heartbeat();
+        const documentAnalysis = this.documentAnalysis ? await this.documentAnalysis.collect(proposalSources, browserSources) : null;
         let finalLead: any = null;
         try {
           finalLead = await client.get(`/leads/${lead.id}`);
@@ -715,19 +799,22 @@ export class CrmControlService {
         };
         const results = evaluateCrmControlDeal(input);
         const snapshot = { ...input, config: undefined, scope: input.scope, sourceReadStartedAt, sourceReadFinishedAt: observedAt,
-          currency: lead.currency ?? (connection.config as any)?.currency ?? null, finalLead, stageEvent, historySource: 'amoCRM_event',
+          currency: finalLead && browserSources?.accountCurrency?.status === 'VERIFIED' ? browserSources.accountCurrency.code : null,
+          finalLead, stageEvent, historySource: 'amoCRM_event',
           proposalSources: finalLead ? proposalSources : null,
+          browserSources: finalLead ? browserSources : null,
+          documentAnalysis: finalLead ? documentAnalysis : null,
           communicationSources: finalLead ? { readAt: communicationReadAt, datasetReadComplete: sourceWindow?.datasetReadComplete ?? false,
             sourceCoverage: 'UNVERIFIED', messages: messageEvidence.map(({ message, bindingProof }) => ({ bindingProof,
               message: { ...message, attachments: message.attachments.map(({ url: _privateDownloadUrl, ...attachment }) => attachment) } })) } : null };
-        await this.persistObservation(run.id, input, results, snapshot, {
+        const observation = await this.persistObservation(run.id, input, results, snapshot, {
           pipelineName: currentMatch.pipeline.name, stageName: stage.name,
           managerName: responsible?.name ?? (lead.responsible_user_id ? `Менеджер amoCRM #${lead.responsible_user_id}` : null),
           groupId: responsible?.groupId ?? null, groupName: responsible?.group?.name ?? null,
           dealUrl: `https://${client.domain.replace(/^https?:\/\//, '').replace(/\/$/, '')}/leads/detail/${lead.id}`,
         }, run.startedAt!);
         observedDealIds.add(String(lead.id));
-        addControlCounts(counts, observationCounts(results));
+        addControlCounts(counts, observation.counts as unknown as CrmControlCounts);
         }));
         // Wait for all in-flight writers before releasing the lease or starting another attempt.
         const failure = collected.find((item): item is PromiseRejectedResult => item.status === 'rejected');
@@ -736,6 +823,19 @@ export class CrmControlService {
       }
       await heartbeat();
     });
+    };
+    if (this.browserSources && this.evidenceProvider.capabilities().screenshots) {
+      let sourceActionFailed = false, sourceActionError: unknown;
+      const browserResult = await this.browserSources.withBatch(async batch => {
+        try { await collectOpenDeals(batch); }
+        catch (error) { sourceActionFailed = true; sourceActionError = error; throw error; }
+      });
+      if (sourceActionFailed) throw sourceActionError;
+      if (!browserResult.ok) {
+        issues.push('Сборщик истории amoCRM недоступен. Проверки отправленных КП и договорённостей остались незавершёнными.');
+        await collectOpenDeals();
+      }
+    } else await collectOpenDeals();
     // Previously observed cases are re-read even if the source's open-deal list no longer contains them.
     // A 404 is not evidence of correction: permissions and deletion must not erase a violation.
     let caseCursor: string | undefined;
@@ -780,12 +880,12 @@ export class CrmControlService {
           stageId: stage?.id ?? prior.stageId, responsibleId: current ? currentResponsible?.id ?? null : prior.managerId, customFields: current?.custom_fields_values ?? [], raw },
           tasks: [], notes: [], stageEnteredAt: null, observedAt, config, scope,
           sourceCompleteness: { deal: Boolean(current), tasks: false, notes: false, stageHistory: false, communications: false } };
-        await this.persistObservation(run.id, input, results, { ...input, config: undefined, reconciliation: true, sourceReadFinishedAt: observedAt },
+        const observation = await this.persistObservation(run.id, input, results, { ...input, config: undefined, reconciliation: true, sourceReadFinishedAt: observedAt },
           { pipelineName: pipeline?.name ?? prior.pipelineName, stageName: stage?.name ?? prior.stageName,
             managerName: current ? currentResponsible?.name ?? null : prior.managerName,
             groupId: current ? currentResponsible?.groupId ?? null : prior.groupId,
             groupName: current ? currentResponsible?.group?.name ?? null : prior.groupName, dealUrl: prior.dealUrl }, run.startedAt!);
-        addControlCounts(counts, observationCounts(results));
+        addControlCounts(counts, observation.counts as unknown as CrmControlCounts);
         await heartbeat();
       }
     }
@@ -799,17 +899,39 @@ export class CrmControlService {
   private async persistObservation(runId: string, input: CrmControlRuleInput, results: CrmControlRuleResult[], snapshot: unknown,
     meta: { pipelineName: string; stageName: string; managerName: string | null; groupId: string | null; groupName: string | null; dealUrl: string }, leaseStartedAt: Date) {
     const snapshotJson = json(snapshot);
+    const observationId = randomUUID(), snapshotHash = createHash('sha256').update(JSON.stringify(snapshotJson)).digest('hex');
+    const offerRule = (result: CrmControlRuleResult) => result.status !== 'NA' && ['offer_budget', 'proposal_file'].includes(result.ruleCode);
+    // File reads and deterministic interpretation happen before DB locks. Reconciliation records preserve their original NA/UNKNOWN semantics.
+    if (!(snapshotJson as any)?.reconciliation && results.some(offerRule)) {
+      if (!input.deal.responsibleId) {
+        results = results.map(result => offerRule(result) ? { ...result, status: 'UNKNOWN',
+          message: 'Ответственный за сделку не подтверждён; документы не сравнивались.',
+          details: { ...result.details, verificationMethod: 'ARCHIVED_OFFER_V1', offerAnalysis: { version: 1, historyStatus: 'UNVERIFIED',
+            issues: ['DEAL_OWNER_UNVERIFIED'], reasons: ['Ответственный за сделку не подтверждён; документы не сравнивались.'], inspectedDocuments: 0, candidates: [], evidence: [] } } } : result);
+      } else {
+        const assessment = await assessArchivedOffer({ scope: { dealId: input.deal.id, ownerId: input.deal.responsibleId,
+          observationId, snapshotHash }, snapshot: snapshotJson }, this.documentAnalysis);
+        results = results.map(result => {
+          if (!offerRule(result)) return result;
+          const key = result.ruleCode === 'offer_budget' ? 'offerBudget' : 'proposalFile';
+          const rule = assessment.validation[key];
+          return { ...result, status: rule.status, message: assessment.messages[result.ruleCode as 'offer_budget' | 'proposal_file'],
+            details: { ...result.details, ...rule.details, verificationMethod: 'ARCHIVED_OFFER_V1',
+              offerAnalysis: { ...assessment.details, issues: [...new Set([...assessment.details.issues, ...rule.issues])], evidence: rule.evidence } } };
+        });
+      }
+    }
     return this.prisma.$transaction(async (tx) => {
       const lease = await tx.$queryRaw<Array<{ id: string }>>`SELECT "id" FROM "CrmControlRun" WHERE "id" = ${runId} AND "status" = 'RUNNING' AND "activeKey" = 'global' AND "startedAt" = ${leaseStartedAt} FOR UPDATE`;
       if (!lease.length) throw new ControlRunError('Проверка больше не выполняется.');
       await tx.$queryRaw`SELECT "id" FROM "CrmControlCase" WHERE "dealId" = ${input.deal.id} FOR UPDATE`;
       const existing = await tx.crmControlObservation.findUnique({ where: { runId_dealId: { runId, dealId: input.deal.id } } });
       if (existing) return existing;
-      const observation = await tx.crmControlObservation.create({ data: { runId, dealId: input.deal.id, dealExternalId: input.deal.externalId,
+      const observation = await tx.crmControlObservation.create({ data: { id: observationId, runId, dealId: input.deal.id, dealExternalId: input.deal.externalId,
         dealTitle: input.deal.title, dealUrl: meta.dealUrl, managerId: input.deal.responsibleId, managerName: meta.managerName, groupId: meta.groupId,
         groupName: meta.groupName, department: input.scope.department, pipelineId: input.deal.pipelineId, pipelineName: meta.pipelineName,
         stageId: input.deal.stageId, stageName: meta.stageName, observedAt: input.observedAt, snapshot: snapshotJson,
-        snapshotHash: createHash('sha256').update(JSON.stringify(snapshotJson)).digest('hex'), counts: json(observationCounts(results)) } });
+        snapshotHash, counts: json(observationCounts(results)) } });
       for (const result of results) {
         const activeKey = `${input.deal.id}:${result.ruleCode}:${result.subjectId ?? ''}`;
         let previous = await tx.crmControlCase.findUnique({ where: { activeKey } });
@@ -868,7 +990,8 @@ export class CrmControlService {
       { status: 'PENDING', OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: now } }] },
       { status: 'ERROR', attempts: { lt: 3 }, nextAttemptAt: { lte: now } },
     ] }, orderBy: { createdAt: 'asc' },
-      include: { observation: { select: { dealExternalId: true, dealTitle: true, managerId: true, groupId: true } } } });
+      include: { observation: { select: { dealExternalId: true, dealTitle: true, managerId: true, groupId: true,
+        observedAt: true, snapshotHash: true, snapshot: true, results: { select: { id: true, ruleCode: true, subjectId: true, status: true, details: true } } } } } });
     if (!job) return;
     const claimedAt = new Date();
     const attempt = job.attempts + 1;
@@ -885,7 +1008,8 @@ export class CrmControlService {
         return;
       }
       const capture = await this.evidenceProvider.capture({ dealExternalId: job.observation.dealExternalId, dealTitle: job.observation.dealTitle,
-        sourceUrl: job.sourceUrl, observationId: job.observationId });
+        sourceUrl: job.sourceUrl, observationId: job.observationId, observedAt: job.observation.observedAt,
+        snapshotHash: job.observation.snapshotHash, snapshot: job.observation.snapshot, results: job.observation.results });
       await this.persistEvidenceHealth();
       if (capture.status === 'READY' && !await this.captureOwnerMatches(job.observation, job.sourceUrl)) {
         await this.prisma.crmControlEvidence.updateMany({ where: lease, data: { status: 'ERROR', nextAttemptAt: null,

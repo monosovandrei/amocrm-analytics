@@ -3,6 +3,8 @@ import { controlScheduleSlot, nextControlCaseState, observationCounts } from './
 import { CrmControlRuleInput, CrmControlRuleResult, DEFAULT_CRM_CONTROL_CONFIG } from './crm-control.types';
 import { CRM_CONTROL_RULE_VERSION, evaluateCrmControlDeal } from './crm-control.rules';
 import { CrmControlProposalSourceCollector, CrmControlProposalSources } from './crm-control-proposal-sources';
+import { createHash } from 'node:crypto';
+import * as offerAssessment from './crm-control-offer.assessment';
 
 const actor = { id: 'actor', email: 'owner@example.test', role: 'ADMIN' as const, businessRole: 'OWNER' as const };
 const result = (status: CrmControlRuleResult['status'], extra: Partial<CrmControlRuleResult> = {}): CrmControlRuleResult => ({
@@ -17,7 +19,7 @@ const input = (): CrmControlRuleInput => ({
   scope: { department: 'sales', pipelineId: 'pipeline' }, config: { ...DEFAULT_CRM_CONTROL_CONFIG },
 });
 
-function memory() {
+function memory(documentReader?: any) {
   const observations: any[] = [], cases: any[] = [], results: any[] = [], evidence: any[] = [];
   let next = 0;
   const tx: any = {
@@ -41,9 +43,10 @@ function memory() {
     crmControlEvidence: { create: jest.fn(({ data }) => { evidence.push({ ...data }); return data; }) },
   };
   const prisma = { ...tx, $transaction: jest.fn((fn) => fn(tx)) };
-  const service = new CrmControlService(prisma as any, {} as any, { capabilities: () => ({ screenshots: false, message: 'Не подключено' }) } as any);
-  const persist = (runId: string, value: CrmControlRuleInput, rows: CrmControlRuleResult[]) => (service as any).persistObservation(runId, value, rows,
-    { deal: value.deal, tasks: value.tasks, observedAt: value.observedAt },
+  const service = new CrmControlService(prisma as any, {} as any, { capabilities: () => ({ screenshots: false, message: 'Не подключено' }) } as any,
+    undefined, undefined, documentReader);
+  const persist = (runId: string, value: CrmControlRuleInput, rows: CrmControlRuleResult[], extraSnapshot?: Record<string, unknown>) => (service as any).persistObservation(runId, value, rows,
+    { deal: value.deal, tasks: value.tasks, observedAt: value.observedAt, ...extraSnapshot },
     { pipelineName: 'Продажи', stageName: 'В работе', managerName: 'Менеджер', groupId: 'group', groupName: 'ОПНК', dealUrl: 'https://example.amocrm.ru/leads/detail/12' }, observedAt);
   return { service, tx, observations, cases, results, evidence, persist };
 }
@@ -159,6 +162,77 @@ describe('CRM control immutable observations and case episodes', () => {
     expect(fixture.cases.find((item) => item.id === caseId).status).toBe('OPEN');
     expect(fixture.results[0].status).toBe('FAIL');
     expect(fixture.results.find((item) => item.observationId !== fixture.results[0].observationId && item.ruleCode === 'intake_stage').status).toBe('NA');
+  });
+});
+
+describe('CRM archived offer persistence', () => {
+  afterEach(() => jest.restoreAllMocks());
+  const rows = () => ['offer_budget', 'proposal_file'].map(ruleCode => result('PASS', { ruleCode, message: 'pending' }));
+
+  it('assesses native files before transaction locks and binds evidence to the saved UUID/hash', async () => {
+    const sha256 = 'a'.repeat(64), outputSha256 = 'b'.repeat(64);
+    const artifact = { sha256, storageKey: `${sha256}.bin`, size: 100, contentType: 'application/pdf', capturedAt: observedAt.toISOString() };
+    const reader = { read: jest.fn() };
+    const fixture = memory(reader);
+    reader.read.mockImplementation(async () => {
+      expect(fixture.tx.$queryRaw).not.toHaveBeenCalled();
+      return { extractorVersion: 'local-documents-v1', sourceSha256: sha256, format: 'pdf', status: 'COMPLETE', problems: [],
+        units: ['Коммерческое предложение', 'Итого: 450 RUB'].map((text, index) => ({ text, complete: true, method: 'native',
+          locator: { kind: 'pdf', page: 1, line: index + 1, coordinateSpace: 'pdf-points' } })) };
+    });
+    const assess = jest.spyOn(offerAssessment, 'assessArchivedOffer');
+    const original = rows();
+    const observation = await fixture.persist('offer-run', input(), original, { currency: 'RUB',
+      proposalSources: { fieldReadComplete: true, fieldFiles: [{ artifact }], sentAttachments: [{ messageId: 'sent-1', sentAt: '2026-09-18T12:00:00Z', artifact }], sentHistoryComplete: false },
+      documentAnalysis: { version: 1, documents: [{ sourceSha256: sha256, status: 'COMPLETE', issues: [], outputSha256,
+        storageKey: `local-documents-v1/${sha256}.${outputSha256}.json` }] } });
+    expect(reader.read).toHaveBeenCalledTimes(1);
+    expect(assess.mock.calls[0][0]).not.toHaveProperty('trustedHistory');
+    expect(assess.mock.calls[0][0].scope).toEqual({ dealId: input().deal.id, ownerId: input().deal.responsibleId,
+      observationId: observation.id, snapshotHash: observation.snapshotHash });
+    expect(observation.id).toMatch(/^[a-f0-9-]{36}$/);
+    expect(observation.snapshotHash).toBe(createHash('sha256').update(JSON.stringify(observation.snapshot)).digest('hex'));
+    expect(observation.counts).toMatchObject({ deals: 1, unknown: 2, unknownDeals: 1, passed: 0, checkedDeals: 0 });
+    expect(fixture.results.every(row => row.status === 'UNKNOWN' && row.message.includes('полноты истории'))).toBe(true);
+    expect(fixture.results[0].details.offerAnalysis.candidates).toEqual(expect.arrayContaining([expect.objectContaining({ status: 'CANDIDATE_ONLY', source: 'sent',
+      amount: expect.objectContaining({ decimal: '450', currency: 'RUB' }) })]));
+    expect(original.every(row => row.status === 'PASS' && row.message === 'pending')).toBe(true);
+    expect(fixture.cases).toHaveLength(0);
+  });
+
+  it('does not read documents or accuse an unassigned manager', async () => {
+    const reader = { read: jest.fn() }, fixture = memory(reader), value = input();
+    value.deal.responsibleId = null;
+    const assess = jest.spyOn(offerAssessment, 'assessArchivedOffer');
+    const saved = await fixture.persist('unassigned', value, rows().map(row => ({ ...row, status: 'FAIL' })));
+    expect(saved.counts).toMatchObject({ unknown: 2, violations: 0, failedDeals: 0 });
+    expect(fixture.results.every(row => row.details.offerAnalysis.issues.includes('DEAL_OWNER_UNVERIFIED'))).toBe(true);
+    expect(assess).not.toHaveBeenCalled(); expect(reader.read).not.toHaveBeenCalled();
+  });
+
+  it.each(['NA', 'UNKNOWN'] as const)('preserves reconciliation %s and its original explanation', async status => {
+    const fixture = memory(), assess = jest.spyOn(offerAssessment, 'assessArchivedOffer');
+    const results = rows().map(row => ({ ...row, status, message: 'reconciliation message', details: { sourceState: status === 'NA' ? 'CLOSED' : 'UNAVAILABLE' } }));
+    await fixture.persist('reconcile', input(), results, { reconciliation: true });
+    expect(fixture.results.every(row => row.status === status && row.message === 'reconciliation message' && !row.details.offerAnalysis)).toBe(true);
+    expect(assess).not.toHaveBeenCalled();
+  });
+
+  it('preserves an explicitly nonapplicable offer result outside reconciliation', async () => {
+    const fixture = memory(), assess = jest.spyOn(offerAssessment, 'assessArchivedOffer');
+    await fixture.persist('not-applicable', input(), rows().map(row => ({ ...row, status: 'NA' })));
+    expect(fixture.results.every(row => row.status === 'NA')).toBe(true);
+    expect(assess).not.toHaveBeenCalled();
+  });
+
+  it('retains a saved assessment and saved counts on an idempotent repeat', async () => {
+    const fixture = memory();
+    const first = await fixture.persist('same-offer-run', input(), rows());
+    const before = JSON.stringify({ observation: first, results: fixture.results });
+    const repeated = await fixture.persist('same-offer-run', input(), [result('FAIL')]);
+    expect(repeated).toBe(first);
+    expect(JSON.stringify({ observation: repeated, results: fixture.results })).toBe(before);
+    expect(repeated.counts.unknown).toBe(2);
   });
 });
 
@@ -393,7 +467,7 @@ describe('CRM control direct source reads', () => {
     };
     const service = new CrmControlService(prisma as any, { getActiveConnectionOrFail: jest.fn().mockResolvedValue({ id: 'connection', config: {} }),
       getClient: jest.fn().mockResolvedValue(client) } as any, {} as any);
-    const persist = jest.spyOn(service as any, 'persistObservation').mockResolvedValue({});
+    const persist = jest.spyOn(service as any, 'persistObservation').mockImplementation(async (...args: any[]) => ({ counts: observationCounts(args[2]) }));
     const run = { id: 'run', startedAt: new Date(), scheduledFor: new Date(), config: { ...DEFAULT_CRM_CONTROL_CONFIG, scopes: [{ pipelineId: 'pipeline', department: 'sales', assignedStageId: 'stage' }] } };
     return { client, readLead, prisma, service, persist, run, leads };
   }
@@ -414,6 +488,33 @@ describe('CRM control direct source reads', () => {
         artifact: { sha256: 'a'.repeat(64), size: 100, storageKey: `${'a'.repeat(64)}.bin`, contentType: 'application/pdf', capturedAt: new Date().toISOString() } }] };
   }
 
+  it('aggregates returned persisted counts for normal source observations', async () => {
+    const fixture = sourceFixture();
+    const savedCounts = observationCounts([result('PASS')]);
+    fixture.persist.mockResolvedValue({ counts: savedCounts });
+    await (fixture.service as any).executeRun(fixture.run);
+    const finish = fixture.prisma.crmControlRun.updateMany.mock.calls.at(-1)![0] as any;
+    expect(finish.data.counts).toMatchObject(savedCounts);
+    expect(finish.data.counts.unknown).toBe(0);
+  });
+
+  it('aggregates returned immutable counts when reconciling a previously observed deal', async () => {
+    const fixture = sourceFixture(0);
+    const active = { id: 'case', dealId: 'amo:99', ruleCode: 'offer_budget', subjectId: '', latestObservationId: 'prior' };
+    fixture.prisma.crmControlCase.findMany.mockResolvedValueOnce([active] as never).mockResolvedValueOnce([active] as never).mockResolvedValue([]);
+    (fixture.prisma.crmControlObservation as any).findUnique = jest.fn().mockResolvedValue({ id: 'prior', dealId: 'amo:99', dealExternalId: '99', pipelineId: 'pipeline',
+      pipelineName: 'Продажи', stageId: 'stage', stageName: 'В работе', dealTitle: 'Сделка', managerId: 'manager', managerName: 'Менеджер', groupId: 'group', groupName: 'ОПНК',
+      dealUrl: 'https://example.amocrm.ru/leads/detail/99' });
+    fixture.readLead.mockResolvedValue({ id: 99, pipeline_id: 100, status_id: 201, responsible_user_id: 300, created_at: 1700000000, price: 450 });
+    const savedCounts = observationCounts([result('FAIL')]);
+    fixture.persist.mockResolvedValue({ counts: savedCounts });
+    await (fixture.service as any).executeRun(fixture.run);
+    expect((fixture.persist.mock.calls[0][2] as CrmControlRuleResult[])[0].status).toBe('NA');
+    const finish = fixture.prisma.crmControlRun.updateMany.mock.calls.at(-1)![0] as any;
+    expect(finish.data.counts).toMatchObject(savedCounts);
+    expect(finish.data.counts.violations).toBe(1);
+  });
+
   it('collects and archives proposal sources before the final card read while retaining unverified communication coverage', async () => {
     const fixture = sourceFixture();
     addMessageSource(fixture);
@@ -423,7 +524,7 @@ describe('CRM control direct source reads', () => {
     const collect = jest.spyOn(CrmControlProposalSourceCollector.prototype, 'collect').mockImplementation(async () => {
       events.push('collect'); return archive;
     });
-    fixture.persist.mockImplementation(async () => { events.push('persist'); return {}; });
+    fixture.persist.mockImplementation(async (...args: any[]) => { events.push('persist'); return { counts: observationCounts(args[2]) }; });
     await (fixture.service as any).executeRun(fixture.run);
     expect(events).toEqual(['initial', 'collect', 'final', 'persist']);
     expect(collect).toHaveBeenCalledWith([], '900', [expect.objectContaining({ message: expect.objectContaining({ messageId: 'message-1' }) })]);
@@ -549,7 +650,7 @@ describe('CRM control direct source reads', () => {
     fixture.persist.mockImplementation(async (...args: any[]) => {
       if (args[1].deal.externalId === '1') throw new Error('temporary database failure');
       await blocked;
-      return {};
+      return { counts: observationCounts(args[2]) };
     });
     let settled = false;
     const running = (fixture.service as any).executeRun(fixture.run).catch((error: Error) => { settled = true; return error; });

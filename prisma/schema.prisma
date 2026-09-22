@@ -1381,9 +1381,34 @@ model CrmControlRun {
   createdAt    DateTime @default(now())
 
   observations CrmControlObservation[]
+  analysisBatches CrmControlAnalysisBatch[]
 
   @@index([status, createdAt])
   @@index([scheduledFor])
+}
+
+model CrmControlAnalysisBatch {
+  id String @id @default(uuid())
+  runId String
+  requestKey String @unique
+  scopeRole String
+  managerId String?
+  groupId String?
+  status String @default("QUEUED")
+  activeKey String? @unique
+  leaseToken String?
+  leaseUntil DateTime?
+  cursor String?
+  processed Int @default(0)
+  queued Int @default(0)
+  deferred Int @default(0)
+  retryCount Int @default(0)
+  nextAttemptAt DateTime?
+  errorCode String?
+  createdAt DateTime @default(now())
+  finishedAt DateTime?
+  run CrmControlRun @relation(fields: [runId], references: [id], onDelete: Restrict)
+  @@index([status, createdAt])
 }
 
 model CrmControlObservation {
@@ -1431,6 +1456,7 @@ model CrmControlResult {
 
   observation CrmControlObservation @relation(fields: [observationId], references: [id], onDelete: Restrict)
   case        CrmControlCase? @relation(fields: [caseId], references: [id], onDelete: Restrict)
+  analyses    CrmControlAnalysisJob[]
 
   @@unique([observationId, ruleCode, subjectId])
   @@index([caseId])
@@ -1497,4 +1523,70 @@ model CrmControlEvidence {
 
   @@index([status, createdAt])
   @@index([status, nextAttemptAt, createdAt])
+}
+
+model CrmControlAnalysisJob {
+  id              String   @id @default(uuid())
+  resultId        String
+  snapshotHash    String
+  inputHash       String
+  analyzerVersion String
+  promptVersion   String
+  model           String
+  modelSha256     String
+  request         Json
+  status          String   @default("QUEUED")
+  activeKey       String?  @unique
+  leaseToken      String?
+  leaseUntil      DateTime?
+  startedAt       DateTime?
+  finishedAt      DateTime?
+  nextAttemptAt   DateTime?
+  attemptCount    Int      @default(0)
+  attemptLimit    Int      @default(3)
+  errorCode       String?
+  assessmentStatus  String?
+  assessmentMessage String?
+  policyVersion     String?
+  createdAt       DateTime @default(now())
+
+  result   CrmControlResult @relation(fields: [resultId], references: [id], onDelete: Restrict)
+  attempts CrmControlAnalysisAttempt[]
+  retryGrants CrmControlAnalysisRetryGrant[]
+
+  @@unique([resultId, inputHash, analyzerVersion])
+  @@index([status, nextAttemptAt, createdAt])
+  @@index([status, leaseUntil])
+}
+
+model CrmControlAnalysisAttempt {
+  id          String   @id @default(uuid())
+  jobId       String
+  attemptNo   Int
+  leaseToken  String
+  status      String
+  errorCode   String?
+  retryable   Boolean  @default(false)
+  rawResponse Json?
+  validation  Json?
+  startedAt   DateTime
+  finishedAt  DateTime
+
+  job CrmControlAnalysisJob @relation(fields: [jobId], references: [id], onDelete: Restrict)
+
+  @@unique([jobId, attemptNo])
+  @@index([jobId, finishedAt])
+}
+
+model CrmControlAnalysisRetryGrant {
+  id           String   @id @default(uuid())
+  jobId        String
+  requestKey   String
+  attemptLimit Int
+  grantedAt    DateTime @default(now())
+
+  job CrmControlAnalysisJob @relation(fields: [jobId], references: [id], onDelete: Restrict)
+
+  @@unique([jobId, requestKey])
+  @@index([jobId, grantedAt])
 }

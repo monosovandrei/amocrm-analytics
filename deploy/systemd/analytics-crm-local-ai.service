@@ -1,0 +1,32 @@
+[Unit]
+Description=Private local CRM text analysis
+After=network.target
+
+[Service]
+Type=simple
+User=ameri
+Group=ameri
+WorkingDirectory=/opt/analytics-local-ai
+ExecStart=/opt/analytics-local-ai/llama-b10964/llama-b10964/llama-server --model /opt/analytics-local-ai/models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf --alias crm-qwen3-4b-instruct --host 127.0.0.1 --port 18080 --ctx-size 4096 --parallel 1 --threads 2 --threads-batch 2 --batch-size 256 --ubatch-size 128 --n-gpu-layers 0 --no-repack --reasoning off --offline --no-webui --log-disable
+Restart=on-failure
+RestartSec=10
+Nice=10
+CPUQuota=200%
+MemoryHigh=2800M
+MemoryMax=3100M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

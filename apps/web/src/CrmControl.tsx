@@ -4,8 +4,8 @@ import type { FormEvent } from 'react';
 import { AlertCircle, CheckCircle2, ChevronDown, ChevronRight, ExternalLink, Play, RefreshCw, Settings, X } from 'lucide-react';
 import { api, apiUrl, getToken } from '@/lib/api';
 import type {
-  ControlConfig, ControlDeadlineMode, ControlDecision, ControlDepartment, ControlEvidence, ControlManager,
-  ControlObservation, ControlObservationDetail, ControlPage, ControlResult, ControlRun,
+  ControlConfig, ControlDeadlineMode, ControlDecision, ControlDepartment, ControlEvidence, ControlEvidenceManifest, ControlManager,
+  ControlObservation, ControlObservationDetail, ControlOfferAnalysis, ControlOfferCitation, ControlPage, ControlResult, ControlRun,
   ControlRunDetail, ControlScope, ControlSettings, ControlStageRule, ControlRuleBreakdown,
 } from './crm-control-types';
 import './crm-control.css';
@@ -115,6 +115,7 @@ export default function CrmControl() {
   const requestRef = useRef(0);
   const finishedRunRef = useRef('');
   const timeZone = settings?.config.timeZone || 'Europe/Moscow';
+  const analysisActive = Boolean(detail?.analysis && (detail.analysis.preparing || detail.analysis.queued || detail.analysis.running));
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -154,10 +155,10 @@ export default function CrmControl() {
   }, [runId, loadRun]);
 
   useEffect(() => {
-    if (!detail || !activeRun(detail.run)) return;
+    if (!detail || (!activeRun(detail.run) && !analysisActive)) return;
     const timer = window.setInterval(() => void loadRun(runId, true), 5000);
     return () => window.clearInterval(timer);
-  }, [detail?.run.status, runId, loadRun]);
+  }, [detail?.run.status, analysisActive, runId, loadRun]);
 
   const loadDeals = useCallback(async (selectedManager: ControlManager, cursor?: string | null) => {
     const request = ++requestRef.current;
@@ -211,6 +212,17 @@ export default function CrmControl() {
     finally { setBusy(false); }
   }
 
+  async function continueAnalysis() {
+    if (!runId) return;
+    setBusy(true); setError(''); setNotice('');
+    try {
+      await api(`${base}/runs/${encodeURIComponent(runId)}/recheck-remaining`, { method: 'POST', body: JSON.stringify({ requestKey: crypto.randomUUID() }) });
+      setNotice('Допроверка сохранённых данных поставлена в очередь. Результаты обновляются автоматически.');
+      await loadRun(runId, true);
+    } catch (err) { setError(errorText(err, 'Не удалось продолжить проверку')); }
+    finally { setBusy(false); }
+  }
+
   return <section className="crm-control" aria-label="Контроль ведения CRM">
     <div className="page-head">
       <h1 className="page-title">Контроль CRM</h1>
@@ -245,9 +257,13 @@ export default function CrmControl() {
           {detail.run.completion?.status === 'CHECKED' ? <p className="crm-note">Все применимые правила получили определённый результат. Найденные нарушения показаны в таблице.</p> : <>
             {detail.run.completion?.reasons.length ? <ul className="crm-error-list">{detail.run.completion.reasons.map((reason, index) => <li key={`${reason.code}:${index}`}>{reason.message}</li>)}</ul> : <p className="crm-note">{detail.run.error || (activeRun(detail.run) ? 'Обработка ещё не завершена.' : 'Итог полной проверки недоступен. Обновите результаты; отсутствие итога не считается успешной проверкой.')}</p>}
             <div className="crm-actions">
-              {(detail.counts.unknown > 0 || detail.counts.review > 0) && <button className="crm-link" type="button" onClick={() => { setView('rules'); setRuleStatus(detail.counts.unknown > 0 ? 'UNKNOWN' : 'REVIEW'); setManager(null); }}>Допроверить оставшиеся</button>}
+              {(detail.counts.unknown > 0 || detail.counts.review > 0) && <>
+                {settings.canReview && settings.capabilities.localAnalysis && <button className="btn" type="button" disabled={busy || analysisActive} onClick={() => void continueAnalysis()}>Допроверить оставшиеся</button>}
+                <button className="crm-link" type="button" onClick={() => { setView('rules'); setRuleStatus(detail.counts.unknown > 0 ? 'UNKNOWN' : 'REVIEW'); setManager(null); }}>Показать непроверенное</button>
+              </>}
               {settings.canReview && detail.run.completion?.canRecheck && <><button className="btn" type="button" disabled={busy || Boolean(runs.some(activeRun))} onClick={() => void startRun(detail.run.id)}><RefreshCw size={14} aria-hidden="true" />Проверить заново</button><span className="crm-note">Новый полный обход CRM. Не заменяет разбор недоступных источников.</span></>}
             </div>
+            {analysisActive && <p className="crm-note" role="status">Локальная допроверка: {detail.analysis?.preparing ? 'подготовка источников; ' : ''}в очереди {detail.analysis?.queued ?? 0}, выполняется {detail.analysis?.running ?? 0}. Проверено пунктов: {detail.analysis?.completed ?? 0}.</p>}
           </>}
         </section>
         {!!detail.configurationIssues.length && <details className="crm-disclosure"><summary>Настройки, влияющие на эту проверку</summary><ul className="crm-error-list">{detail.configurationIssues.map(issue => <li key={issue}>{issue}</li>)}</ul></details>}
@@ -353,11 +369,15 @@ function RuleCatalog({ settings }: { settings: ControlSettings }) {
   </section>;
 }
 
-function EvidenceImage({ evidence, timeZone, canCapture, onRetried }: { evidence: ControlEvidence; timeZone: string; canCapture: boolean; onRetried: () => Promise<void> }) {
+function EvidenceImage({ evidence, resultId, timeZone, canCapture, onRetried }: { evidence: ControlEvidence; resultId: string; timeZone: string; canCapture: boolean; onRetried: () => Promise<void> }) {
   const [url, setUrl] = useState('');
+  const [manifest, setManifest] = useState<ControlEvidenceManifest | null>(null);
+  const [selectedFrame, setSelectedFrame] = useState('');
   const [error, setError] = useState('');
   const [attempt, setAttempt] = useState(0);
   const [retrying, setRetrying] = useState(false);
+  const frame = manifest?.frames.find(item => item.id === selectedFrame) ?? manifest?.frames[0];
+  const coverage = manifest?.coverage.find(item => item.resultId === resultId);
   async function retryCapture() {
     setRetrying(true); setError('');
     try {
@@ -369,12 +389,32 @@ function EvidenceImage({ evidence, timeZone, canCapture, onRetried }: { evidence
   useEffect(() => {
     if (evidence.status !== 'READY') return;
     const controller = new AbortController();
+    setManifest(null); setUrl(''); setError('');
+    void api<ControlEvidenceManifest>(`${base}/evidence/${encodeURIComponent(evidence.id)}/manifest`, { signal: controller.signal })
+      .then(value => { if (!controller.signal.aborted) { if (!value.frames.length) throw new Error('В архиве нет доступных кадров.'); setManifest(value); } })
+      .catch(err => { if (!controller.signal.aborted) setError(errorText(err, 'Не удалось загрузить список кадров')); });
+    return () => controller.abort();
+  }, [evidence.id, evidence.status, attempt]);
+  useEffect(() => {
+    if (!manifest) return;
+    const related = manifest.coverage.find(item => item.resultId === resultId)?.frameIds[0];
+    setSelectedFrame(related && manifest.frames.some(item => item.id === related) ? related : manifest.frames[0]?.id ?? '');
+  }, [manifest, resultId]);
+  useEffect(() => {
+    if (evidence.status !== 'READY' || !manifest || !frame) return;
+    const controller = new AbortController();
     let objectUrl = '';
     setError(''); setUrl('');
     void (async () => {
       try {
-        const response = await fetch(apiUrl(`${base}/evidence/${encodeURIComponent(evidence.id)}/file`), { signal: controller.signal, headers: { Authorization: `Bearer ${getToken()}` } });
-        if (!response.ok) throw new Error(await response.text());
+        const filePath = manifest.version === 0 ? `${base}/evidence/${encodeURIComponent(evidence.id)}/file`
+          : `${base}/evidence/${encodeURIComponent(evidence.id)}/frames/${encodeURIComponent(frame.id)}/file`;
+        const response = await fetch(apiUrl(filePath), { signal: controller.signal, headers: { Authorization: `Bearer ${getToken()}` } });
+        if (!response.ok) {
+          let message = 'Сохранённый кадр недоступен. Повторите загрузку.';
+          try { const body = await response.json(); if (typeof body.message === 'string') message = body.message; } catch { /* Keep the readable failure when the proxy response is not JSON. */ }
+          throw new Error(message);
+        }
         const imageData = await response.blob(); // slop-check: allow ai-decor — бинарное тело ответа со скриншотом, не декоративный элемент.
         if (!imageData.type.startsWith('image/')) throw new Error('Сервер вернул файл, который не является изображением.');
         if (controller.signal.aborted) return;
@@ -382,10 +422,15 @@ function EvidenceImage({ evidence, timeZone, canCapture, onRetried }: { evidence
       } catch (err) { if (!controller.signal.aborted) setError(errorText(err, 'Не удалось открыть скриншот')); }
     })();
     return () => { controller.abort(); if (objectUrl) URL.revokeObjectURL(objectUrl); };
-  }, [evidence.id, evidence.status, attempt]);
+  }, [evidence.id, evidence.status, manifest, frame?.id, attempt]);
   if (evidence.status === 'DISABLED' || evidence.status === 'ERROR') return <div className="grid gap-2"><p className={`crm-status ${evidence.status === 'ERROR' ? 'crm-status-error' : 'crm-status-warning'}`}>{evidence.status === 'DISABLED' ? 'Скриншот не сохранён: сервис захвата был недоступен.' : `Скриншот не получен. ${evidence.error || 'Причина недоступна.'}`}</p>{canCapture && <><button type="button" className="btn justify-self-start" disabled={retrying} onClick={() => void retryCapture()}>{retrying ? 'Постановка в очередь…' : 'Получить снимок сейчас'}</button><p className="crm-note">Снимок покажет текущее состояние карточки. Сохранённые факты прошлой проверки не изменятся.</p></>}{error && <p role="alert" className="crm-danger">{error}</p>}</div>;
   if (evidence.status === 'PENDING' || evidence.status === 'RUNNING') return <p role="status" className="crm-note">Скриншот {evidence.status === 'PENDING' ? 'ожидает сохранения' : 'сохраняется'}…</p>;
-  return <figure>{error ? <div role="alert" className="crm-status crm-status-error">{error}<button type="button" className="crm-link" onClick={() => setAttempt(current => current + 1)}>Повторить</button></div> : url ? <a href={url} target="_blank" rel="noreferrer" aria-label="Открыть сохранённый скриншот целиком"><img src={url} alt="Сохранённая карточка сделки amoCRM в момент захвата" /></a> : <p role="status" className="crm-note">Загрузка скриншота…</p>}<figcaption className="crm-note">Скриншот: {dateTime(evidence.capturedAt, timeZone)}. Его время может отличаться от времени проверки.{evidence.coverage ? ` ${evidence.coverage}` : ''}</figcaption></figure>;
+  const coverageNames = { CONTEXT_ONLY: 'Контекст карточки', VISIBLE_MATCH: 'Источник совпал с сохранёнными данными',
+    NOT_VISIBLE: 'Источник не попал в кадры', SOURCE_CHANGED: 'Источник изменился после проверки' };
+  return <figure>{manifest && manifest.frames.length > 1 && <label><span className="label">Сохранённый кадр</span><select className="select" value={frame?.id || ''} onChange={event => setSelectedFrame(event.target.value)}>{manifest.frames.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>}
+    {coverage && <div className="grid gap-1" aria-live="polite"><p>{coverageNames[coverage.status]}</p><p className="crm-note">{coverage.reason}</p>{frame && coverage.frameIds.length > 0 && !coverage.frameIds.includes(frame.id) && <p className="crm-note">Выбран общий кадр. Источник этого пункта находится в других сохранённых кадрах.</p>}</div>}
+    {error ? <div role="alert" className="crm-status crm-status-error">{error}<button type="button" className="crm-link" onClick={() => setAttempt(current => current + 1)}>Повторить</button></div> : url ? <a className="grid gap-2" href={url} target="_blank" rel="noreferrer" aria-label="Открыть сохранённый кадр целиком"><img src={url} alt={frame?.label || 'Сохранённая карточка сделки amoCRM в момент захвата'} /><span className="crm-link">Открыть кадр в полном размере<ExternalLink size={13} aria-hidden="true" /></span></a> : <p role="status" className="crm-note">{manifest ? 'Загрузка кадра…' : 'Загрузка списка кадров…'}</p>}
+    <figcaption className="crm-note">Кадр снят: {dateTime(frame?.capturedAt || evidence.capturedAt, timeZone)}. Состояние на момент прошлой проверки может отличаться.{manifest?.limitation ? ` ${manifest.limitation}` : evidence.coverage ? ` ${evidence.coverage}` : ''}{manifest?.truncated ? ' Достигнут предел съёмки; часть ленты осталась за кадром.' : ''}</figcaption></figure>;
 }
 
 function ObservationDetail({ observationId, resultId, settings, onClose, onDecision }: {
@@ -410,10 +455,11 @@ function ObservationDetail({ observationId, resultId, settings, onClose, onDecis
   useEffect(() => { sectionRef.current?.focus({ preventScroll: true }); sectionRef.current?.scrollIntoView({ block: 'start' }); }, [observationId, resultId]);
   useEffect(() => { setReason(''); setSaved(''); setReviewSaved(''); setUntil(''); }, [resultId]);
   useEffect(() => {
-    if (!data?.evidence.some(item => item.status === 'PENDING' || item.status === 'RUNNING')) return;
+    if (!data?.evidence.some(item => item.status === 'PENDING' || item.status === 'RUNNING')
+      && !data?.results.some(item => ['QUEUED','RUNNING'].includes(item.analysis?.status || ''))) return;
     const timer = window.setInterval(() => void load(), 7000);
     return () => window.clearInterval(timer);
-  }, [data?.evidence, load]);
+  }, [data?.evidence, data?.results, load]);
   const result = data?.results.find(item => item.id === resultId);
   const linkedCase = data?.cases.find(item => item.id === result?.caseId);
   const currentCase = !result || result.status === 'UNKNOWN' || ['PASS', 'NA'].includes(effectiveStatus(result)) ? undefined : linkedCase;
@@ -437,13 +483,19 @@ function ObservationDetail({ observationId, resultId, settings, onClose, onDecis
     {!data && !error && <p role="status" className="crm-note">Загрузка сохранённых фактов…</p>}
     {data && !result && <p className="crm-note">Этот результат проверки недоступен. Выберите другой пункт сделки.</p>}
     {data && result && <>
-      <p>{result.message}</p>
+      <p>{result.review?.current?.reason || result.analysis?.message || result.message}</p>
       <div className="crm-proof-grid"><div className="grid gap-4"><h3>На момент проверки</h3><dl className="crm-facts">
-        <dt>Результат</dt><dd>{resultNames[result.status]}</dd><dt>Сделка</dt><dd>{data.dealTitle} · № {data.dealExternalId}</dd><dt>Ответственный</dt><dd>{data.managerName}</dd><dt>Этап</dt><dd>{data.pipelineName} · {data.stageName}</dd><dt>Зафиксировано</dt><dd>{dateTime(data.observedAt, tz)}</dd><dt>Пункты письма</dt><dd>{result.clauses.join(', ')}</dd>
+        <dt>Результат</dt><dd>{resultNames[effectiveStatus(result)]}</dd><dt>Сделка</dt><dd>{data.dealTitle} · № {data.dealExternalId}</dd><dt>Ответственный</dt><dd>{data.managerName}</dd><dt>Этап</dt><dd>{data.pipelineName} · {data.stageName}</dd><dt>Зафиксировано</dt><dd>{dateTime(data.observedAt, tz)}</dd><dt>Пункты письма</dt><dd>{result.clauses.join(', ')}</dd>
         {result.details && Object.entries(result.details).map(([key, value]) => <FactValue key={key} name={key} value={value} timeZone={tz} />)}
-      </dl></div><div className="crm-evidence"><h3>Сохранённые подтверждения</h3>{data.evidence.length ? data.evidence.map(item => <EvidenceImage key={item.id} evidence={item} timeZone={tz} canCapture={settings.capabilities.screenshots} onRetried={load} />) : <p className="crm-note">Для этого результата скриншот не сохранён.</p>}</div></div>
+      </dl></div><div className="crm-evidence"><h3>Сохранённые подтверждения</h3>{data.evidence.length ? data.evidence.map(item => <EvidenceImage key={item.id} evidence={item} resultId={result.id} timeZone={tz} canCapture={settings.capabilities.screenshots} onRetried={load} />) : <p className="crm-note">Для этого результата скриншот не сохранён.</p>}</div></div>
       {currentCase && <div className="grid gap-2"><h3>Текущее состояние случая</h3><p>{caseNames[currentCase.status]}{currentCase.resolvedAt ? ` · ${dateTime(currentCase.resolvedAt, tz)}` : ''}</p>{currentCase.resolutionReason && <p className="crm-note">{currentCase.resolutionReason}</p>}<p className="crm-note">Первое обнаружение: {dateTime(currentCase.firstDetectedAt, tz)}. Последнее: {dateTime(currentCase.lastDetectedAt, tz)}. Это состояние может меняться; результат проверки выше остаётся в истории.</p></div>}
       <details className="crm-disclosure"><summary>Сохранённые задачи и примечания</summary><SnapshotData snapshot={data.snapshot} timeZone={tz} /></details>
+      {['offer_budget', 'proposal_file'].includes(result.ruleCode) && <OfferProof value={result.details?.offerAnalysis} timeZone={tz} />}
+      {!!data.documents?.length && <section className="grid gap-2" aria-label="Архив документов"><h3>Документы на момент проверки</h3>
+        {data.documents.map(document => <DocumentEvidence key={`${document.sha256}:${document.source}`} document={document} timeZone={tz} />)}
+        <p className="crm-note">Файл из поля «КП» сам по себе не подтверждает отправку клиенту. Для сверки используется подтверждённая отправка из этой сделки.</p>
+      </section>}
+      {result.analysis?.outcome && <AnalysisProof key={`${result.id}:${result.analysis.id}`} observationId={observationId} resultId={result.id} timeZone={tz} />}
       {result.review?.current && <div className="grid gap-2"><h3>Результат допроверки</h3><p>{resultNames[result.review.current.outcome]} · {result.review.current.reviewedBy} · {dateTime(result.review.current.reviewedAt, tz)}</p><p className="crm-review-reason">{result.review.current.reason}</p><p className="crm-note">Решение относится к этому сохранённому результату. Исходные данные и будущие проверки не меняются.</p></div>}
       {reviewSaved && <p role="status" className="crm-success">{reviewSaved}</p>}
       {result.review && <ManualReview key={`${result.id}:${result.review.expectedDecisionId || 'initial'}`} observationId={observationId} observedAt={data.observedAt} timeZone={tz} result={result} canReview={settings.canReview} onReload={load} onSaved={async () => { await load(); setReviewSaved('Допроверка сохранена. Сводка обновляется.'); onDecision(); }} />}
@@ -451,6 +503,89 @@ function ObservationDetail({ observationId, resultId, settings, onClose, onDecis
       {!!linkedCase?.decisions.length && <details className="crm-disclosure"><summary>История решений</summary><div className="grid gap-3">{linkedCase.decisions.map(decision => <div key={decision.id}><p>{decisionNames[decision.action]} · {decision.actorName || 'Пользователь платформы'}</p><p>{decision.reason}</p><p className="crm-note">{dateTime(decision.createdAt, tz)}{decision.validUntil ? ` · Действует до ${dateTime(decision.validUntil, tz)}` : ''}</p></div>)}</div></details>}
     </>}
   </section>;
+}
+
+function OfferProof({ value, timeZone }: { value: unknown; timeZone: string }) {
+  if (!value || typeof value !== 'object') return null;
+  const analysis = value as ControlOfferAnalysis;
+  if (analysis.version !== 1 || !Array.isArray(analysis.reasons) || !Array.isArray(analysis.candidates)) return null;
+  const citations = (items: ControlOfferCitation[]) => items.filter((item, index) =>
+    items.findIndex(other => other.quote === item.quote && JSON.stringify(other.locator) === JSON.stringify(item.locator)) === index);
+  const location = (locator: ControlOfferCitation['locator']) => locator.kind === 'pdf' ? `Страница ${locator.page}`
+    : locator.kind === 'xlsx' ? `Лист «${locator.sheet}», ячейка ${locator.cell}`
+      : locator.kind === 'docx' ? 'Текст документа Word' : 'Текст сообщения';
+  const quotes = (items: ControlOfferCitation[]) => citations(items).map((item, index) => <div key={index}>
+    <p className="crm-note">{location(item.locator)}</p><blockquote className="whitespace-pre-wrap break-words">{item.quote}</blockquote>
+  </div>);
+  return <details className="crm-disclosure crm-analysis-proof">
+    <summary>Разбор КП</summary>
+    {!!analysis.reasons.length && <ul className="list-disc pl-5">{analysis.reasons.map(reason => <li key={reason}>{reason}</li>)}</ul>}
+    {!!analysis.evidence?.length && <div className="grid gap-2"><h3>Подтверждения сравнения</h3>{quotes(analysis.evidence)}</div>}
+    {!!analysis.candidates.length && <>
+      <p className="crm-note">Ниже — найденные фрагменты документов. Они сами по себе не подтверждают, какое КП было отправлено последним.</p>
+      {analysis.candidates.map((candidate, index) => <details key={`${candidate.source}:${candidate.sourceId}:${index}`}>
+        <summary>Документ {index + 1} · {candidate.source === 'field' ? 'из поля «КП»' : 'отправленное вложение'}</summary>
+        <div className="grid gap-2">
+          {candidate.sentAt && <p className="crm-note">Отправлено: {dateTime(candidate.sentAt, timeZone)}</p>}
+          <p>{candidate.amount ? `Сумма, найденная в файле: ${candidate.amount.decimal} ${candidate.amount.currency}` : 'Однозначный итог в этом файле не подтверждён.'}</p>
+          {quotes([...candidate.headingEvidence, ...(candidate.amount?.evidence || [])])}
+        </div>
+      </details>)}
+    </>}
+    {!analysis.candidates.length && <p className="crm-note">Нет архивных документов, по которым можно показать разбор.</p>}
+  </details>;
+}
+
+function DocumentEvidence({ document: source, timeZone }: { document: NonNullable<ControlObservationDetail['documents']>[number]; timeZone: string }) {
+  const [busy, setBusy] = useState(false), [error, setError] = useState('');
+  const controller = useRef<AbortController | null>(null);
+  useEffect(() => () => controller.current?.abort(), []);
+  async function download() {
+    controller.current?.abort(); controller.current = new AbortController();
+    const signal = controller.current.signal;
+    setBusy(true); setError('');
+    try {
+      const response = await fetch(apiUrl(source.downloadUrl), { signal, headers: { Authorization: `Bearer ${getToken()}` } });
+      if (!response.ok) throw new Error('Документ недоступен или не прошёл проверку целостности.');
+      const file = await response.blob(); // slop-check: allow ai-decor — бинарный архив документа, не декоративный элемент.
+      if (signal.aborted) return;
+      const url = URL.createObjectURL(file), link = window.document.createElement('a');
+      link.href = url; link.download = `crm-document.${file.type === 'application/pdf' ? 'pdf' : 'bin'}`;
+      window.document.body.appendChild(link); link.click(); link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err) { if (!signal.aborted) setError(errorText(err, 'Не удалось скачать документ')); }
+    finally { if (!signal.aborted) setBusy(false); }
+  }
+  return <div><button className="crm-link break-words" type="button" disabled={busy} onClick={() => void download()}>{busy ? 'Загрузка…' : source.label}</button>
+    <p className="crm-note">{source.source === 'field' ? 'Поле «КП»' : 'Отправленное вложение'} · {Math.ceil(source.size / 1024)} КБ · Сохранён: {dateTime(source.capturedAt, timeZone)}</p>
+    {error && <p role="alert" className="crm-danger">{error}</p>}</div>;
+}
+
+type AnalysisProofData = { findings: Array<{ fact: string; label: string; state: string;
+  evidence: Array<{ sourceId: string; sourceHash: string; label: string; createdAt: string | null; quote: string; text: string }> }> };
+function AnalysisProof({ observationId, resultId, timeZone }: { observationId: string; resultId: string; timeZone: string }) {
+  const [data, setData] = useState<AnalysisProofData | null>(null);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+  const load = async () => {
+    setLoading(true); setError('');
+    try { setData(await api<AnalysisProofData>(`${base}/observations/${encodeURIComponent(observationId)}/results/${encodeURIComponent(resultId)}/analysis`)); }
+    catch (err) { setError(errorText(err, 'Не удалось загрузить подтверждения анализа')); }
+    finally { setLoading(false); }
+  };
+  return <details className="crm-disclosure crm-analysis-proof" onToggle={event => { if (event.currentTarget.open && !data && !loading && !error) void load(); }}>
+    <summary>На чём основан вывод</summary>
+    {loading && <p role="status" className="crm-note">Загрузка сохранённых источников…</p>}
+    {error && <p role="alert">{error} <button type="button" className="crm-link" onClick={() => void load()}>Повторить</button></p>}
+    {data && !data.findings.length && <p className="crm-note">Подтверждения этого анализа сейчас недоступны.</p>}
+    {data?.findings.map(finding => <div key={finding.fact} className="grid gap-2"><h3>{finding.label}: {finding.state === 'present' ? 'подтверждено' : finding.state === 'absent' ? 'не найдено' : 'не определено'}</h3>
+      {finding.evidence.map((source, index) => <div key={`${source.sourceId}:${index}`}><p className="crm-note">{source.label} · {dateTime(source.createdAt, timeZone)}</p>
+        <blockquote className="whitespace-pre-wrap break-words">{source.quote}</blockquote>
+        <details><summary>Исходный текст</summary><p className="whitespace-pre-wrap break-words">{source.text}</p></details>
+      </div>)}
+      {!finding.evidence.length && <p className="crm-note">Признак не найден в проверенном наборе сохранённых источников.</p>}
+    </div>)}
+  </details>;
 }
 
 function ManualReview({ observationId, observedAt, timeZone, result, canReview, onReload, onSaved }: { observationId: string; observedAt: string; timeZone: string; result: ControlResult; canReview: boolean; onReload: () => Promise<void>; onSaved: () => Promise<void> }) {

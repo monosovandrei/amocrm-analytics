@@ -241,11 +241,21 @@
   min-width: 0;
   padding: 18px;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 16px;
   background: var(--pb-surface);
   border: 1px solid var(--pb-border);
   border-left: 3px solid var(--pb-primary);
   border-radius: 0 7px 7px 0;
+}
+
+.crm-control .crm-detail > * {
+  min-width: 0;
+}
+
+.crm-control .crm-analysis-proof p,
+.crm-control .crm-analysis-proof blockquote {
+  overflow-wrap: anywhere;
 }
 
 .crm-control .crm-proof-grid {

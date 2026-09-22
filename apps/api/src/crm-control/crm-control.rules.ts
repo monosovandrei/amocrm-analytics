@@ -1,7 +1,7 @@
 import { CrmControlRuleInput, CrmControlRuleResult, CrmControlResultStatus } from './crm-control.types';
 import { civilTime, stageDeadline } from './crm-control-deadline';
 
-export const CRM_CONTROL_RULE_VERSION = '3';
+export const CRM_CONTROL_RULE_VERSION = '4';
 
 type RuleCode = keyof typeof RULE_NAMES;
 type ResultExtra = Pick<CrmControlRuleResult, 'subjectId' | 'details'> & { clauses?: string[] };
@@ -298,8 +298,8 @@ export function evaluateCrmControlDeal(input: CrmControlRuleInput): CrmControlRu
       { details: { createdAt: createdAt.toISOString(), agePolicy: config.maxDealAge, timeZone: config.timeZone } });
   }
 
-  add('offer_budget', 'UNKNOWN', 'Не подключён достоверный источник суммы предложения, фактически отправленного клиенту. Нужна ручная сверка.');
-  add('proposal_file', 'UNKNOWN', 'Не подключено сопоставление всех файлов поля «КП» с последней версией, фактически отправленной клиенту. Нужна ручная сверка.');
+  add('offer_budget', 'UNKNOWN', 'Ожидается автоматическое сравнение бюджета с итогом сохранённого отправленного КП.');
+  add('proposal_file', 'UNKNOWN', 'Ожидается автоматическое сравнение файлов поля «КП» с сохранённой отправленной версией.');
 
   if (sales) {
     add('price_requested_duration', 'NA', 'Пункт относится к ОППК.', { details: { resolvesPrior: true } });
