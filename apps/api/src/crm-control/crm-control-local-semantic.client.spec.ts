@@ -1,7 +1,7 @@
 import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { CRM_CONTROL_LOCAL_PROMPT_VERSION, CrmControlLocalSemanticClient, localCrmAnalysisOrigin } from './crm-control-local-semantic.client';
+import { CRM_CONTROL_LOCAL_PROMPT_VERSION, CrmControlLocalSemanticClient, crmControlSemanticExcerpts, localCrmAnalysisOrigin } from './crm-control-local-semantic.client';
 import { crmControlSemanticTextHash, CrmControlSemanticRequest } from './crm-control-semantic.validation';
 import { assessCrmControlSemantic } from './crm-control-semantic.policy';
 
@@ -133,11 +133,11 @@ describe('local CRM semantic boundary', () => {
     if (mode === 'wrong-owner') source.ownerId = 'another-manager';
     if (mode === 'future') source.createdAt = '2026-09-23T10:00:00Z';
     if (mode === 'wrong-hash') source.sourceHash = '0'.repeat(64);
-    const send = jest.fn().mockResolvedValue(new Response(JSON.stringify({ model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ findings: [
-      { fact: 'manager_note', state: 'absent', evidence: [] },
-      { fact: 'customer_agreement', state: 'uncertain', evidence: [] },
-      { fact: 'agreed_deadline', state: 'uncertain', evidence: [] },
-    ] }) } }] })));
+    const send = jest.fn().mockResolvedValue(new Response(JSON.stringify({ model, choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({
+      manager_note: { state: 'absent', evidence: [] },
+      customer_agreement: { state: 'uncertain', evidence: [] },
+      agreed_deadline: { state: 'uncertain', evidence: [] },
+    }) } }] })));
     const result = await new CrmControlLocalSemanticClient(options(), send).analyze(request);
     expect(send).toHaveBeenCalledTimes(1);
     if (result.status === 'READY') expect(assessCrmControlSemantic(request, result.validation, 'stage_duration').status).toBe('UNKNOWN');
@@ -237,7 +237,7 @@ describe('local CRM semantic boundary', () => {
     expect(JSON.parse(neutral).findings[0].evidence).toEqual([{ source: 'S0', quote: text }]);
     const prompt = JSON.parse(JSON.parse(send.mock.calls[0][1].body).messages[1].content);
     expect(prompt).toEqual({ check: 'task_action', stage: 'КП презентовано', sources: [{ id: 'S0', text }] });
-    expect(CRM_CONTROL_LOCAL_PROMPT_VERSION).toBe('4');
+    expect(CRM_CONTROL_LOCAL_PROMPT_VERSION).toBe('5');
   });
 
   it.each(['stage', 'text', 'modelSha256', 'model'])('does not reuse task semantics after changing %s', async field => {
@@ -296,8 +296,8 @@ describe('local CRM semantic boundary', () => {
     request.sources[0] = { ...request.sources[0], kind: 'manager_note', subjectId: null, actor: 'manager', actorId: request.ownerId,
       text: 'Клиент был занят. Презентация завтра.', sourceHash: crmControlSemanticTextHash('Клиент был занят. Презентация завтра.') };
     const send = jest.fn().mockImplementation(async () => new Response(JSON.stringify({ model, choices: [{ finish_reason: 'stop', message: {
-      content: JSON.stringify({ findings: ['transfer_reason','presentation_date'].map(fact => ({ fact, state: 'present',
-        evidence: [{ source: 'S0', quote: request.sources[0].text }] })) }) } }] })));
+      content: JSON.stringify(Object.fromEntries(['transfer_reason','presentation_date'].map(fact => [fact,
+        { state: 'present', evidence: [fact === 'presentation_date' ? 'S0Q1' : 'S0Q0'] }]))) } }] })));
     const client = new CrmControlLocalSemanticClient(options(), send);
     expect(await client.analyze(request)).toMatchObject({ status: 'READY', cacheHit: false, validation: { status: 'VALIDATED' } });
     expect(await client.analyze(request)).toMatchObject({ status: 'READY', cacheHit: true });
@@ -308,4 +308,59 @@ describe('local CRM semantic boundary', () => {
     const prompt = JSON.parse(JSON.parse(send.mock.calls[0][1].body).messages[1].content);
     expect(prompt).toMatchObject({ observedAt: request.observedAt, coverage: request.coverage, timeZone: request.timeZone });
   });
+
+  it('binds selected evidence to the exact saved text, preserving spaces and line breaks', async () => {
+    const request = input(); request.check = 'deadline_agreement'; request.subjectId = null;
+    const note = 'Клиент  попросил перенос\nдо завтра.';
+    Object.assign(request.sources[0], { kind: 'manager_note', subjectId: null, actor: 'manager', actorId: 'manager1',
+      text: note, sourceHash: crmControlSemanticTextHash(note) });
+    const content = { manager_note: { state: 'present', evidence: ['S0Q0'] },
+      customer_agreement: { state: 'absent', evidence: [] }, agreed_deadline: { state: 'absent', evidence: [] } };
+    const send = jest.fn().mockResolvedValue(new Response(JSON.stringify({ model, choices: [{ finish_reason: 'stop',
+      message: { content: JSON.stringify(content) } }] })));
+    const result = await new CrmControlLocalSemanticClient(options(), send).analyze(request);
+    expect(result.status).toBe('READY');
+    if (result.status !== 'READY') throw Error('fixture');
+    expect(result.response.findings[0].evidence).toEqual([{ sourceId: 'task1', sourceHash: crmControlSemanticTextHash(note), quote: 'Клиент  попросил перенос\n' }]);
+    expect(result.validation.issues.some(issue => issue.code === 'UNGROUNDED_CITATION')).toBe(false);
+    expect(JSON.parse(send.mock.calls[0][1].body).max_tokens).toBeLessThan(900);
+  });
+
+  it.each(['missing-fact','extra-fact','unknown-excerpt','fabricated-quote','duplicate-excerpt','absent-with-evidence','present-without-evidence'])(
+    'rejects %s instead of repairing a model answer', async mode => {
+      const request = input(); request.check = 'proposal_note'; request.subjectId = null;
+      Object.assign(request.sources[0], { kind: 'manager_note', subjectId: null, actor: 'manager', actorId: 'manager1' });
+      const content: any = { transfer_reason: { state: 'present', evidence: ['S0Q0'] }, presentation_date: { state: 'absent', evidence: [] } };
+      if (mode === 'missing-fact') delete content.presentation_date;
+      if (mode === 'extra-fact') content.extra = content.transfer_reason;
+      if (mode === 'unknown-excerpt') content.transfer_reason.evidence = ['S1Q0'];
+      if (mode === 'fabricated-quote') content.transfer_reason.quote = 'fabricated';
+      if (mode === 'duplicate-excerpt') content.transfer_reason.evidence.push('S0Q0');
+      if (mode === 'absent-with-evidence') content.transfer_reason.state = 'absent';
+      if (mode === 'present-without-evidence') content.transfer_reason.evidence = [];
+      const send = jest.fn().mockResolvedValue(new Response(JSON.stringify({ model, choices: [{ finish_reason: 'stop',
+        message: { content: JSON.stringify(content) } }] })));
+      expect(await new CrmControlLocalSemanticClient(options(), send).analyze(request)).toMatchObject({ status: 'ERROR', code: 'LOCAL_AI_INVALID_RESPONSE' });
+    });
+
+  it('separates the presentation date from an unrelated date without changing source text', () => {
+    const text = 'Сегодня клиент занят. Презентация КП 23.09.2026 в 15:00.';
+    expect(crmControlSemanticExcerpts(text)).toEqual(['Сегодня клиент занят. ', 'Презентация КП 23.09.2026 в 15:00.']);
+  });
+
+  it.each(['А'.repeat(6000), 'слово без точки '.repeat(300), '🧑'.repeat(2000)])(
+    'retains every character in bounded immutable excerpts', text => {
+      const excerpts = crmControlSemanticExcerpts(text);
+      const covered = new Set<number>(); let previous = 0;
+      for (const excerpt of excerpts) {
+        expect(excerpt.length).toBeLessThanOrEqual(2000);
+        expect(excerpt).not.toMatch(/^[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/u);
+        const at = text.indexOf(excerpt, previous);
+        expect(at).toBeGreaterThanOrEqual(0);
+        for (let i = at; i < at + excerpt.length; i++) covered.add(i);
+        previous = at + Math.max(1, excerpt.length - 200);
+        if (/[\uDC00-\uDFFF]/u.test(text[previous])) previous--;
+      }
+      expect(covered.size).toBe(text.length);
+    });
 });
