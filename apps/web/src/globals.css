@@ -2878,7 +2878,7 @@ button:disabled {
   bottom: auto;
   left: 0;
   z-index: 20;
-  display: grid;
+  display: none;
   width: min(380px, calc(100vw - 56px));
   max-height: 300px;
   gap: 8px;
@@ -2902,6 +2902,7 @@ button:disabled {
 .deal-cycle-segment:hover .deal-cycle-tooltip,
 .deal-cycle-segment:focus .deal-cycle-tooltip,
 .deal-cycle-segment:focus-within .deal-cycle-tooltip {
+  display: grid;
   opacity: 1;
   pointer-events: auto;
   transform: translateY(0);
@@ -3374,6 +3375,18 @@ button:disabled {
 
   .report-matrix thead th {
     word-break: normal;
+  }
+
+  .deal-cycle-track {
+    position: relative;
+  }
+
+  .deal-cycle-segment {
+    position: static;
+  }
+
+  .deal-cycle-tooltip {
+    width: min(380px, 100%);
   }
 
   .plan-fact-report-group > .dashboard-section-header {
