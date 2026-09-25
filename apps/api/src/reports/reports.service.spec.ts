@@ -1698,7 +1698,7 @@ function createPrismaMock() {
       findFirst: jest.fn(() => Promise.resolve(null)),
     },
     crmGroup: {
-      findMany: jest.fn(() => Promise.resolve([{ id: 'group-sales', name: 'Sales' }])),
+      findMany: jest.fn(() => Promise.resolve([{ id: 'group-sales', name: 'Sales' }, { id: 'group-csm', name: 'CSM' }])),
     },
     customFieldDefinition: {
       findMany: jest.fn(() => Promise.resolve([{ externalId: '809047', name: 'Маркетинг' }])),

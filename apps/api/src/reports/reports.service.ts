@@ -131,6 +131,10 @@ const MAX_REPORT_MAX_RANGE_DAYS = 3_653;
 const EXPORTS_DIR = process.env.REPORT_EXPORT_DIR || '/tmp/amocrm-analytics-exports';
 const MB = 1024 * 1024;
 const DAY_MS = 86_400_000;
+const BUILTIN_REPORT_KEYS = new Set([
+  'sales_funnel_steps', 'sales_weighted_funnel', 'sales_assigned_stage_speed', 'sales_stage_age', 'sales_loss_reasons',
+  'csm_funnel', 'csm_weighted_funnel', 'csm_base_stage_age', 'csm_assigned_stage_age', 'revenue_profit_forecast',
+]);
 
 function normalizeCustomFieldName(value: unknown) {
   return String(value ?? '').trim().toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ');
@@ -163,10 +167,11 @@ export class ReportsService {
 
   async compute(dto: ReportQueryDto, user: { id: string; role: UserRole }) {
     this.assertReportPeriod(dto);
+    [dto] = await this.normalizeBuiltinRequests([dto]);
     const cacheKey = this.reportCacheKey(dto, user);
     const latestSyncAt = await this.latestReportSourceSyncAt();
     const cached = await this.getCachedReport(cacheKey);
-    if (cached) {
+    if (cached?.payload && cached.payload.type !== 'pending') {
       await this.assertReportAvailable(dto, cached.sourceSyncAt);
       if (this.cacheIsStale(cached.sourceSyncAt, latestSyncAt)) {
         await this.enqueueReportCacheRefresh(cacheKey, dto, user);
@@ -174,7 +179,7 @@ export class ReportsService {
       return cached.payload;
     }
 
-    const report = await this.computeFresh(dto, user);
+    const report = await this.computeFresh(dto, user, true);
     await this.saveCachedReport(cacheKey, dto.name, report, latestSyncAt, dto, user);
     await this.assertReportAvailable(dto, latestSyncAt);
     return report;
@@ -182,6 +187,7 @@ export class ReportsService {
 
   async snapshots(dtos: ReportQueryDto[], user: { id: string; role: UserRole }) {
     for (const dto of dtos) this.assertReportPeriod(dto);
+    dtos = await this.normalizeBuiltinRequests(dtos);
     await this.ensureReportCacheTable();
     const latestSyncAt = await this.latestReportSourceSyncAt();
     const reports = dtos.map((dto, index) => ({
@@ -294,8 +300,44 @@ export class ReportsService {
     return { latestSourceSyncAt: latestSyncAt, reports: items };
   }
 
-  private async computeFresh(dto: ReportQueryDto, user: { id: string; role: UserRole }) {
+  private async normalizeBuiltinRequests(dtos: ReportQueryDto[]): Promise<ReportQueryDto[]> {
+    const keys = new Set(dtos.map((dto) => String(dto.config?.builtinKey ?? '')).filter((key) => BUILTIN_REPORT_KEYS.has(key)));
+    if (!keys.size) return dtos;
+    const [sales, csm] = await Promise.all([
+      [...keys].some((key) => key.startsWith('sales_')) ? this.buildSalesReportTemplates() : [],
+      [...keys].some((key) => key.startsWith('csm_')) ? this.buildCsmReportTemplates() : [],
+    ]);
+    const templates = new Map([...sales, ...csm, this.buildRevenueForecastReportTemplate()].map((template) => [template.config.builtinKey, template]));
+    return dtos.map((dto) => {
+      const key = String(dto.config?.builtinKey ?? '');
+      if (!keys.has(key)) return dto;
+      const template = templates.get(key);
+      if (!template) throw new ServiceUnavailableException(`Не настроены источники встроенного отчёта ${dto.name}`);
+      const filters: ReportFilters = { ...dto.filters };
+      if (filters.dateFrom) filters.dateFrom = this.parseFilterDate(filters.dateFrom, false).toISOString();
+      if (filters.dateTo) filters.dateTo = this.parseFilterDate(filters.dateTo, true).toISOString();
+      if (key === 'revenue_profit_forecast') {
+        const now = new Date();
+        filters.dateFrom = this.startOfMoscowMonth(now).toISOString();
+        filters.dateTo = this.endOfMoscowDay(now).toISOString();
+      }
+      if (template.config.lockPipelineFilter) filters.pipelineIds = template.config.filters?.pipelineIds;
+      if (template.config.lockTeamFilter) {
+        delete filters.groupIds;
+        if (template.config.filters?.groupIds) filters.groupIds = template.config.filters.groupIds;
+      }
+      return {
+        name: template.name,
+        sourceType: template.sourceType,
+        filters,
+        config: { ...template.config, filters, ...(dto.config.compare === undefined ? {} : { compare: dto.config.compare }) },
+      };
+    });
+  }
+
+  private async computeFresh(dto: ReportQueryDto, user: { id: string; role: UserRole }, normalized = false) {
     this.assertReportPeriod(dto);
+    if (!normalized) [dto] = await this.normalizeBuiltinRequests([dto]);
     return this.withFreshComputeSlot(async () => {
       const filters = dto.filters as ReportFilters;
       const config = dto.config as ReportConfig;
@@ -559,13 +601,22 @@ export class ReportsService {
       );
 
       try {
-        const dto = job.report_config?.dto;
+        const requestedDto = job.report_config?.dto;
         const user = job.report_config?.user;
-        if (!dto || !user?.id || !user?.role) throw new Error('Invalid report cache refresh payload');
+        if (!requestedDto || !user?.id || !user?.role) throw new Error('Invalid report cache refresh payload');
+        const [dto] = await this.normalizeBuiltinRequests([requestedDto]);
 
         const latestSyncAt = await this.latestReportSourceSyncAt();
-        const report = await this.computeFresh(dto, user);
-        await this.saveCachedReport(job.cache_key, dto.name, report, latestSyncAt, dto, user);
+        const report = await this.computeFresh(dto, user, true);
+        const cacheKey = dto === requestedDto ? job.cache_key : this.reportCacheKey(dto, user);
+        await this.saveCachedReport(cacheKey, dto.name, report, latestSyncAt, dto, user);
+        if (cacheKey !== job.cache_key) {
+          await this.prisma.$executeRawUnsafe(
+            `UPDATE report_snapshot SET report_config = NULL, refresh_status = 'IDLE', refreshing_at = NULL,
+             refresh_requested_at = NULL, refresh_error = NULL, updated_at = NOW() WHERE cache_key = $1`,
+            job.cache_key,
+          );
+        }
         await this.prisma.$executeRawUnsafe(
           `
             UPDATE report_snapshot_job
@@ -951,12 +1002,28 @@ export class ReportsService {
     await this.ensureTeamScopedReportTemplates();
   }
 
+  async getTeamFunnelDefinition(team: 'sales' | 'csm') {
+    const [templates, group] = await Promise.all([
+      team === 'sales' ? this.buildSalesReportTemplates() : this.buildCsmReportTemplates(),
+      this.findCrmGroupByName(team === 'sales' ? 'Sales' : 'CSM'),
+    ]);
+    const template = templates.find((item) => item.config.builtinKey === (team === 'sales' ? 'sales_funnel_steps' : 'csm_funnel'));
+    if (!template || !group) return null;
+    const filters = template.config.filters ?? {};
+    return { name: template.name, sourceType: template.sourceType, group, pipelineIds: filters.pipelineIds ?? [], filters, config: template.config };
+  }
+
   private async buildSalesReportTemplates(): Promise<BuiltinReportTemplate[]> {
     const refs = await this.resolveSalesRefs();
     if (!refs) return [];
 
     const marketingFieldId = (await this.resolveLeadFieldExternalId('маркетинг')) ?? '809047';
-    const salesFilters = { pipelineIds: [refs.salesPipeline.id], groupIds: [refs.salesGroup.id] };
+    // Sales is a pipeline scope: a transfer to another team must not erase its history.
+    const salesFilters = { pipelineIds: [refs.salesPipeline.id] };
+    const csmGroup = await this.findCrmGroupByName('CSM');
+    if (refs.assemblyPipeline && !csmGroup) {
+      throw new ServiceUnavailableException('Не найдена группа CSM для разделения сборки по отделам');
+    }
     const baseConfig = (key: string, order: number, config: ReportConfig): ReportConfig => ({
       ...config,
       builtinKey: key,
@@ -969,6 +1036,7 @@ export class ReportsService {
     const contractBase = {
       entity: 'deal' as const,
       groupBy: 'manager' as const,
+      emptyManagerGroupIds: [refs.salesGroup.id],
       conversions: [],
       durations: [],
       includeRowTotal: false,
@@ -1113,8 +1181,14 @@ export class ReportsService {
         successStageIds: refs.stages.success.map((stage) => stage.id),
         defaultProbability: 0.9,
       },
-      currentStageMetric('count_assembly', 'Сделок в сборке', assemblyStageIds, 'number', 'deal_count', refs.assemblyPipeline?.id ?? ''),
-      currentStageMetric('sum_assembly', 'Сумма сборки', assemblyStageIds, 'money', 'field_sum', refs.assemblyPipeline?.id ?? ''),
+      {
+        ...currentStageMetric('count_assembly', 'Сделок в сборке', assemblyStageIds, 'number', 'deal_count', refs.assemblyPipeline?.id ?? ''),
+        excludeGroupIds: csmGroup ? [csmGroup.id] : [],
+      },
+      {
+        ...currentStageMetric('sum_assembly', 'Сумма сборки', assemblyStageIds, 'money', 'field_sum', refs.assemblyPipeline?.id ?? ''),
+        excludeGroupIds: csmGroup ? [csmGroup.id] : [],
+      },
       { id: 'weighted_assembly', label: 'Сборка x 100%', type: 'formula', display: 'money', formula: '[Сумма сборки]' },
       {
         id: 'weighted_total',
@@ -1246,7 +1320,7 @@ export class ReportsService {
       display: 'number',
       pipelineId,
       stageIds,
-      stageEntryMode: 'event',
+      stageEntryMode: 'first_ever_deal',
     });
     const conversion = (id: string, label: string, fromMetricId: string, toMetricId: string): DataContractMetric => ({
       id,
@@ -1289,6 +1363,7 @@ export class ReportsService {
         display: 'money',
         pipelineId: csmPipelines[0],
         stageIds: csmSuccessStageIds,
+        stageEntryMode: 'first_ever_deal',
       },
     ];
     const weightedMetrics: DataContractMetric[] = [
@@ -1480,14 +1555,14 @@ export class ReportsService {
       this.findPipelineByName('\u0432\u043e\u0440\u043e\u043d\u043a\u0430 \u043f\u0440\u043e\u0434\u0430\u0436'),
     ]);
 
-    await this.ensureSalesLossReasonsReportTemplate(salesGroup?.id, salesPipeline?.id);
+    await this.ensureSalesLossReasonsReportTemplate(salesPipeline?.id);
     await this.applyTeamScopeToTemplates('Sales:', salesGroup?.id, salesPipeline ? [salesPipeline.id] : undefined, true);
     await this.applyTeamScopeToTemplates('CSM:', csmGroup?.id, undefined, true);
     await this.applySalesAssignedStageSpeedMode();
     await this.applySalesLeadsReceivedMetric();
   }
 
-  private async ensureSalesLossReasonsReportTemplate(salesGroupId?: string, salesPipelineId?: string) {
+  private async ensureSalesLossReasonsReportTemplate(salesPipelineId?: string) {
     const name = 'Sales: причины отказа';
     const config: ReportConfig = {
       metric: 'loss_reasons',
@@ -1503,7 +1578,6 @@ export class ReportsService {
       lockTeamFilter: true,
       filters: {
         ...(salesPipelineId ? { pipelineIds: [salesPipelineId] } : {}),
-        ...(salesGroupId ? { groupIds: [salesGroupId] } : {}),
       },
     };
     const data = {
@@ -1619,6 +1693,7 @@ export class ReportsService {
     const templates = await this.db.reportTemplate.findMany({ where: { name: { startsWith: prefix } } });
     for (const template of templates) {
       const config = template.config as ReportConfig;
+      if (prefix === 'Sales:' && config.builtinKey?.startsWith('sales_')) continue;
       const nextConfig: ReportConfig = {
         ...config,
         filters: {
@@ -1696,10 +1771,12 @@ export class ReportsService {
   }
 
   async exportExcel(dto: ReportQueryDto, user: { id: string; role: UserRole }) {
+    this.assertReportPeriod(dto);
+    [dto] = await this.normalizeBuiltinRequests([dto]);
     const latestSyncAt = await this.latestReportSourceSyncAt();
     await this.assertReportAvailable(dto, latestSyncAt);
     const cacheKey = this.reportCacheKey(dto, user);
-    const report = await this.computeFresh(dto, user);
+    const report = await this.computeFresh(dto, user, true);
     await this.saveCachedReport(cacheKey, dto.name, report, latestSyncAt, dto, user);
     const sheets: XlsxSheet[] = [
       {
@@ -1975,7 +2052,11 @@ ${sheets}
     if (groupBy === 'none') groups.set('all', { id: 'all', name: 'Отдел' });
     if (groupBy === 'manager') {
       const managers = await this.visibleManagers(role, filters.groupIds, filters.managerIds);
-      for (const manager of managers) groups.set(manager.id, { id: manager.id, name: manager.name });
+      for (const manager of managers) {
+        if (!contract.emptyManagerGroupIds?.length || contract.emptyManagerGroupIds.includes(manager.groupId ?? '')) {
+          groups.set(manager.id, { id: manager.id, name: manager.name });
+        }
+      }
     }
 
     for (const metric of contract.metrics ?? []) {
@@ -2428,6 +2509,10 @@ ${sheets}
   }
 
   private async applyMetricDealFilters(deals: any[], metric: DataContractMetric) {
+    if (metric.excludeGroupIds?.length) {
+      const excludedGroups = new Set(metric.excludeGroupIds);
+      deals = deals.filter((deal) => !excludedGroups.has(deal.responsible?.group?.id ?? deal.responsible?.groupId));
+    }
     const filters: DataContractFilter[] = [...(metric.extraFilters ?? [])];
     if (metric.createdWithinAmount && metric.createdWithinAmount > 0) {
       filters.push({
@@ -4048,6 +4133,76 @@ ${sheets}
     };
   }
 
+  async getPlanFactShipping(dateFrom: Date, dateTo: Date, user: { id: string; role: UserRole }): Promise<{
+    entries: Array<{ deal: any; shippedAt: Date }>;
+    csmGroupId: string;
+  }> {
+    const filters = { dateFrom: dateFrom.toISOString(), dateTo: dateTo.toISOString() };
+    if (this.startOfMoscowMonth(dateFrom).getTime() !== this.startOfMoscowMonth(new Date()).getTime()) {
+      return this.getActualShipping(filters, user.role);
+    }
+    const template = this.buildRevenueForecastReportTemplate();
+    const [report, csmGroup] = await Promise.all([
+      this.compute({ name: template.name, sourceType: template.sourceType, filters, config: template.config }, user),
+      this.findCrmGroupByName('CSM'),
+    ]);
+    if (report.type !== 'revenueProfitForecast' || !report.ready || !csmGroup) {
+      throw new ServiceUnavailableException('Данные отгрузок в общем снимке прогноза недоступны');
+    }
+    const actualRows = (report.rows ?? []).filter((row: any) => ['salesShippedThisMonth', 'repeatShippedThisMonth'].includes(row.id));
+    if (actualRows.length !== 2) throw new ServiceUnavailableException('В снимке прогноза нет фактических отгрузок');
+    const entries = actualRows.flatMap((row: any) => (row.deals ?? []).map((sample: any) => {
+      const shippedAt = new Date(sample.predictedShipAt);
+      if (!sample.managerId || !sample.predictedShipAt || !Number.isFinite(shippedAt.getTime())) {
+        throw new ServiceUnavailableException('В снимке отгрузок нет ответственного или даты отгрузки');
+      }
+      return {
+        shippedAt,
+        deal: {
+          id: sample.dealId, amount: sample.amount, responsibleId: sample.managerId,
+          responsible: { id: sample.managerId, name: sample.manager, groupId: sample.groupId, group: { id: sample.groupId } },
+        },
+      };
+    }));
+    return { entries, csmGroupId: csmGroup.id };
+  }
+
+  async getActualShipping(filters: ReportFilters, role: UserRole): Promise<{
+    entries: Array<{ deal: any; shippedAt: Date }>;
+    csmGroupId: string;
+  }> {
+    const refs = await this.resolveRevenueForecastRefs();
+    if (!refs.assemblyPipeline || !refs.shippingDoneStage || !refs.csmGroup) {
+      throw new ServiceUnavailableException('Не настроены воронка Сборка, этап отгрузки или группа CSM');
+    }
+    const entries = await this.prisma.factStageTransition.findMany({
+      where: {
+        toStageId: refs.shippingDoneStage.id,
+        pipelineId: refs.assemblyPipeline.id,
+        movedAt: this.dateRange(filters),
+      },
+      orderBy: [{ dealId: 'asc' }, { movedAt: 'asc' }],
+      select: { dealId: true, movedAt: true },
+    });
+    if (!entries.length) return { entries: [], csmGroupId: refs.csmGroup.id };
+
+    const dealRows = await this.prisma.factDealCurrent.findMany({
+      where: {
+        ...await this.buildFactDealWhere(this.fixedPipelineFilters(filters, refs.assemblyPipeline.id), role),
+        dealId: { in: [...new Set(entries.map((entry) => entry.dealId))] },
+      },
+    });
+    const dealsById = new Map(dealRows
+      .filter((deal) => this.matchesCustomFieldFilters(deal.customFields as any, filters.customFields))
+      .map((deal) => [deal.dealId, this.factDealToReportDeal(deal)]));
+    const firstEntryByDeal = new Map<string, { deal: any; shippedAt: Date }>();
+    for (const entry of entries) {
+      const deal = dealsById.get(entry.dealId);
+      if (deal && !firstEntryByDeal.has(deal.id)) firstEntryByDeal.set(deal.id, { deal, shippedAt: entry.movedAt });
+    }
+    return { entries: [...firstEntryByDeal.values()], csmGroupId: refs.csmGroup.id };
+  }
+
   private async computeRevenueProfitForecast(filters: ReportFilters, role: UserRole) {
     const refs = await this.resolveRevenueForecastRefs();
     const now = new Date();
@@ -4066,29 +4221,11 @@ ${sheets}
       };
     }
 
-    const alreadyShippedEntries = await this.prisma.factStageTransition.findMany({
-      where: {
-        toStageId: refs.shippingDoneStage!.id,
-        pipelineId: refs.assemblyPipeline!.id,
-        movedAt: { gte: monthFrom, lte: monthTo },
-      },
-      orderBy: [{ dealId: 'asc' }, { movedAt: 'asc' }],
-      select: { dealId: true, movedAt: true },
-    });
-    const alreadyShippedDeals = new Map((await this.findDealsByIds(alreadyShippedEntries.map((entry) => entry.dealId))).map((deal) => [deal.id, deal]));
-    const allowedShippedManagerIds = new Set(await this.visibleManagerIds(role));
-    const alreadyShippedByDeal = new Map<string, { deal: any; shippedAt: Date }>();
-    for (const entry of alreadyShippedEntries) {
-      const deal = alreadyShippedDeals.get(entry.dealId);
-      if (!deal || deal.pipelineId !== refs.assemblyPipeline!.id) continue;
-      if (!deal.responsibleId || !allowedShippedManagerIds.has(deal.responsibleId)) continue;
-      if (!alreadyShippedByDeal.has(deal.id)) {
-        alreadyShippedByDeal.set(deal.id, { deal, shippedAt: entry.movedAt });
-      }
-    }
+    const actualShipping = await this.getActualShipping({ ...filters, dateFrom: monthFrom.toISOString(), dateTo: this.endOfMoscowDay(now).toISOString() }, role);
+    const alreadyShippedIds = new Set(actualShipping.entries.map(({ deal }) => deal.id));
 
-    const assemblyDeals = (await this.findCurrentStageDealsFromFacts(this.fixedPipelineFilters(filters, refs.assemblyPipeline!.id, undefined, { ignoreTeam: true }), role))
-      .filter((deal) => !this.isBusinessWonStage(deal.stage) && !this.isBusinessLostStage(deal.stage));
+    const assemblyDeals = (await this.findCurrentStageDealsFromFacts(this.fixedPipelineFilters(filters, refs.assemblyPipeline!.id), role))
+      .filter((deal) => !alreadyShippedIds.has(deal.id) && !this.isBusinessWonStage(deal.stage) && !this.isBusinessLostStage(deal.stage));
     const invoiceDeals = await this.findCurrentStageDealsFromFacts(
       this.fixedPipelineFilters(filters, refs.salesPipeline!.id, [refs.invoiceStage!.id]),
       role,
@@ -4168,6 +4305,8 @@ ${sheets}
         dealExternalId: deal.externalId,
         title: deal.title,
         manager: deal.responsible?.name ?? 'Без менеджера',
+        managerId: deal.responsibleId ?? deal.responsible?.id ?? null,
+        groupId: deal.responsible?.group?.id ?? deal.responsible?.groupId ?? null,
         stage: deal.stage?.name ?? '',
         source,
         probabilityPercent: prediction?.probabilityPercent ?? 100,
@@ -4181,14 +4320,14 @@ ${sheets}
         drivers: prediction?.drivers ?? [],
         featureSummary: prediction?.featureSummary ?? null,
         amount,
-        revenue: Math.round(revenue),
-        profit: Math.round(profit),
+        revenue: Number(revenue.toFixed(2)),
+        profit: Number(profit.toFixed(2)),
         elapsedStageDays: prediction?.elapsedStageDays ?? null,
         predictedShipAt: prediction?.predictedShipAt?.toISOString() ?? shippedAt?.toISOString() ?? null,
       });
     };
 
-    for (const { deal, shippedAt } of alreadyShippedByDeal.values()) {
+    for (const { deal, shippedAt } of actualShipping.entries) {
       addDeal(this.revenueForecastShippedBucket(deal, refs), deal, 'Фактически отгружено', null, shippedAt);
     }
     for (const deal of assemblyDeals) {
@@ -4221,13 +4360,13 @@ ${sheets}
 
     const rows = Object.values(buckets).map((bucket) => ({
       ...bucket,
-      revenue: Math.round(bucket.revenue),
-      profit: Math.round(bucket.profit ?? 0),
+      revenue: Number(bucket.revenue.toFixed(2)),
+      profit: Number((bucket.profit ?? 0).toFixed(2)),
       deals: bucket.deals.sort((a: any, b: any) => String(a.predictedShipAt ?? '').localeCompare(String(b.predictedShipAt ?? ''))),
     }));
     const expectedRevenue = rows.reduce((sum, row) => sum + row.revenue, 0);
     const expectedProfit = rows.reduce((sum, row) => sum + Number(row.profit ?? 0), 0);
-    const actualRevenue = [...alreadyShippedByDeal.values()].reduce((sum, item) => sum + Number(item.deal.amount ?? 0), 0);
+    const actualRevenue = actualShipping.entries.reduce((sum, item) => sum + Number(item.deal.amount ?? 0), 0);
     const forecastVariance = openForecastDeals.reduce(
       (sum, item) => sum + (item.amount ** 2) * item.probability * (1 - item.probability),
       0,
@@ -4264,14 +4403,14 @@ ${sheets}
       ],
       warnings: [...refs.warnings, ...engineResult.warnings],
       summary: {
-        count: alreadyShippedByDeal.size + openForecastDeals.length,
-        revenue: Math.round(expectedRevenue),
-        profit: Math.round(expectedProfit),
-        actualRevenue: Math.round(actualRevenue),
-        committedRevenue: Math.round(committedRevenue),
-        lowRevenue: Math.round(Math.max(actualRevenue, expectedRevenue - 1.28 * riskDeviation)),
-        highRevenue: Math.round(expectedRevenue + 1.28 * riskDeviation),
-        pipelineAmount: Math.round(actualRevenue + openForecastDeals.reduce((sum, item) => sum + item.amount, 0)),
+        count: alreadyShippedIds.size + openForecastDeals.length,
+        revenue: Number(expectedRevenue.toFixed(2)),
+        profit: Number(expectedProfit.toFixed(2)),
+        actualRevenue: Number(actualRevenue.toFixed(2)),
+        committedRevenue: Number(committedRevenue.toFixed(2)),
+        lowRevenue: Number(Math.max(actualRevenue, expectedRevenue - 1.28 * riskDeviation).toFixed(2)),
+        highRevenue: Number((expectedRevenue + 1.28 * riskDeviation).toFixed(2)),
+        pipelineAmount: Number((actualRevenue + openForecastDeals.reduce((sum, item) => sum + item.amount, 0)).toFixed(2)),
       },
       rows,
       totals: this.createRevenueForecastTotalRows(rows),
@@ -4899,8 +5038,8 @@ ${sheets}
         id,
         label,
         count: sourceRows.reduce((sum, row) => sum + Number(row.count ?? 0), 0),
-        revenue: Math.round(sourceRows.reduce((sum, row) => sum + Number(row.revenue ?? 0), 0)),
-        profit: Math.round(sourceRows.reduce((sum, row) => sum + Number(row.profit ?? 0), 0)),
+        revenue: Number(sourceRows.reduce((sum, row) => sum + Number(row.revenue ?? 0), 0).toFixed(2)),
+        profit: Number(sourceRows.reduce((sum, row) => sum + Number(row.profit ?? 0), 0).toFixed(2)),
         deals,
       };
     };
@@ -4925,25 +5064,17 @@ ${sheets}
   }
 
   private isRepeatRevenueForecastDeal(deal: any, refs: { csmGroup?: { id: string; name: string } | null }) {
-    const groupId = deal.responsible?.group?.id ?? null;
-    const groupName = this.normalizeStageName(deal.responsible?.group?.name ?? '');
-    const csmGroupName = this.normalizeStageName(refs.csmGroup?.name ?? 'CSM');
-    return Boolean(
-      (refs.csmGroup?.id && groupId === refs.csmGroup.id) ||
-      groupName === csmGroupName ||
-      groupName.includes('csm'),
-    );
+    const groupId = deal.responsible?.group?.id ?? deal.responsible?.groupId ?? null;
+    return Boolean(refs.csmGroup?.id && groupId === refs.csmGroup.id);
   }
 
   private fixedPipelineFilters(
     filters: ReportFilters,
     pipelineId: string,
     stageIds?: string[],
-    options?: { ignoreTeam?: boolean },
   ): ReportFilters {
     return {
-      managerIds: options?.ignoreTeam ? undefined : filters.managerIds,
-      groupIds: options?.ignoreTeam ? undefined : filters.groupIds,
+      ...filters,
       pipelineIds: [pipelineId],
       stageIds,
     };
@@ -5077,6 +5208,14 @@ ${sheets}
 
   private addDays(date: Date, days: number) {
     return new Date(date.getTime() + days * 86_400_000);
+  }
+
+  private endOfMoscowDay(date: Date) {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Europe/Moscow', year: 'numeric', month: '2-digit', day: '2-digit',
+    }).formatToParts(date);
+    const part = (type: string) => Number(parts.find((item) => item.type === type)?.value);
+    return moscowDate(part('year'), part('month'), part('day'), 23, 59, 59, 999);
   }
 
   private startOfMoscowMonth(date: Date) {
@@ -5661,7 +5800,7 @@ ${sheets}
     if (role === 'ROP') where.isVisible = true;
     if (groupIds?.length) where.groupId = { in: groupIds };
     if (managerIds?.length) where.id = { in: managerIds };
-    return this.db.crmUser.findMany({ where, select: { id: true, name: true }, orderBy: { name: 'asc' } });
+    return this.db.crmUser.findMany({ where, select: { id: true, name: true, groupId: true }, orderBy: { name: 'asc' } });
   }
 
   private lossReasonFromCustomField(customFields?: Record<string, any> | null) {

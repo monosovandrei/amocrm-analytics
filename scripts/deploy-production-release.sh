@@ -9,7 +9,7 @@ BACKUPS_DIR="${BACKUPS_DIR:-/opt/analytics-backups}"
 KEEP_RELEASES="${KEEP_RELEASES:-5}"
 READY_URL="${READY_URL:-http://127.0.0.1:4000/api/v1/health/ready}"
 HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:4000/api/v1/health}"
-METRIC_VERSION_VALUE="${METRIC_VERSION:-2026-08-31.1}"
+METRIC_VERSION_VALUE="${METRIC_VERSION:-2026-09-25.1}"
 
 SERVICES=(
   analytics-tcp-mtu.service
@@ -182,6 +182,20 @@ if [[ "$DEPLOY_OK" != "1" ]]; then
 fi
 
 cat "$HEALTH_SUMMARY"
+
+# A healthy process is not enough: publish current definitions, warm the usual
+# periods, then compare sections on one read-only database snapshot.
+if ! node --expose-gc "$RELEASE/scripts/prepare-release-reports.cjs" || \
+   ! node --expose-gc "$RELEASE/scripts/verify-section-consistency.cjs" --roles=ADMIN,ROP; then
+  echo "Release report consistency gate failed; restoring previous application release" >&2
+  if restore_previous_release; then
+    # Templates are shared database rows, so restore their previous definitions too.
+    if ! node "$RELEASE/scripts/prepare-release-reports.cjs" --templates-only "--release-root=$PREVIOUS_RELEASE"; then
+      echo "Previous code restored, but built-in report templates could not be restored; manual check required" >&2
+    fi
+  fi
+  exit 1
+fi
 
 RELEASES_ROOT="$(readlink -f "$RELEASES_DIR")"
 CURRENT_RELEASE="$(readlink -f "$LIVE_LINK")"

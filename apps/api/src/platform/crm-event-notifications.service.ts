@@ -1202,7 +1202,7 @@ export class CrmEventNotificationsService {
 
   private async countFirstStageReachedByManager(
     stageIds: string[],
-    refs: { pipelineIds: string[]; csmGroupId: string },
+    refs: { csmGroupId: string },
     startAt: Date,
     endAt: Date,
   ) {
@@ -1223,7 +1223,6 @@ export class CrmEventNotificationsService {
       WHERE transition."to_stage_id" IN (${Prisma.join(stageIds)})
         AND transition."moved_at" <= ${endAt}
         AND deal."deleted_at" IS NULL
-        AND deal."pipeline_id" IN (${Prisma.join(refs.pipelineIds)})
         AND deal."responsible_id" IN (${Prisma.join(csmManagerIds)})
       ORDER BY transition."deal_id" ASC, transition."moved_at" ASC
     `;

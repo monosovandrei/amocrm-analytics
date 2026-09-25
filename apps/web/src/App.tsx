@@ -45,6 +45,7 @@ import {
   X,
 } from 'lucide-react';
 import { api, downloadExcel, downloadFile } from '@/lib/api';
+import { moscowPresetDateInputs } from './report-period';
 import CrmControl from './CrmControl';
 import type {
   BuilderOperator,
@@ -482,23 +483,16 @@ function defaultDisplayForMetric(metric?: MetricType): DisplayType {
 }
 
 function getInitialFilters(): ReportFilters {
-  const now = new Date();
   return {
     periodMode: 'preset',
     periodPreset: 'this_month',
     relativeAmount: 7,
     relativeUnit: 'days',
-    dateFrom: toDateInput(new Date(now.getFullYear(), now.getMonth(), 1)),
-    dateTo: toDateInput(now),
+    ...moscowPresetDateInputs('this_month'),
     pipelineIds: [],
     managerIds: [],
     groupIds: [],
   };
-}
-
-function toDateInput(date: Date) {
-  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
-  return local.toISOString().slice(0, 10);
 }
 
 function dateInputValue(value?: string) {
@@ -507,30 +501,7 @@ function dateInputValue(value?: string) {
 }
 
 function presetDateInputs(preset: PeriodPreset) {
-  const now = new Date();
-  const startOfDay = (date: Date) => new Date(date.getFullYear(), date.getMonth(), date.getDate());
-  const day = now.getDay() || 7;
-
-  if (preset === 'today') {
-    return { dateFrom: toDateInput(now), dateTo: toDateInput(now) };
-  }
-
-  if (preset === 'yesterday') {
-    const yesterday = new Date(now);
-    yesterday.setDate(yesterday.getDate() - 1);
-    return { dateFrom: toDateInput(yesterday), dateTo: toDateInput(yesterday) };
-  }
-
-  if (preset === 'this_week') {
-    const monday = startOfDay(now);
-    monday.setDate(monday.getDate() - day + 1);
-    return { dateFrom: toDateInput(monday), dateTo: toDateInput(now) };
-  }
-
-  return {
-    dateFrom: toDateInput(new Date(now.getFullYear(), now.getMonth(), 1)),
-    dateTo: toDateInput(now),
-  };
+  return moscowPresetDateInputs(preset);
 }
 
 function makeId(prefix: string) {

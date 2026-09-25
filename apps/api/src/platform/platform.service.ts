@@ -17,7 +17,6 @@ import { isMoscowBusinessDay, moscowDate, moscowParts } from '../common/date.uti
 import { FactMartsService } from '../facts/fact-marts.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { ReportsService } from '../reports/reports.service';
-import { DataContractMetric, ReportConfig, ReportFilters } from '../reports/report-types';
 import { TelegramService } from './telegram.service';
 import { CrmEventNotificationsService } from './crm-event-notifications.service';
 import {
@@ -30,6 +29,30 @@ import {
 } from './rop-stage-sla';
 
 type PlanFactTeamKey = 'sales' | 'csm';
+type TeamFunnelDefinition = NonNullable<Awaited<ReturnType<ReportsService['getTeamFunnelDefinition']>>>;
+type ActualShipping = Awaited<ReturnType<ReportsService['getActualShipping']>>;
+// Aliases only: the report owns stage selection, attribution and counting rules.
+const PLAN_FACT_REPORT_METRICS: Record<PlanFactTeamKey, Record<string, string>> = {
+  sales: {
+    sales_qualified_leads: 'leads_received',
+    sales_kp_count: 'kp_presented',
+    sales_conv_kp_to_invoice: 'conv_kp_presented_to_invoice',
+    sales_invoice_count: 'invoice_sent',
+    sales_conv_invoice_to_paid: 'conv_invoice_to_paid',
+    sales_paid_count: 'paid',
+    sales_paid_amount: 'payment_amount',
+  },
+  csm: {
+    csm_taken_to_work_count: 'taken_to_work',
+    csm_conv_work_to_kp: 'conv_work_to_offer',
+    csm_kp_count: 'offer_made',
+    csm_conv_kp_to_invoice: 'conv_offer_to_invoice',
+    csm_invoice_count: 'invoice_sent',
+    csm_conv_invoice_to_paid: 'conv_invoice_to_paid',
+    csm_paid_count: 'paid',
+    csm_paid_amount: 'paid_amount',
+  },
+};
 type PlanFactMetricUnit = 'number' | 'money' | 'percent';
 type PlanFactMetric = {
   key: string;
@@ -1804,13 +1827,26 @@ export class PlatformService {
       ? await this.prisma.planSet.findUnique({ where: { id: planSetId }, include: { items: true } })
       : await this.prisma.planSet.findFirst({ where: { isActive: true }, orderBy: { updatedAt: 'desc' }, include: { items: true } });
 
-    const refs = await this.resolvePlanFactRefs();
+    const periodEnd = calendar.todayEnd < calendar.monthEnd ? calendar.todayEnd : calendar.monthEnd;
+    const [refs, monthShipping] = await Promise.all([
+      this.resolvePlanFactRefs(),
+      calendar.monthStart > periodEnd ? null : this.reports.getPlanFactShipping(calendar.monthStart, periodEnd, user),
+    ]);
+    // All shipping windows use the same forecast snapshot, not independently
+    // refreshed values. A reopened shipment cannot count again on a later day.
+    const shipping = {
+      month: monthShipping,
+      today: calendar.isCurrentMonth && monthShipping
+        ? { ...monthShipping, entries: monthShipping.entries.filter((entry) => entry.shippedAt >= calendar.todayStart) } : null,
+      beforeToday: calendar.isCurrentMonth && monthShipping
+        ? { ...monthShipping, entries: monthShipping.entries.filter((entry) => entry.shippedAt < calendar.todayStart) } : null,
+    };
     const monthItems = (planSet?.items ?? []).filter((item) =>
       item.periodStart <= calendar.monthEnd && item.periodEnd >= calendar.monthStart,
     );
     const [sales, csm] = await Promise.all([
-      refs.sales ? this.buildPlanFactTeam('sales', refs.sales, refs.shipping, monthItems, calendar, user) : null,
-      refs.csm ? this.buildPlanFactTeam('csm', refs.csm, refs.shipping, monthItems, calendar, user) : null,
+      refs.sales ? this.buildPlanFactTeam('sales', refs.sales, shipping, monthItems, calendar, user) : null,
+      refs.csm ? this.buildPlanFactTeam('csm', refs.csm, shipping, monthItems, calendar, user) : null,
     ]);
 
     return {
@@ -1999,73 +2035,20 @@ export class PlatformService {
   }
 
   private async resolvePlanFactRefs() {
-    const [pipelines, salesGroup, csmGroup, marketingFieldId] = await Promise.all([
-      this.prisma.pipeline.findMany({ include: { stages: { orderBy: { position: 'asc' } } } }),
-      this.findPlanFactGroup('Sales'),
-      this.findPlanFactGroup('CSM'),
-      this.resolvePlanFactFieldExternalId('маркетинг'),
+    const [sales, csm] = await Promise.all([
+      this.reports.getTeamFunnelDefinition('sales'),
+      this.reports.getTeamFunnelDefinition('csm'),
     ]);
-    const pipelineByName = (needles: string[]) =>
-      pipelines.find((pipeline) => this.nameIncludesAll(pipeline.name, needles)) ?? null;
-    const salesPipeline = pipelineByName(['продаж']);
-    const assemblyPipeline = pipelineByName(['сбор']);
-    const basePipeline = pipelines.find((pipeline) => this.normalizeName(pipeline.name) === this.normalizeName('База')) ?? null;
-    const assignedPipeline = pipelineByName(['закреп']);
     const warnings: string[] = [];
-
-    const sales = salesPipeline && salesGroup
-      ? {
-        key: 'sales' as const,
-        name: 'Продажи',
-        group: salesGroup,
-        pipelineIds: [salesPipeline.id],
-        stages: {
-          kp: this.findStage(salesPipeline.stages, [['кп', 'презент'], ['кп', 'отправ'], ['предлож']]),
-          invoice: this.findStage(salesPipeline.stages, [['счет', 'отправ'], ['счёт', 'отправ']]),
-          paid: this.findPaidStage(salesPipeline.stages),
-        },
-        marketingFieldId,
-      }
-      : null;
-    const csmStages = basePipeline && assignedPipeline
-      ? {
-        base: this.resolveCsmPlanFactStages(basePipeline.stages),
-        assigned: this.resolveCsmPlanFactStages(assignedPipeline.stages),
-      }
-      : null;
-    const csm = basePipeline && assignedPipeline && csmGroup && csmStages?.base && csmStages.assigned
-      ? {
-        key: 'csm' as const,
-        name: 'CSM',
-        group: csmGroup,
-        pipelineIds: [basePipeline.id, assignedPipeline.id],
-        stages: csmStages,
-      }
-      : null;
-    const shipping = assemblyPipeline
-      ? {
-        pipeline: assemblyPipeline,
-        shippedStage: this.findStage(assemblyPipeline.stages, [['отгруж']]) ?? assemblyPipeline.stages.find((stage) => stage.isWon) ?? null,
-      }
-      : null;
-
-    if (!salesGroup) warnings.push('Не найдена группа Sales.');
-    if (!csmGroup) warnings.push('Не найдена группа CSM.');
-    if (!salesPipeline) warnings.push('Не найдена воронка продаж.');
-    if (!basePipeline) warnings.push('Не найдена воронка База.');
-    if (!assignedPipeline) warnings.push('Не найдена воронка Закрепленные компании.');
-    if (!assemblyPipeline) warnings.push('Не найдена воронка Сборка.');
-    if (sales && (!sales.stages.kp || !sales.stages.invoice || !sales.stages.paid)) warnings.push('Не найдены все этапы Sales для план-факта.');
-    if (csm && (!csm.stages.base || !csm.stages.assigned)) warnings.push('Не найдены все этапы CSM для план-факта.');
-    if (!shipping?.shippedStage) warnings.push('Не найден этап отгружено.');
-
-    return { sales, csm, shipping, warnings };
+    if (!sales) warnings.push('Не найдены настройки воронки Sales. Данные не рассчитаны.');
+    if (!csm) warnings.push('Не найдены настройки воронки CSM. Данные не рассчитаны.');
+    return { sales, csm, warnings };
   }
 
   private async buildPlanFactTeam(
     team: PlanFactTeamKey,
-    refs: any,
-    shipping: any,
+    refs: TeamFunnelDefinition,
+    shipping: { month: ActualShipping | null; today: ActualShipping | null; beforeToday: ActualShipping | null },
     planItems: any[],
     calendar: ReturnType<PlatformService['planFactCalendar']>,
     user: AuthUser,
@@ -2074,7 +2057,7 @@ export class PlatformService {
     const managers = await this.prisma.crmUser.findMany({
       where: {
         isActive: true,
-        isVisible: true,
+        ...(user.role === 'ROP' ? { isVisible: true } : {}),
         ...(team === 'sales'
           ? {
               OR: [
@@ -2088,20 +2071,29 @@ export class PlatformService {
       select: { id: true, name: true },
     });
     const [monthReport, todayReport, beforeTodayReport] = await Promise.all([
-      this.computePlanFactContract(team, refs, shipping, calendar.monthStart, calendar.todayEnd < calendar.monthEnd ? calendar.todayEnd : calendar.monthEnd, user),
+      this.computePlanFactContract(team, refs, shipping.month, calendar.monthStart, calendar.todayEnd < calendar.monthEnd ? calendar.todayEnd : calendar.monthEnd, user),
       calendar.isCurrentMonth
-        ? this.computePlanFactContract(team, refs, shipping, calendar.todayStart, calendar.todayEnd, user)
+        ? this.computePlanFactContract(team, refs, shipping.today, calendar.todayStart, calendar.todayEnd, user)
         : Promise.resolve(null),
       calendar.isCurrentMonth
-        ? this.computePlanFactContract(team, refs, shipping, calendar.monthStart, new Date(calendar.todayStart.getTime() - 1), user)
+        ? this.computePlanFactContract(team, refs, shipping.beforeToday, calendar.monthStart, new Date(calendar.todayStart.getTime() - 1), user)
         : Promise.resolve(null),
     ]);
 
-    const rows = managers.map((manager) => this.buildPlanFactTargetRow({
+    // Include current owners present in facts even if they no longer own an open
+    // Sales card. Otherwise the total includes deals absent from manager rows.
+    const allManagers = new Map(managers.map((manager) => [manager.id, manager]));
+    for (const report of [monthReport, todayReport, beforeTodayReport]) {
+      for (const row of report?.rows ?? []) {
+        if (!allManagers.has(row.groupId)) allManagers.set(row.groupId, { id: row.groupId, name: row.groupName });
+      }
+    }
+    const teamName = team === 'sales' ? 'Продажи' : 'CSM';
+    const rows = [...allManagers.values()].sort((a, b) => a.name.localeCompare(b.name, 'ru')).map((manager) => this.buildPlanFactTargetRow({
       targetType: 'MANAGER',
       targetId: manager.id,
       targetName: manager.name,
-      groupTarget: { targetId: refs.group.id, targetName: refs.name },
+      groupTarget: { targetId: refs.group.id, targetName: teamName },
       metrics,
       planItems,
       calendar,
@@ -2112,8 +2104,8 @@ export class PlatformService {
     const total = this.buildPlanFactTargetRow({
       targetType: 'GROUP',
       targetId: refs.group.id,
-      targetName: `Итого ${refs.name}`,
-      groupTarget: { targetId: refs.group.id, targetName: refs.name },
+      targetName: `Итого ${teamName}`,
+      groupTarget: { targetId: refs.group.id, targetName: teamName },
       metrics,
       planItems,
       calendar,
@@ -2124,7 +2116,7 @@ export class PlatformService {
     });
     return {
       key: team,
-      name: refs.name,
+      name: teamName,
       groupId: refs.group.id,
       metrics,
       rows,
@@ -2229,101 +2221,57 @@ export class PlatformService {
 
   private async computePlanFactContract(
     team: PlanFactTeamKey,
-    refs: any,
-    shipping: any,
+    refs: TeamFunnelDefinition,
+    shipping: ActualShipping | null,
     dateFrom: Date,
     dateTo: Date,
     user: AuthUser,
   ) {
     if (dateTo < dateFrom) return null;
-    const contractMetrics = this.planFactContractMetrics(team, refs, shipping);
-    const filters: ReportFilters = {
-      dateFrom: dateFrom.toISOString(),
-      dateTo: dateTo.toISOString(),
-      groupIds: team === 'sales' ? undefined : [refs.group.id],
-      pipelineIds: refs.pipelineIds,
-    };
-    const config: ReportConfig = {
-      metric: 'contract',
-      display: 'table',
+    const filters = { ...refs.filters, dateFrom: dateFrom.toISOString(), dateTo: dateTo.toISOString() };
+    const report = await this.reports.compute({
+      name: refs.name,
+      sourceType: refs.sourceType,
       filters,
-      contract: {
-        entity: 'deal',
-        groupBy: 'manager',
-        metrics: contractMetrics,
-        conversions: [],
-        includeSummaryRow: true,
-        summaryRowMode: 'sum',
-      },
-    };
-    return this.reports.compute({
-      name: `plan-fact-${team}-${dateFrom.toISOString()}-${dateTo.toISOString()}`,
-      sourceType: 'EVENT',
-      filters,
-      config,
+      config: { ...refs.config, filters },
     }, user);
-  }
-
-  private planFactContractMetrics(team: PlanFactTeamKey, refs: any, shipping: any): DataContractMetric[] {
-    const metric = (id: string, label: string, stageIds: string[], measure: 'deal_count' | 'field_sum' = 'deal_count'): DataContractMetric => ({
-      id,
-      label,
-      type: 'stage_reached',
-      measure,
-      display: measure === 'field_sum' ? 'money' : 'number',
-      stageIds,
-    });
-    const conversion = (id: string, label: string, fromMetricId: string, toMetricId: string): DataContractMetric => ({
-      id,
-      label,
-      type: 'conversion',
-      display: 'percent',
-      fromMetricId,
-      toMetricId,
-    });
-    const shippedStageIds = shipping?.shippedStage ? [shipping.shippedStage.id] : [];
-
-    if (team === 'sales') {
-      return [
-        {
-          id: 'sales_qualified_leads',
-          label: 'Квал лиды',
-          type: 'created_deals',
-          measure: 'deal_count',
-          display: 'number',
-          pipelineId: refs.pipelineIds[0],
-          extraFilters: refs.marketingFieldId
-            ? [{ id: 'marketing_accepted', subject: 'deal_field', fieldId: refs.marketingFieldId, operator: 'equals', value: 'Принято' }]
-            : [],
-        },
-        conversion('sales_conv_lead_to_kp', 'Конверсия лиды -> КП', 'sales_qualified_leads', 'sales_kp_count'),
-        metric('sales_kp_count', 'КП', refs.stages.kp ? [refs.stages.kp.id] : []),
-        conversion('sales_conv_kp_to_invoice', 'Конверсия КП -> счёт', 'sales_kp_count', 'sales_invoice_count'),
-        metric('sales_invoice_count', 'Счета', refs.stages.invoice ? [refs.stages.invoice.id] : []),
-        conversion('sales_conv_invoice_to_paid', 'Конверсия счёт -> оплата', 'sales_invoice_count', 'sales_paid_count'),
-        metric('sales_paid_count', 'Оплаты', refs.stages.paid ? [refs.stages.paid.id] : []),
-        metric('sales_paid_amount', 'Сумма оплат', refs.stages.paid ? [refs.stages.paid.id] : [], 'field_sum'),
-        metric('sales_shipped_count', 'Отгрузки', shippedStageIds),
-        metric('sales_shipped_amount', 'Сумма отгрузок', shippedStageIds, 'field_sum'),
-      ];
+    const mapMetrics = (source: Record<string, any> = {}) => {
+      const mapped: Record<string, any> = {};
+      for (const [planKey, reportKey] of Object.entries(PLAN_FACT_REPORT_METRICS[team])) {
+        mapped[planKey] = source[reportKey] ?? { value: null };
+      }
+      if (team === 'sales') {
+        const leads = source.leads_received?.value;
+        const quotes = source.kp_presented?.value;
+        mapped.sales_conv_lead_to_kp = {
+          value: leads != null && leads > 0 && quotes != null ? this.roundMetric(quotes / leads * 100) : null,
+        };
+      }
+      mapped[team + '_shipped_count'] = { value: 0 };
+      mapped[team + '_shipped_amount'] = { value: 0 };
+      return mapped;
+    };
+    const rows: any[] = (report.rows ?? []).map((row: any) => ({ ...row, metrics: mapMetrics(row.metrics) }));
+    const rowByManager = new Map(rows.map((row: any) => [row.groupId, row]));
+    const summary = { metrics: mapMetrics(report.summaryRows?.[0]?.metrics) };
+    for (const { deal } of shipping?.entries ?? []) {
+      const isCsm = deal.responsible?.group?.id === shipping!.csmGroupId;
+      if ((team === 'csm') !== isCsm) continue;
+      let row = rowByManager.get(deal.responsibleId);
+      if (!row) {
+        // No funnel activity is a real zero, not a missing conversion.
+        const emptySource = Object.fromEntries(Object.values(PLAN_FACT_REPORT_METRICS[team])
+          .map((key) => [key, { value: key.startsWith('conv_') ? null : 0 }]));
+        row = { groupId: deal.responsibleId, groupName: deal.responsible?.name ?? 'Без имени', metrics: mapMetrics(emptySource) };
+        rows.push(row);
+        rowByManager.set(deal.responsibleId, row);
+      }
+      for (const target of [row, summary]) {
+        target.metrics[team + '_shipped_count'].value += 1;
+        target.metrics[team + '_shipped_amount'].value += Number(deal.amount ?? 0);
+      }
     }
-
-    const workStageIds = [refs.stages.base.work.id, refs.stages.assigned.work.id];
-    const offerStageIds = [refs.stages.base.offer.id, refs.stages.assigned.offer.id];
-    const invoiceStageIds = [refs.stages.base.invoice.id, refs.stages.assigned.invoice.id];
-    const paidStageIds = [refs.stages.base.paid.id, refs.stages.assigned.paid.id];
-    return [
-      metric('csm_taken_to_work_count', 'Взяты в работу', workStageIds),
-      conversion('csm_conv_work_to_kp', 'Конверсия в работу -> КП', 'csm_taken_to_work_count', 'csm_kp_count'),
-      metric('csm_kp_count', 'КП', offerStageIds),
-      conversion('csm_conv_kp_to_invoice', 'Конверсия КП -> счёт', 'csm_kp_count', 'csm_invoice_count'),
-      metric('csm_invoice_count', 'Счета', invoiceStageIds),
-      conversion('csm_conv_invoice_to_paid', 'Конверсия счёт -> оплата', 'csm_invoice_count', 'csm_paid_count'),
-      metric('csm_paid_count', 'Оплаты', paidStageIds),
-      metric('csm_paid_amount', 'Сумма оплат', paidStageIds, 'field_sum'),
-      metric('csm_shipped_count', 'Отгрузки', shippedStageIds),
-      metric('csm_shipped_amount', 'Сумма отгрузок', shippedStageIds, 'field_sum'),
-    ];
+    return { ...report, rows, summaryRows: [summary] };
   }
 
   private findPlanValue(
@@ -2354,7 +2302,7 @@ export class PlatformService {
     if (targetType === 'GROUP' && managerRows?.length) {
       const values = managerRows
         .map((row) => row.values?.[metric.key]?.plan)
-        .filter((value: unknown): value is number => Number.isFinite(Number(value)))
+        .filter((value: unknown): value is number => value != null && Number.isFinite(Number(value)))
         .map(Number);
       if (!values.length) return null;
       return this.roundMetric(values.reduce((sum, value) => sum + value, 0));
@@ -2364,54 +2312,17 @@ export class PlatformService {
 
   private reportMetricValue(report: any, targetId: string, targetType: 'MANAGER' | 'GROUP', metricKey: string) {
     if (!report) return null;
+    const row = report.rows?.find((item: any) => item.groupId === targetId);
+    if (targetType === 'MANAGER' && !row) {
+      return PLAN_FACT_METRICS.find((metric) => metric.key === metricKey)?.kind === 'additive' ? 0 : null;
+    }
     const source = targetType === 'GROUP'
       ? report.summaryRows?.[0]?.metrics?.[metricKey]
-      : report.rows?.find((row: any) => row.groupId === targetId)?.metrics?.[metricKey];
-    const value = Number(source?.value);
+      : row?.metrics?.[metricKey];
+    if (source?.value == null) return null;
+    const value = Number(source.value);
     return Number.isFinite(value) ? this.roundMetric(value) : null;
   }
-
-  private async findPlanFactGroup(name: string) {
-    const groups = await this.prisma.crmGroup.findMany({ select: { id: true, name: true } });
-    const normalized = this.normalizeName(name);
-    return groups.find((group) => this.normalizeName(group.name) === normalized) ?? null;
-  }
-
-  private async resolvePlanFactFieldExternalId(name: string) {
-    const fields = await this.prisma.customFieldDefinition.findMany({
-      where: { entityType: 'LEAD' as any, isVisible: true },
-      select: { externalId: true, name: true },
-    });
-    const normalized = this.normalizeName(name);
-    return fields.find((field) => this.normalizeName(field.name) === normalized)?.externalId ??
-      fields.find((field) => this.normalizeName(field.name).includes(normalized))?.externalId ??
-      null;
-  }
-
-  private resolveCsmPlanFactStages(stages: Array<{ id: string; name: string; isWon?: boolean; isLost?: boolean }>) {
-    const work = this.findStage(stages, [['взят', 'работ']]);
-    const offer = this.findStage(stages, [['сделано', 'предлож'], ['кп']]);
-    const invoice = this.findStage(stages, [['счет', 'отправ'], ['счёт', 'отправ']]);
-    const paid = this.findStage(stages, [['счет', 'оплачен'], ['счёт', 'оплачен'], ['оплачен']]) ?? this.findPaidStage(stages);
-    if (!work || !offer || !invoice || !paid) return null;
-    return { work, offer, invoice, paid };
-  }
-
-  private findStage(
-    stages: Array<{ id: string; name: string; isWon?: boolean; isLost?: boolean }>,
-    alternatives: string[][],
-  ) {
-    return stages.find((stage) => alternatives.some((needles) => this.nameIncludesAll(stage.name, needles))) ?? null;
-  }
-
-  private findPaidStage(stages: Array<{ id: string; name: string; isWon?: boolean; isLost?: boolean }>) {
-    return stages.find((stage) => {
-      const name = this.normalizeName(stage.name);
-      if (name.includes('not fully paid')) return false;
-      return name.includes('оплат') || name === 'paid' || name === 'paid!' || Boolean(stage.isWon);
-    }) ?? null;
-  }
-
   private nameIncludesAll(value: string, needles: string[]) {
     const normalized = this.normalizeName(value);
     return needles.every((needle) => normalized.includes(this.normalizeName(needle)));

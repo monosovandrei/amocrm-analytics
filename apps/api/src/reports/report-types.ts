@@ -58,6 +58,7 @@ export interface DataContractMetric {
   legacyStageIds?: string[];
   legacyStageBefore?: string;
   stageEntryMode?: 'first_ever_deal' | 'event';
+  excludeGroupIds?: string[];
   fieldId?: string;
   fieldOperator?: 'equals' | 'contains' | 'is_set' | 'lt' | 'lte' | 'gt' | 'gte';
   fieldValue?: unknown;
@@ -139,6 +140,7 @@ export interface DataContractDuration {
 export interface DataContractConfig {
   entity?: 'deal' | 'task';
   groupBy?: 'manager' | 'group' | 'none';
+  emptyManagerGroupIds?: string[];
   metrics?: DataContractMetric[];
   conversions?: DataContractConversion[];
   durations?: DataContractDuration[];

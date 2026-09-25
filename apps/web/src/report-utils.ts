@@ -9,6 +9,7 @@
   ReportTemplate,
   SourceType,
 } from './report-types';
+import { moscowPresetPeriod } from './report-period';
 export function buildReportPayload(
   draft: ReportDraft,
   workspaceFilters: ReportFilters,
@@ -183,46 +184,11 @@ function resolveReportPeriod(filters: ReportFilters): ReportFilters {
   }
 
   if (filters.periodMode === 'preset' && filters.periodPreset) {
-    const { from, to } = presetPeriod(filters.periodPreset);
+    const { from, to } = moscowPresetPeriod(filters.periodPreset);
     return { ...filters, dateFrom: from.toISOString(), dateTo: to.toISOString() };
   }
 
   return filters;
-}
-
-function presetPeriod(preset: NonNullable<ReportFilters['periodPreset']>) {
-  const now = new Date();
-  const startOfDay = (date: Date) => new Date(date.getFullYear(), date.getMonth(), date.getDate());
-  const endOfDay = (date: Date) => new Date(date.getFullYear(), date.getMonth(), date.getDate(), 23, 59, 59, 999);
-  const day = now.getDay() || 7;
-
-  if (preset === 'today') return { from: startOfDay(now), to: endOfDay(now) };
-  if (preset === 'yesterday') {
-    const date = new Date(now);
-    date.setDate(date.getDate() - 1);
-    return { from: startOfDay(date), to: endOfDay(date) };
-  }
-  if (preset === 'this_week') {
-    const from = startOfDay(now);
-    from.setDate(from.getDate() - day + 1);
-    return { from, to: endOfDay(now) };
-  }
-  if (preset === 'last_week') {
-    const from = startOfDay(now);
-    from.setDate(from.getDate() - day - 6);
-    const to = endOfDay(from);
-    to.setDate(to.getDate() + 6);
-    return { from, to };
-  }
-  if (preset === 'last_month') {
-    const from = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-    const to = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59, 999);
-    return { from, to };
-  }
-  return {
-    from: new Date(now.getFullYear(), now.getMonth(), 1),
-    to: endOfDay(now),
-  };
 }
 
 export function buildQueryFromTemplate(template: ReportTemplate, workspaceFilters: ReportFilters) {
