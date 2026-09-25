@@ -138,6 +138,7 @@ async function main() {
   const apiRoot = path.join(root, 'apps', 'api');
   const load = createRequire(path.join(apiRoot, 'package.json'));
   process.chdir(apiRoot);
+  load('dotenv').config({ path: path.join(root, '.env'), override: true, quiet: true });
   process.env.WORKER_ROLE = 'verification';
   process.env.PROCESS_ROLE = 'verification';
   load('reflect-metadata');

@@ -69,6 +69,9 @@ async function main() {
   const templatesOnly = process.argv.includes('--templates-only');
   const load = createRequire(path.join(apiRoot, 'package.json'));
   process.chdir(apiRoot);
+  // Release constants are evaluated while importing AppModule, before Nest's
+  // ConfigModule initializes. Rollback must load the previous release's values.
+  load('dotenv').config({ path: path.join(root, '.env'), override: true, quiet: true });
   process.env.WORKER_ROLE = 'verification';
   process.env.PROCESS_ROLE = 'verification';
   load('reflect-metadata');
