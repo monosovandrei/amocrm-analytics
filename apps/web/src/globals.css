@@ -613,10 +613,13 @@ button:disabled {
 
 .plan-fact-report-group {
   display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr);
   gap: 12px;
 }
 
 .plan-fact-table-wrap {
+  min-width: 0;
   max-width: 100%;
   overflow-x: auto;
   border: 1px solid var(--pb-border);
@@ -3355,5 +3358,29 @@ button:disabled {
 
   .report-matrix {
     min-width: 520px;
+    table-layout: auto;
+  }
+
+  .report-matrix th:not(:first-child),
+  .report-matrix td {
+    min-width: 128px;
+  }
+
+  .report-matrix th:first-child {
+    min-width: 144px;
+    width: 144px;
+    max-width: 144px;
+  }
+
+  .report-matrix thead th {
+    word-break: normal;
+  }
+
+  .plan-fact-report-group > .dashboard-section-header {
+    flex-wrap: wrap;
+  }
+
+  .plan-fact-report-group > .dashboard-section-header .dashboard-section-count {
+    white-space: normal;
   }
 }
