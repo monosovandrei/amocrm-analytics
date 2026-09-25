@@ -3743,8 +3743,7 @@ function planFactSaveLabel(state: 'dirty' | 'saving' | 'saved' | 'error') {
 }
 
 function currentMonthInput() {
-  const date = new Date();
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+  return moscowPresetDateInputs('this_month').dateFrom.slice(0, 7);
 }
 
 type RopFilterOption = {
