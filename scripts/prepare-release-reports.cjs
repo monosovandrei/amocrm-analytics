@@ -44,6 +44,18 @@ function warmupJobs(templates, windows) {
   ]);
 }
 
+async function waitForCertification(quality, buildId, metricVersion, options = {}) {
+  const now = options.now || Date.now;
+  const sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const deadline = now() + (options.timeoutMs ?? 180_000);
+  do {
+    const status = await quality.status();
+    if (status.overall === 'CERTIFIED' && status.buildId === buildId && status.metricVersion === metricVersion) return;
+    if (now() >= deadline) throw new Error('Current release data did not become certified within the startup window');
+    await sleep(2000);
+  } while (true);
+}
+
 function selfTest() {
   const windows = moscowWindows(new Date('2026-09-24T22:15:00Z'));
   assert.equal(windows[0].dateFrom, '2026-08-31T21:00:00.000Z');
@@ -79,6 +91,7 @@ async function main() {
   const { AppModule } = load('./dist/app.module');
   const { PrismaService } = load('./dist/prisma/prisma.service');
   const { ReportsService } = load('./dist/reports/reports.service');
+  const { DataQualityService } = load('./dist/quality/data-quality.service');
   const { RELEASE_BUILD_ID, METRIC_VERSION } = load('./dist/quality/release-info');
   const app = await NestFactory.createApplicationContext(AppModule, { logger: false });
   try {
@@ -93,6 +106,11 @@ async function main() {
     process.stdout.write(JSON.stringify({ step: 'templates', status: 'ready', count: templates.length,
       buildId: RELEASE_BUILD_ID, metricVersion: METRIC_VERSION }) + '\n');
     if (templatesOnly) return;
+    // Readiness checks process health; certification runs on its own schedule.
+    // A previous release's certificate or a transient sync must not pass the gate.
+    process.stdout.write(JSON.stringify({ step: 'certification', status: 'waiting', buildId: RELEASE_BUILD_ID }) + '\n');
+    const quality = app.get(DataQualityService);
+    await waitForCertification(quality, RELEASE_BUILD_ID, METRIC_VERSION);
     for (const key of ['sales_funnel_steps', 'csm_funnel', 'revenue_profit_forecast']) {
       if (!templates.some((template) => template.config.builtinKey === key)) throw new Error(`Missing required template: ${key}`);
     }
@@ -104,12 +122,21 @@ async function main() {
       const started = Date.now();
       const user = { ...admin, role: job.role };
       const [dto] = await reports.normalizeBuiltinRequests([reportDto(job.template, job.window)]);
+      await waitForCertification(quality, RELEASE_BUILD_ID, METRIC_VERSION);
       const report = await reports.compute(dto, user);
       if (!report?.type || report.type === 'pending' || report.ready === false) throw new Error(`Report is unavailable: ${job.template.name}`);
-      const snapshot = await prisma.reportSnapshot.findUnique({
+      const findSnapshot = () => prisma.reportSnapshot.findUnique({
         where: { cacheKey: reports.reportCacheKey(dto, user) },
         select: { payload: true, qualityStatus: true },
       });
+      let snapshot = await findSnapshot();
+      if (snapshot?.payload?.type && snapshot.qualityStatus === 'CHECKING') {
+        // A scheduled source check can run during computation. Retry once after
+        // it certifies; never relabel an unchecked payload as certified.
+        await waitForCertification(quality, RELEASE_BUILD_ID, METRIC_VERSION);
+        await reports.compute(dto, user);
+        snapshot = await findSnapshot();
+      }
       if (!snapshot?.payload?.type || snapshot.payload.type === 'pending' || snapshot.qualityStatus !== 'CERTIFIED') {
         throw new Error(`Snapshot was not certified: ${job.template.name}`);
       }
@@ -128,4 +155,4 @@ if (require.main === module) main().catch((error) => {
   process.exitCode = 1;
 });
 
-module.exports = { moscowWindows, reportDto, warmupJobs };
+module.exports = { moscowWindows, reportDto, warmupJobs, waitForCertification };
