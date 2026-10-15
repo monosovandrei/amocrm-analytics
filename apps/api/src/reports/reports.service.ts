@@ -1695,7 +1695,9 @@ export class ReportsService {
     const templates = await this.db.reportTemplate.findMany({ where: { name: { startsWith: prefix } } });
     for (const template of templates) {
       const config = template.config as ReportConfig;
-      if (prefix === 'Sales:' && config.builtinKey?.startsWith('sales_')) continue;
+      // Built-ins already have canonical scopes; legacy prefix migrations must
+      // not silently reintroduce current-team filters into historical funnels.
+      if (BUILTIN_REPORT_KEYS.has(String(config.builtinKey ?? ''))) continue;
       const nextConfig: ReportConfig = {
         ...config,
         filters: {

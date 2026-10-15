@@ -79,13 +79,13 @@ describe('shared section metrics', () => {
     expect(await (service as any).applyMetricDealFilters([salesDeal, csmDeal, ungroupedDeal], assemblyMetrics[0])).toEqual([salesDeal, ungroupedDeal]);
   });
 
-  it('does not reapply Sales group scope to built-ins but preserves custom report behavior', async () => {
+  it.each([['Sales:', 'sales_funnel_steps'], ['CSM:', 'csm_funnel']])('does not reapply %s group scope to built-ins but preserves custom reports', async (prefix, builtinKey) => {
     const { service, db } = fixture();
-    const builtin = { id: 'builtin', config: { builtinKey: 'sales_funnel_steps', filters: { pipelineIds: ['sales-pipe'] } } };
+    const builtin = { id: 'builtin', config: { builtinKey, filters: { pipelineIds: ['sales-pipe'] } } };
     const custom = { id: 'custom', config: { filters: {} } };
     const templates = { findMany: jest.fn().mockResolvedValue([builtin, custom]), update: jest.fn() };
     (db as any).reportTemplate = templates;
-    await (service as any).applyTeamScopeToTemplates('Sales:', 'sales', ['sales-pipe'], true);
+    await (service as any).applyTeamScopeToTemplates(prefix, 'sales', ['sales-pipe'], true);
     expect(templates.update).toHaveBeenCalledTimes(1);
     expect(templates.update).toHaveBeenCalledWith(expect.objectContaining({ where: { id: 'custom' }, data: { config: expect.objectContaining({ filters: { pipelineIds: ['sales-pipe'], groupIds: ['sales'] } }) } }));
   });
