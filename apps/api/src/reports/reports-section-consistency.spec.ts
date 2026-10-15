@@ -38,7 +38,7 @@ describe('shared section metrics', () => {
     });
   });
 
-  it('uses first-ever current-owner deals for every CSM count and payment amount', async () => {
+  it('uses source amoCRM events for every CSM count and payment amount without excluding other executors', async () => {
     const { service } = fixture();
     const csmStages = {
       work: stage('work'), offer: stage('offer'), invoice: stage('invoice'),
@@ -49,10 +49,10 @@ describe('shared section metrics', () => {
       assemblyPipeline: { id: 'assembly' }, assemblyStages: [], baseStages: csmStages, assignedStages: csmStages,
     });
     const definition = await service.getTeamFunnelDefinition('csm');
-    expect(definition!.filters).toEqual({ pipelineIds: ['base', 'assigned'], groupIds: ['csm'] });
+    expect(definition!.filters).toEqual({ pipelineIds: ['base', 'assigned'] });
     const metrics = definition!.config.contract!.metrics!.filter((metric) => metric.type === 'stage_reached');
     expect(metrics.map((metric) => metric.id)).toEqual(['taken_to_work', 'offer_made', 'invoice_sent', 'paid', 'paid_amount']);
-    expect(metrics.every((metric) => metric.stageEntryMode === 'first_ever_deal')).toBe(true);
+    expect(metrics.every((metric) => metric.stageEntryMode === 'amo_event')).toBe(true);
     expect(metrics.find((metric) => metric.id === 'paid')!.stageIds).toEqual(metrics.find((metric) => metric.id === 'paid_amount')!.stageIds);
   });
 
@@ -65,6 +65,10 @@ describe('shared section metrics', () => {
     jest.spyOn(service as any, 'resolveLeadFieldExternalId').mockResolvedValue('marketing');
     const templates = await (service as any).buildSalesReportTemplates();
     expect(templates.every((template: any) => !template.config.filters.groupIds)).toBe(true);
+    const funnel = templates.find((template: any) => template.config.builtinKey === 'sales_funnel_steps').config.contract.metrics;
+    expect(funnel.filter((metric: any) => metric.type === 'stage_reached').every((metric: any) => metric.stageEntryMode === 'amo_event')).toBe(true);
+    expect(funnel.find((metric: any) => metric.id === 'paid').includeSystemStageEvents).toBe(false);
+    expect(funnel.find((metric: any) => metric.id === 'payment_amount').includeSystemStageEvents).toBe(false);
     const assemblyMetrics = templates.find((template: any) => template.config.builtinKey === 'sales_weighted_funnel')
       .config.contract.metrics.filter((metric: any) => ['count_assembly', 'sum_assembly'].includes(metric.id));
     expect(assemblyMetrics).toHaveLength(2);

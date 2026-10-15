@@ -32,14 +32,16 @@ describe('AmoSyncService full snapshot safeguards', () => {
     expect(service.pullResumeStage({ startedAt: null, cursor: { step: 'events' } })).toBeNull();
   });
 
-  it('bounds a stale reconciliation cursor by the configured recent lookback', () => {
+  it('preserves an old reconciliation cursor instead of losing the outage interval', () => {
     const service = createService({});
     const startedAt = new Date('2026-09-02T13:00:00.000Z');
 
     expect(service.recentReconcileFrom(startedAt, new Date('2026-08-20T10:00:00.000Z')))
-      .toEqual(new Date('2026-09-02T12:30:00.000Z'));
+      .toEqual(new Date('2026-08-20T09:58:00.000Z'));
     expect(service.recentReconcileFrom(startedAt, new Date('2026-09-02T12:50:00.000Z')))
       .toEqual(new Date('2026-09-02T12:48:00.000Z'));
+    expect(service.recentReconcileFrom(startedAt, null)).toEqual(new Date('2026-09-02T12:30:00.000Z'));
+    expect(() => service.recentReconcileFrom(startedAt, new Date('2026-09-02T13:01:00.000Z'))).toThrow('future');
   });
 
   it('restores the exact event stream and time window from a saved cursor', () => {
@@ -49,6 +51,24 @@ describe('AmoSyncService full snapshot safeguards', () => {
       .toEqual({ streamIndex: 2, windowFrom: 1785150546 });
     expect(service.eventResumePosition({ step: 'events:window:1785150546:page:41' }))
       .toEqual({ streamIndex: 0, windowFrom: 1785150546 });
+  });
+
+  it.each([30, 1])('catches up a gap with a %s-minute window even when the overlap is larger', async (lookback) => {
+    const cursor = new Date(Date.now() - 3 * 60 * 60_000);
+    const service = createService({});
+    service.amo = { getActiveConnectionOrFail: jest.fn().mockResolvedValue({ id: 'connection', lastFullSyncAt: cursor,
+      config: { recentReconcileAt: cursor.toISOString() } }), getClient: jest.fn().mockResolvedValue({}) };
+    service.hydrateMetadataMaps = jest.fn(); service.syncRecentDeals = jest.fn(); service.syncRecentStageEvents = jest.fn();
+    service.refreshRecentFactMarts = jest.fn(); service.updateConnectionConfig = jest.fn(); service.compactHeapAfterHeavySync = jest.fn();
+    service.getRecentReconcileLookbackMinutes = jest.fn().mockReturnValue(lookback);
+    const result = await service.reconcileRecentChanges();
+    expect(result.from).toEqual(new Date(cursor.getTime() - 2 * 60_000));
+    expect(result.through).toEqual(new Date(cursor.getTime() + lookback * 60_000));
+    const from = Math.floor(result.from.getTime() / 1000), through = Math.floor(result.through.getTime() / 1000);
+    expect(service.syncRecentDeals).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.anything(), from, through);
+    expect(service.syncRecentStageEvents).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.anything(), from, through);
+    expect(service.updateConnectionConfig).toHaveBeenCalledWith('connection', expect.objectContaining({ recentReconcileAt: result.through.toISOString() }),
+      expect.objectContaining({ lastReconcileAt: result.through }));
   });
 
   it('streams events into storage and deduplicates repeated event categories', async () => {

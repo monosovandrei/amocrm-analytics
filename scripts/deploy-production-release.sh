@@ -9,7 +9,7 @@ BACKUPS_DIR="${BACKUPS_DIR:-/opt/analytics-backups}"
 KEEP_RELEASES="${KEEP_RELEASES:-5}"
 READY_URL="${READY_URL:-http://127.0.0.1:4000/api/v1/health/ready}"
 HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:4000/api/v1/health}"
-METRIC_VERSION_VALUE="${METRIC_VERSION:-2026-09-25.1}"
+METRIC_VERSION_VALUE="${METRIC_VERSION:-2026-10-15.1}"
 
 SERVICES=(
   analytics-tcp-mtu.service
@@ -185,8 +185,11 @@ cat "$HEALTH_SUMMARY"
 
 # A healthy process is not enough: publish current definitions, warm the usual
 # periods, then compare sections on one read-only database snapshot.
+SOURCE_AUDIT_TO="$(node -e 'process.stdout.write(new Date(Date.now() - 120000).toISOString())')"
 if ! node --expose-gc "$RELEASE/scripts/prepare-release-reports.cjs" || \
-   ! node --expose-gc "$RELEASE/scripts/verify-section-consistency.cjs" --roles=ADMIN,ROP; then
+   ! node --expose-gc "$RELEASE/scripts/verify-section-consistency.cjs" --roles=ADMIN,ROP || \
+   ! (umask 077; node --expose-gc "$RELEASE/scripts/audit-amo-report-funnels.cjs" --live --verify "--to=$SOURCE_AUDIT_TO" \
+     > "$BACKUPS_DIR/source-audit-$COMMIT-$STAMP.json"); then
   echo "Release report consistency gate failed; restoring previous application release" >&2
   if restore_previous_release; then
     # Templates are shared database rows, so restore their previous definitions too.
@@ -196,6 +199,7 @@ if ! node --expose-gc "$RELEASE/scripts/prepare-release-reports.cjs" || \
   fi
   exit 1
 fi
+echo "Source amoCRM audit passed: $BACKUPS_DIR/source-audit-$COMMIT-$STAMP.json"
 
 RELEASES_ROOT="$(readlink -f "$RELEASES_DIR")"
 CURRENT_RELEASE="$(readlink -f "$LIVE_LINK")"

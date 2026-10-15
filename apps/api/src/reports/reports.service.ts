@@ -1059,6 +1059,7 @@ export class ReportsService {
       display,
       pipelineId,
       stageIds,
+      stageEntryMode: 'amo_event',
     });
     const currentStageMetric = (
       id: string,
@@ -1115,8 +1116,8 @@ export class ReportsService {
       conversionMetric('conv_kp_presented_to_invoice', 'Конверсия КП презентовано -> счёт', 'kp_presented', 'invoice_sent'),
       stageMetric('invoice_sent', 'Счета выставили', [refs.stages.invoice.id]),
       conversionMetric('conv_invoice_to_paid', 'Конверсия счёт -> оплата', 'invoice_sent', 'paid'),
-      stageMetric('paid', 'Оплаты получили', refs.stages.success.map((stage) => stage.id)),
-      stageMetric('payment_amount', 'Сумма оплат', refs.stages.success.map((stage) => stage.id), 'money', 'field_sum'),
+      { ...stageMetric('paid', 'Оплаты получили', refs.stages.success.map((stage) => stage.id)), includeSystemStageEvents: false },
+      { ...stageMetric('payment_amount', 'Сумма оплат', refs.stages.success.map((stage) => stage.id), 'money', 'field_sum'), includeSystemStageEvents: false },
       {
         id: 'avg_check',
         type: 'formula',
@@ -1320,7 +1321,7 @@ export class ReportsService {
       display: 'number',
       pipelineId,
       stageIds,
-      stageEntryMode: 'first_ever_deal',
+      stageEntryMode: 'amo_event',
     });
     const conversion = (id: string, label: string, fromMetricId: string, toMetricId: string): DataContractMetric => ({
       id,
@@ -1363,7 +1364,7 @@ export class ReportsService {
         display: 'money',
         pipelineId: csmPipelines[0],
         stageIds: csmSuccessStageIds,
-        stageEntryMode: 'first_ever_deal',
+        stageEntryMode: 'amo_event',
       },
     ];
     const weightedMetrics: DataContractMetric[] = [
@@ -1499,8 +1500,8 @@ export class ReportsService {
           metric: 'contract',
           display: 'table',
           description: 'Взяли в работу, КП, счета, оплаты и конверсии по CSM',
-          conditionLabel: 'База + Закрепленные компании: переходы по этапам и конверсии',
-          filters: { pipelineIds: csmPipelines, groupIds: [refs.csmGroup.id] },
+          conditionLabel: 'База + Закрепленные компании: действия amoCRM за период, по исполнителю',
+          filters: { pipelineIds: csmPipelines },
           contract,
           size: 'lg',
         }),
@@ -2409,8 +2410,14 @@ ${sheets}
     if (metric.type === 'stage_reached') {
       const stageIds = metric.stageIds?.filter(Boolean) ?? [];
       if (stageIds.length === 0) return [];
-      if (metric.stageEntryMode === 'event') {
-        return applyMetricFilters(await this.findStageEventDeals(stageIds, filters, role, metric.fromStageId));
+      if (metric.stageEntryMode === 'event' || metric.stageEntryMode === 'amo_event') {
+        const eventOptions = { amoEvent: metric.stageEntryMode === 'amo_event', includeSystem: metric.includeSystemStageEvents !== false };
+        const deals = await this.findStageEventDeals(stageIds, filters, role, metric.fromStageId, eventOptions);
+        const legacyFilters = this.legacyStageFilters(metric, filters);
+        if (legacyFilters && metric.legacyStageIds?.length) {
+          deals.push(...await this.findStageEventDeals(metric.legacyStageIds, legacyFilters, role, metric.fromStageId, eventOptions));
+        }
+        return applyMetricFilters(deals);
       }
       const dealIds = new Set(await this.findDealIdsFromHistoryMany(stageIds, filters, role, metric.fromStageId));
       const legacyFilters = this.legacyStageFilters(metric, filters);
@@ -5284,6 +5291,7 @@ ${sheets}
     filters: ReportFilters,
     role: UserRole,
     fromStageId?: string,
+    options: { amoEvent?: boolean; includeSystem?: boolean } = {},
   ) {
     const targetStages = await this.prisma.pipelineStage.findMany({
       where: { id: { in: stageIds } },
@@ -5294,11 +5302,19 @@ ${sheets}
     });
     if (!targetStages.length) return [];
 
-    const managerIds = await this.visibleManagerIds(role, filters.groupIds);
+    const managerIds = await this.visibleManagerIds(role, filters.groupIds, options.amoEvent);
     const allowedManagerIds = filters.managerIds?.length
       ? filters.managerIds.filter((id) => managerIds.includes(id))
       : managerIds;
-    if (!allowedManagerIds.length) return [];
+    const includeUnknownActors = options.amoEvent && !filters.managerIds?.length && !filters.groupIds?.length;
+    if (!allowedManagerIds.length && !includeUnknownActors) return [];
+
+    const actorId = options.amoEvent
+      ? Prisma.sql`COALESCE(event_manager."id", CASE WHEN event."raw"->>'created_by' = '0'
+          THEN 'amo-automation' ELSE 'amo-user:' || COALESCE(event."raw"->>'created_by', 'unknown') END)`
+      : Prisma.sql`COALESCE(event_manager."id", deal."responsible_id")`;
+    const managerScope = allowedManagerIds.length
+      ? Prisma.sql`${actorId} IN (${Prisma.join(allowedManagerIds)})` : Prisma.sql`FALSE`;
 
     const afterStatusId = Prisma.sql`COALESCE(
       event."valueAfter"->0->'lead_status'->>'id',
@@ -5322,10 +5338,11 @@ ${sheets}
     const where: Prisma.Sql[] = [
       Prisma.sql`event."type" = 'lead_status_changed'`,
       Prisma.sql`event."dealId" IS NOT NULL`,
-      Prisma.sql`deal."deleted_at" IS NULL`,
-      Prisma.sql`COALESCE(event_manager."id", deal."responsible_id") IN (${Prisma.join(allowedManagerIds)})`,
+      includeUnknownActors ? Prisma.sql`(${managerScope} OR event_manager."id" IS NULL)` : managerScope,
       Prisma.sql`(${Prisma.join(stageConditions, ' OR ')})`,
     ];
+    if (!options.amoEvent) where.push(Prisma.sql`deal."deleted_at" IS NULL`);
+    if (options.amoEvent && options.includeSystem === false) where.push(Prisma.sql`event."raw"->>'created_by' <> '0'`);
     if (range?.gte) where.push(Prisma.sql`event."createdAt" >= ${range.gte}`);
     if (range?.lte) where.push(Prisma.sql`event."createdAt" <= ${range.lte}`);
     if (filters.lossReasonIds?.length) {
@@ -5381,10 +5398,12 @@ ${sheets}
         event."id" AS "occurrenceId",
         event."dealId" AS "dealId",
         event."createdAt" AS "occurredAt",
-        COALESCE(event_manager."id", deal."responsible_id") AS "responsibleId",
-        COALESCE(event_manager."name", deal."responsible_name") AS "responsibleName",
-        COALESCE(event_group."id", deal."group_id") AS "groupId",
-        COALESCE(event_group."name", deal."group_name") AS "groupName"
+        ${actorId} AS "responsibleId",
+        ${options.amoEvent ? Prisma.sql`COALESCE(event_manager."name", CASE WHEN event."raw"->>'created_by' = '0'
+          THEN 'Автоматизация amoCRM' ELSE 'Неизвестный исполнитель amoCRM' END)`
+          : Prisma.sql`COALESCE(event_manager."name", deal."responsible_name")`} AS "responsibleName",
+        ${options.amoEvent ? Prisma.sql`event_group."id"` : Prisma.sql`COALESCE(event_group."id", deal."group_id")`} AS "groupId",
+        ${options.amoEvent ? Prisma.sql`event_group."name"` : Prisma.sql`COALESCE(event_group."name", deal."group_name")`} AS "groupName"
       FROM "CrmEvent" event
       JOIN "fact_deal_current" deal ON deal."deal_id" = event."dealId"
       LEFT JOIN "CrmUser" event_manager
@@ -5395,7 +5414,7 @@ ${sheets}
     `;
     if (!occurrences.length) return [];
 
-    const deals = await this.findDealsByIds([...new Set(occurrences.map((item) => item.dealId))]);
+    const deals = await this.findDealsByIds([...new Set(occurrences.map((item) => item.dealId))], options.amoEvent);
     const dealById = new Map(deals.map((deal) => [deal.id, deal]));
     return occurrences.flatMap((occurrence) => {
       const deal = dealById.get(occurrence.dealId);
@@ -5482,10 +5501,10 @@ ${sheets}
     return firstEntries.filter((entry) => !repeatedDealIds.has(entry.dealId)).map((entry) => entry.dealId);
   }
 
-  private async findDealsByIds(dealIds: string[]) {
+  private async findDealsByIds(dealIds: string[], includeDeleted = false) {
     if (dealIds.length === 0) return [];
     const rows = await this.prisma.factDealCurrent.findMany({
-      where: { dealId: { in: dealIds }, deletedAt: null },
+      where: { dealId: { in: dealIds }, ...(includeDeleted ? {} : { deletedAt: null }) },
       orderBy: { updatedAt: 'desc' },
     });
     return rows.map((deal) => this.factDealToReportDeal(deal));
@@ -5790,13 +5809,13 @@ ${sheets}
     return where;
   }
 
-  private async visibleManagerIds(role: UserRole, groupIds?: string[]) {
-    const managers = await this.visibleManagers(role, groupIds);
+  private async visibleManagerIds(role: UserRole, groupIds?: string[], includeInactive = false) {
+    const managers = await this.visibleManagers(role, groupIds, undefined, includeInactive);
     return managers.map((manager) => manager.id);
   }
 
-  private async visibleManagers(role: UserRole, groupIds?: string[], managerIds?: string[]) {
-    const where: Record<string, any> = { isActive: true };
+  private async visibleManagers(role: UserRole, groupIds?: string[], managerIds?: string[], includeInactive = false) {
+    const where: Record<string, any> = includeInactive ? {} : { isActive: true };
     if (role === 'ROP') where.isVisible = true;
     if (groupIds?.length) where.groupId = { in: groupIds };
     if (managerIds?.length) where.id = { in: managerIds };

@@ -433,19 +433,21 @@ export class AmoSyncService {
     const connectionConfig = this.connectionConfig(connection);
     const previousCursor = this.parseConfigDate(connectionConfig.recentReconcileAt);
     const syncFrom = this.recentReconcileFrom(startedAt, previousCursor);
+    const syncThrough = new Date(Math.min(startedAt.getTime(), (previousCursor ?? syncFrom).getTime() + this.getRecentReconcileLookbackMinutes() * 60_000));
     const updatedSince = Math.floor(syncFrom.getTime() / 1000);
+    const updatedThrough = Math.floor(syncThrough.getTime() / 1000);
     const stats: Record<string, number> = {};
 
     try {
       const client = await this.amo.getClient(connection);
       const maps = this.emptyMaps();
       await this.hydrateMetadataMaps(maps);
-      await this.syncRecentDeals(client, maps, stats, updatedSince);
-      await this.syncRecentStageEvents(client, maps, stats, updatedSince);
+      await this.syncRecentDeals(client, maps, stats, updatedSince, updatedThrough);
+      await this.syncRecentStageEvents(client, maps, stats, updatedSince, updatedThrough);
       await this.refreshRecentFactMarts(stats);
 
       await this.updateConnectionConfig(connection.id, {
-        recentReconcileAt: startedAt.toISOString(),
+        recentReconcileAt: syncThrough.toISOString(),
         recentReconcileFrom: syncFrom.toISOString(),
         recentReconcileStats: stats,
         recentReconcileError: null,
@@ -453,10 +455,10 @@ export class AmoSyncService {
       }, {
         status: 'ACTIVE',
         lastError: null,
-        lastReconcileAt: startedAt,
+        lastReconcileAt: syncThrough,
       });
 
-      return { status: 'ok', from: syncFrom, stats };
+      return { status: 'ok', from: syncFrom, through: syncThrough, stats };
     } catch (error: any) {
       await this.updateConnectionConfig(connection.id, {
         recentReconcileError: String(error?.message ?? error),
@@ -1120,9 +1122,10 @@ export class AmoSyncService {
   private recentReconcileFrom(startedAt: Date, previousCursor: Date | null) {
     const lookbackMs = this.getRecentReconcileLookbackMinutes() * 60_000;
     const overlapMs = this.getRecentReconcileOverlapMinutes() * 60_000;
-    const earliestAllowed = startedAt.getTime() - lookbackMs;
-    const requestedFrom = previousCursor ? previousCursor.getTime() - overlapMs : earliestAllowed;
-    return new Date(Math.max(earliestAllowed, requestedFrom));
+    if (previousCursor && previousCursor > startedAt) throw new Error('amoCRM reconciliation cursor is in the future');
+    // A long outage must be caught up in bounded windows, never skipped by
+    // moving the lower bound forward to the latest lookback window.
+    return new Date(previousCursor ? previousCursor.getTime() - overlapMs : startedAt.getTime() - lookbackMs);
   }
 
   private pullResumeStage(job: SyncJobWithConnection): PullStage | null {
@@ -2259,12 +2262,14 @@ export class AmoSyncService {
     maps: AmoSyncMaps,
     stats: Record<string, number>,
     updatedSince: number,
+    updatedThrough?: number,
   ) {
     const maxDeals = this.getRecentReconcileMaxDeals();
     const pageLimit = Math.min(250, maxDeals);
     const params: Record<string, string | number> = {
       with: 'contacts,catalog_elements,loss_reason',
       'filter[updated_at][from]': updatedSince,
+      ...(updatedThrough === undefined ? {} : { 'filter[updated_at][to]': updatedThrough }),
     };
     let page = 1;
     let totalDeals = 0;
@@ -2309,11 +2314,13 @@ export class AmoSyncService {
     maps: AmoSyncMaps,
     stats: Record<string, number>,
     updatedSince: number,
+    updatedThrough?: number,
   ) {
     const maxEvents = this.getRecentReconcileMaxEvents();
     const pageLimit = Math.min(100, maxEvents);
     const params: Record<string, string | number> = {
       'filter[created_at][from]': updatedSince,
+      ...(updatedThrough === undefined ? {} : { 'filter[created_at][to]': updatedThrough }),
       'filter[type]': 'lead_status_changed',
     };
     const eventsById = new Map<string, any>();

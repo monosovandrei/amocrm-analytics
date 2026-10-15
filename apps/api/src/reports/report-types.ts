@@ -57,7 +57,8 @@ export interface DataContractMetric {
   stageIds?: string[];
   legacyStageIds?: string[];
   legacyStageBefore?: string;
-  stageEntryMode?: 'first_ever_deal' | 'event';
+  stageEntryMode?: 'first_ever_deal' | 'event' | 'amo_event';
+  includeSystemStageEvents?: boolean;
   excludeGroupIds?: string[];
   fieldId?: string;
   fieldOperator?: 'equals' | 'contains' | 'is_set' | 'lt' | 'lte' | 'gt' | 'gte';
