@@ -31,7 +31,7 @@ require() {
   }
 }
 
-for command_name in git rsync npm node curl systemctl install pg_dump; do
+for command_name in git rsync npm node curl systemctl systemd-run install pg_dump; do
   require "$command_name"
 done
 
@@ -72,7 +72,9 @@ cd "$RELEASE"
 npm ci
 npm run db:generate
 npm run typecheck
-npm test
+systemd-run --scope --quiet --unit="analytics-test-$COMMIT-$STAMP" \
+  -p MemoryHigh=1400M -p MemoryMax=1800M -p MemorySwapMax=0 -p CPUWeight=20 \
+  env NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=1024" npm test
 npm run frontend:gate
 npm run build
 
@@ -185,10 +187,17 @@ cat "$HEALTH_SUMMARY"
 
 # A healthy process is not enough: publish current definitions, warm the usual
 # periods, then compare sections on one read-only database snapshot.
+run_report_verification() {
+  local check_name="$1"
+  shift
+  systemd-run --scope --quiet --unit="analytics-verify-$check_name-$COMMIT-$STAMP" \
+    -p MemoryHigh=1024M -p MemoryMax=1280M -p MemorySwapMax=0 -p CPUWeight=20 \
+    node --expose-gc --max-old-space-size=512 "$@"
+}
 SOURCE_AUDIT_TO="$(node -e 'process.stdout.write(new Date(Date.now() - 120000).toISOString())')"
-if ! node --expose-gc "$RELEASE/scripts/prepare-release-reports.cjs" || \
-   ! node --expose-gc "$RELEASE/scripts/verify-section-consistency.cjs" --roles=ADMIN,ROP || \
-   ! (umask 077; node --expose-gc "$RELEASE/scripts/audit-amo-report-funnels.cjs" --live --verify "--to=$SOURCE_AUDIT_TO" \
+if ! run_report_verification prepare "$RELEASE/scripts/prepare-release-reports.cjs" || \
+   ! run_report_verification consistency "$RELEASE/scripts/verify-section-consistency.cjs" --roles=ADMIN,ROP || \
+   ! (umask 077; run_report_verification source "$RELEASE/scripts/audit-amo-report-funnels.cjs" --live --verify "--to=$SOURCE_AUDIT_TO" \
      > "$BACKUPS_DIR/source-audit-$COMMIT-$STAMP.json"); then
   echo "Release report consistency gate failed; restoring previous application release" >&2
   if restore_previous_release; then
