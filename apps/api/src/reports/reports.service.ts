@@ -1462,6 +1462,7 @@ export class ReportsService {
       entity: 'deal' as const,
       groupBy: 'manager' as const,
       metrics: funnelMetrics,
+      emptyManagerGroupIds: [refs.csmGroup.id],
       conversions: [],
       durations: [],
       includeRowTotal: false,
