@@ -3338,12 +3338,18 @@ function PlanFactTab({ refreshStamp }: { refreshStamp: number }) {
   const [dirtyCount, setDirtyCount] = useState(0);
   const dirtyKeysRef = useRef<Set<string>>(new Set());
   const reportRef = useRef<PlanFactReport | null>(null);
+  const loadRequestRef = useRef(0);
+  const loadInFlightRef = useRef(false);
 
-  const load = useCallback(async (preserveDrafts = false) => {
-    setLoading(true);
+  const load = useCallback(async (preserveDrafts = false, background = false) => {
+    if (background && loadInFlightRef.current) return;
+    const requestId = ++loadRequestRef.current;
+    loadInFlightRef.current = true;
+    if (!background) setLoading(true);
     setError('');
     try {
       const next = await api<PlanFactReport>(`/platform/plans/fact?month=${encodeURIComponent(month)}`);
+      if (requestId !== loadRequestRef.current) return;
       setReport(next);
       reportRef.current = next;
       const nextDrafts = planFactDrafts(next);
@@ -3356,9 +3362,13 @@ function PlanFactTab({ refreshStamp }: { refreshStamp: number }) {
         return merged;
       });
     } catch (err) {
+      if (requestId !== loadRequestRef.current) return;
       setError(err instanceof Error ? err.message : 'Не удалось загрузить план-факт');
     } finally {
-      setLoading(false);
+      if (requestId === loadRequestRef.current) {
+        loadInFlightRef.current = false;
+        setLoading(false);
+      }
     }
   }, [month]);
 
@@ -3374,6 +3384,14 @@ function PlanFactTab({ refreshStamp }: { refreshStamp: number }) {
     if (!reportRef.current) return;
     void load(true);
   }, [refreshStamp, load]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => void load(true, true), 20_000);
+    return () => {
+      window.clearInterval(timer);
+      loadRequestRef.current += 1;
+    };
+  }, [load]);
 
   function updatePlanDraft(key: string, value: string) {
     dirtyKeysRef.current.add(key);

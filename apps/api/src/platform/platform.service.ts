@@ -2234,7 +2234,7 @@ export class PlatformService {
       sourceType: refs.sourceType,
       filters,
       config: { ...refs.config, filters },
-    }, user);
+    }, user, { requireFresh: true });
     const mapMetrics = (source: Record<string, any> = {}) => {
       const mapped: Record<string, any> = {};
       for (const [planKey, reportKey] of Object.entries(PLAN_FACT_REPORT_METRICS[team])) {

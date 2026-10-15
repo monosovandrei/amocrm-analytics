@@ -165,7 +165,7 @@ export class ReportsService {
     @Optional() private readonly dataQuality?: DataQualityService,
   ) {}
 
-  async compute(dto: ReportQueryDto, user: { id: string; role: UserRole }) {
+  async compute(dto: ReportQueryDto, user: { id: string; role: UserRole }, options: { requireFresh?: boolean } = {}) {
     this.assertReportPeriod(dto);
     [dto] = await this.normalizeBuiltinRequests([dto]);
     const cacheKey = this.reportCacheKey(dto, user);
@@ -173,10 +173,12 @@ export class ReportsService {
     const cached = await this.getCachedReport(cacheKey);
     if (cached?.payload && cached.payload.type !== 'pending') {
       await this.assertReportAvailable(dto, cached.sourceSyncAt);
-      if (this.cacheIsStale(cached.sourceSyncAt, latestSyncAt)) {
+      const stale = this.cacheIsStale(cached.sourceSyncAt, latestSyncAt);
+      if (!stale) return cached.payload;
+      if (!options.requireFresh) {
         await this.enqueueReportCacheRefresh(cacheKey, dto, user);
+        return cached.payload;
       }
-      return cached.payload;
     }
 
     const report = await this.computeFresh(dto, user, true);

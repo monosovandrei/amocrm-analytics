@@ -88,7 +88,7 @@ describe('PlatformService plan-fact shared report definitions', () => {
       },
     }));
     expect(reports.compute).toHaveBeenCalledTimes(3);
-    for (const [request, actor] of reports.compute.mock.calls) {
+    for (const [request, actor, options] of reports.compute.mock.calls) {
       expect(request.name).toBe(refs.name);
       expect(request.sourceType).toBe(refs.sourceType);
       expect(request.config.contract).toBe(refs.config.contract);
@@ -96,6 +96,7 @@ describe('PlatformService plan-fact shared report definitions', () => {
       expect(request.filters.pipelineIds).toEqual(['pipeline-sales']);
       expect(request.filters.groupIds).toBeUndefined();
       expect(actor).toBe(user);
+      expect(options).toEqual({ requireFresh: true });
     }
     expect(reports.compute.mock.calls.map(([request]) => [request.filters.dateFrom, request.filters.dateTo])).toEqual([
       [calendar.monthStart.toISOString(), calendar.todayEnd.toISOString()],
