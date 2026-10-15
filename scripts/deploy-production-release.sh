@@ -191,7 +191,7 @@ run_report_verification() {
   local check_name="$1"
   shift
   systemd-run --scope --quiet --unit="analytics-verify-$check_name-$COMMIT-$STAMP" \
-    -p MemoryHigh=1024M -p MemoryMax=1280M -p MemorySwapMax=0 -p CPUWeight=20 \
+    -p MemoryHigh=1152M -p MemoryMax=1280M -p MemorySwapMax=0 -p CPUWeight=20 \
     node --expose-gc --max-old-space-size=512 "$@"
 }
 SOURCE_AUDIT_TO="$(node -e 'process.stdout.write(new Date(Date.now() - 120000).toISOString())')"
