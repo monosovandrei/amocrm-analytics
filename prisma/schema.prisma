@@ -142,6 +142,8 @@ model User {
   role         UserRole @default(ROP)
   businessRole PlatformBusinessRole @default(MANAGER)
   crmUserId    String?  @unique
+  departmentKey String?
+  accessVersion Int @default(1)
   isActive     Boolean  @default(true)
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
@@ -159,6 +161,49 @@ model User {
   reportSchedules  ReportSchedule[]
 
   @@index([businessRole, isActive])
+}
+
+model WorkspaceDepartment {
+  key String @id
+  name String
+  groupId String
+  pipelineIds String[]
+  paymentStageIds String[] @default([])
+  assemblyPipelineId String
+  shippingStageId String
+  updatedAt DateTime @updatedAt
+}
+
+model CommercialShipmentLink {
+  shipmentDealId String @id
+  saleDealId String?
+  managerId String?
+  departmentKey String?
+  status String @default("UNRESOLVED")
+  source String
+  effectiveAt DateTime?
+  evidence Json @default("{}")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  checkedAt DateTime @default(now())
+
+  @@index([managerId, departmentKey, status])
+  @@index([saleDealId])
+}
+
+model WorkspacePlan {
+  id String @id @default(uuid())
+  month String
+  departmentKey String
+  targetType String
+  targetId String
+  metric String
+  value Decimal
+  currency String @default("EUR")
+  version Int @default(1)
+  updatedAt DateTime @updatedAt
+
+  @@unique([month, departmentKey, targetType, targetId, metric])
 }
 
 model AmoConnection {
@@ -485,7 +530,7 @@ model Deal {
   lossReasonId    String?
   title           String
   amount          Decimal  @default(0)
-  currency        String   @default("RUB")
+  currency        String
   source          String?
   tags            String[] @default([])
   customFields    Json     @default("{}")
@@ -653,7 +698,7 @@ model FactDealCurrent {
   lossReasonName      String?  @map("loss_reason_name")
   title               String
   amount              Decimal  @default(0)
-  currency            String   @default("RUB")
+  currency            String
   source              String?
   tags                String[] @default([])
   customFields        Json     @default("{}") @map("custom_fields")

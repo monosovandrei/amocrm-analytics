@@ -1124,14 +1124,17 @@ button:disabled {
   background: var(--pb-surface-hover);
 }
 
-.table {
+.table,
+.data-table {
   width: 100%;
   border-collapse: collapse;
   table-layout: fixed;
 }
 
 .table th,
-.table td {
+.table td,
+.data-table th,
+.data-table td {
   border-bottom: 1px solid var(--pb-border);
   padding: 9px 8px;
   overflow: hidden;
@@ -1140,11 +1143,49 @@ button:disabled {
   white-space: nowrap;
 }
 
-.table th {
+.table th,
+.data-table th {
   color: var(--pb-text-secondary);
   font-size: 11px;
   font-weight: 800;
   text-transform: uppercase;
+}
+
+.data-table {
+  min-width: 1000px;
+  table-layout: auto;
+}
+
+.data-table th,
+.data-table td {
+  overflow: visible;
+  text-overflow: clip;
+}
+
+.data-table td {
+  max-width: 360px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.data-table .field {
+  min-width: 160px;
+}
+.data-table th:first-child,
+.data-table td:first-child {
+  min-width: 160px;
+  overflow-wrap: normal;
+}
+.data-table button {
+  white-space: nowrap;
+}
+.personal-plan-table {
+  min-width: 850px;
+}
+.personal-plan-table th:first-child,
+.personal-plan-table td:first-child {
+  min-width: 100px;
+  width: 100px;
 }
 
 .rop-card-header {
@@ -1842,7 +1883,7 @@ button:disabled {
 
 .report-matrix-wrap {
   max-width: 100%;
-  overflow: visible;
+  overflow: auto;
   border: 1px solid var(--pb-border);
   border-radius: 8px;
   background: #fff;
@@ -1852,11 +1893,12 @@ button:disabled {
   width: 100%;
   border-collapse: separate;
   border-spacing: 0;
-  table-layout: fixed;
+  table-layout: auto;
 }
 
 .report-matrix th,
 .report-matrix td {
+  min-width: 128px;
   border-right: 1px solid var(--pb-border);
   border-bottom: 1px solid var(--pb-border);
   overflow: hidden;
@@ -1870,7 +1912,8 @@ button:disabled {
   position: sticky;
   left: 0;
   z-index: 2;
-  width: clamp(132px, 22%, 220px);
+  min-width: 200px;
+  width: 200px;
   background: #fff;
   text-align: left;
   white-space: normal;
@@ -1887,7 +1930,7 @@ button:disabled {
   line-height: 1.15;
   text-transform: uppercase;
   white-space: normal;
-  word-break: break-word;
+  word-break: normal;
 }
 
 .report-matrix thead th:first-child {

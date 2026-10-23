@@ -199,7 +199,9 @@ async function main() {
         const roleCheck = (name, actual, expected) => check(`${role}/${name}`, actual, expected);
         for (const month of months) {
           const start = Date.now();
+          process.stderr.write(JSON.stringify({step:'legacy-plan-start',role,month})+'\n');
           const plan = await platform.planFact(user, undefined, month);
+          process.stderr.write(JSON.stringify({step:'legacy-plan-ready',role,month,ms:Date.now()-start})+'\n');
           roleCheck(`${month}/teams`, plan.teams.length, 2);
           for (const warning of plan.warnings || []) result.failures.push({ name: `${role}/${month}/configuration`, message: warning });
           const dateFrom = new Date(plan.calendar.monthStart).toISOString();
@@ -229,9 +231,12 @@ async function main() {
           for (const template of generated.filter((item) => !['sales_funnel_steps', 'csm_funnel'].includes(item.config.builtinKey)
             && item.config.metric !== 'revenue_profit_forecast')) {
             const start = Date.now();
+            process.stderr.write(JSON.stringify({step:'report-start',role,key:template.config.builtinKey})+'\n');
             const report = await reports.compute(reportDto(template, dateFrom, dateTo), user);
             roleCheck(`report/${template.name}/payload`, report && report.type && report.ready !== false ? 1 : 0, 1);
             result.reports.push({ role, name: template.name, type: report.type, durationMs: Date.now() - start });
+            if(global.gc)global.gc();
+            process.stderr.write(JSON.stringify({step:'report-ready',role,key:template.config.builtinKey,ms:Date.now()-start,rssMb:Math.round(process.memoryUsage().rss/1048576)})+'\n');
           }
         }
       }
@@ -253,7 +258,7 @@ async function verifyShipping({ plan, reports, user, dateFrom, dateTo, currentMo
   for (const key of teams) {
     const team = plan.teams.find((item) => item.key === key);
     if (!team) continue;
-    const entries = shipping.entries.filter(({ deal }) =>
+    const entries = shipping.entries.filter(({ deal }) => deal.responsibleId !== 'unassigned-commercial' &&
       (deal.responsible?.group?.id === shipping.csmGroupId) === (key === 'csm'));
     check(`${month}/${key}/shipping/count`, team.total.values[`${key}_shipped_count`].factMonth, entries.length);
     check(`${month}/${key}/shipping/amount`, team.total.values[`${key}_shipped_amount`].factMonth,
@@ -268,9 +273,9 @@ async function verifyShipping({ plan, reports, user, dateFrom, dateTo, currentMo
   if (month !== currentMonth) return;
   const forecast = await reports.compute(reportDto(reports.buildRevenueForecastReportTemplate(), dateFrom, dateTo), user);
   check(`${month}/forecast/ready`, forecast.ready ? 1 : 0, 1);
-  const combined = plan.teams.reduce((sum, team) => sum + Number(team.total.values[`${team.key}_shipped_amount`].factMonth), 0);
+  const combined = plan.teams.reduce((sum, team) => sum + Number(team.total.values[`${team.key}_shipped_amount`].factMonth), Number(plan.unassignedShipping?.amount||0));
   check(`${month}/forecast/actualRevenue`, combined, forecast.summary?.actualRevenue);
-  const actualRows = (forecast.rows || []).filter((row) => ['salesShippedThisMonth', 'repeatShippedThisMonth'].includes(row.id));
+  const actualRows = (forecast.rows || []).filter((row) => ['salesShippedThisMonth', 'repeatShippedThisMonth','unassignedShippedThisMonth'].includes(row.id));
   const actualIds = actualRows.flatMap((row) => (row.deals || []).map((deal) => deal.dealId));
   const allIds = (forecast.rows || []).flatMap((row) => (row.deals || []).map((deal) => deal.dealId));
   check(`${month}/forecast/uniqueActual`, new Set(actualIds).size, actualIds.length);

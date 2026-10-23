@@ -1155,6 +1155,7 @@ export class AmoSyncService {
   }
 
   private mergeMaps(target: AmoSyncMaps, source: AmoSyncMaps) {
+    if(source.currency)target.currency=source.currency;
     for (const [key, value] of source.pipelines) target.pipelines.set(key, value);
     for (const [key, value] of source.stages) target.stages.set(key, value);
     for (const [key, value] of source.users) target.users.set(key, value);
@@ -2583,6 +2584,12 @@ export class AmoSyncService {
     const pipelineId = maps.pipelines.get(String(lead.pipeline_id));
     const stageId = maps.stages.get(`${lead.pipeline_id}_${lead.status_id}`);
     if (!pipelineId || !stageId) return;
+    if(!maps.currency){
+      const account=await this.prisma.amoAccountSnapshot.findFirst({orderBy:{updatedAt:'desc'},select:{raw:true}});
+      const currency=String((account?.raw as any)?.currency||'').toUpperCase();
+      if(!/^[A-Z]{3}$/.test(currency))throw new Error('Не подтверждена валюта аккаунта amoCRM. Сначала обновите метаданные аккаунта');
+      maps.currency=currency;
+    }
 
     const stage = await this.prisma.pipelineStage.findUnique({ where: { id: stageId } });
     const contactExternalId = lead._embedded?.contacts?.[0]?.id ? String(lead._embedded.contacts[0].id) : null;
@@ -2608,7 +2615,7 @@ export class AmoSyncService {
       lossReasonId,
       title: lead.name || `Сделка ${lead.id}`,
       amount: Number(lead.price ?? 0),
-      currency: 'RUB',
+      currency: maps.currency,
       source: this.extractSource(lead),
       tags: (lead._embedded?.tags ?? []).map((tag: any) => tag.name).filter(Boolean),
       customFields: this.parseCustomFields(lead.custom_fields_values),

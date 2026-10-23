@@ -1,6 +1,11 @@
 import { CrmEventNotificationsService } from './crm-event-notifications.service';
 
 describe('CrmEventNotificationsService payment notification routing', () => {
+  it('routes ROP notifications by the assigned department rather than the Support group',()=>{
+    const service=new CrmEventNotificationsService({} as any,{} as any) as any;
+    const users=[{id:'sales-head',businessRole:'ROP',departmentKey:'sales',crmUser:{group:{name:'Support, Management'}}},{id:'cs-head',businessRole:'ROP',departmentKey:'csm',crmUser:{group:{name:'Support, Management'}}},{id:'unconfigured',businessRole:'ROP',departmentKey:null,crmUser:{group:{name:'Sales'}}}];
+    expect(service.salesLeaderUsers(users).map((u:any)=>u.id)).toEqual(['sales-head']);expect(service.csmLeaderUsers(users).map((u:any)=>u.id)).toEqual(['cs-head']);
+  });
   function createService() {
     const prisma = {
       crmUser: {

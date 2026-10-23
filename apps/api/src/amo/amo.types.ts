@@ -18,6 +18,7 @@ export interface AmoWebhookItem {
 }
 
 export interface AmoSyncMaps {
+  currency?: string;
   pipelines: Map<string, string>;
   stages: Map<string, string>;
   users: Map<string, string>;

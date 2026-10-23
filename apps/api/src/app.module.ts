@@ -12,13 +12,17 @@ import { AuditModule } from './audit/audit.module';
 import { PlatformModule } from './platform/platform.module';
 import { ApiMemoryInterceptor } from './common/api-memory.interceptor';
 import { QualityModule } from './quality/quality.module';
-import { CrmControlModule } from './crm-control/crm-control.module';
+import { WorkspaceAccessModule } from './workspaces/workspace-access.module';
+import { WorkspaceBoundaryInterceptor } from './workspaces/workspace-boundary.interceptor';
+import { WorkspacesModule } from './workspaces/workspaces.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
     ThrottlerModule.forRoot([{ ttl: 60_000, limit: 100 }]),
     PrismaModule,
+    WorkspaceAccessModule,
+    WorkspacesModule,
     AuthModule,
     AmoModule,
     ReportsModule,
@@ -27,9 +31,9 @@ import { CrmControlModule } from './crm-control/crm-control.module';
     AuditModule,
     PlatformModule,
     QualityModule,
-    CrmControlModule,
   ],
   providers: [
+    { provide: APP_INTERCEPTOR, useClass: WorkspaceBoundaryInterceptor },
     {
       provide: APP_INTERCEPTOR,
       useClass: ApiMemoryInterceptor,

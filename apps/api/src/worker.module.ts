@@ -13,29 +13,29 @@ import { AmoSchedulerService } from './amo/amo-scheduler.service';
 import { WorkerRuntimeService } from './common/worker-runtime.service';
 import { QualityModule } from './quality/quality.module';
 import { DataQualitySchedulerService } from './quality/data-quality-scheduler.service';
-import { CrmControlModule } from './crm-control/crm-control.module';
-import { CrmControlScheduler } from './crm-control/crm-control.scheduler';
+import { WorkspaceLinksScheduler } from './workspaces/workspace-links.scheduler';
+import { WorkspaceAccessModule } from './workspaces/workspace-access.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
     ScheduleModule.forRoot(),
     PrismaModule,
+    WorkspaceAccessModule,
     AuditModule,
     ReportsModule,
     PlatformModule,
     AmoModule,
     QualityModule,
-    CrmControlModule,
   ],
   providers: [
+    WorkspaceLinksScheduler,
     AmoSchedulerService,
     PlatformSchedulerService,
     ReportsSchedulerService,
     ReportRefreshProcessService,
     WorkerRuntimeService,
     DataQualitySchedulerService,
-    CrmControlScheduler,
   ],
 })
 export class WorkerModule {}

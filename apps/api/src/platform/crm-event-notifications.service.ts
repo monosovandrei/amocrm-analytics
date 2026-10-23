@@ -20,6 +20,7 @@ type AppUser = {
   name: string;
   role: UserRole;
   businessRole: PlatformBusinessRole;
+  departmentKey?: string | null;
   crmUserId?: string | null;
   crmUser?: { id: string; name: string; group?: { name: string } | null } | null;
   telegramAccount?: { username: string | null; chatId: string } | null;
@@ -107,6 +108,7 @@ export class CrmEventNotificationsService {
           name: true,
           role: true,
           businessRole: true,
+          departmentKey: true,
           crmUserId: true,
           crmUser: { select: { id: true, name: true, group: { select: { name: true } } } },
           telegramAccount: { select: { username: true, chatId: true } },
@@ -1127,7 +1129,7 @@ export class CrmEventNotificationsService {
   }
 
   private teamLeaderUsers(users: AppUser[], team: 'sales' | 'csm') {
-    return users.filter((user) => user.businessRole === 'ROP' && this.isTeamGroup(user.crmUser?.group?.name, team));
+    return users.filter((user) => user.businessRole === 'ROP' && user.departmentKey === team);
   }
 
   private isTeamGroup(name: string | null | undefined, team: 'sales' | 'csm') {

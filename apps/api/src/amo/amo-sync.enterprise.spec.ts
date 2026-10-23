@@ -13,6 +13,11 @@ function createService(prisma: Record<string, any>) {
 }
 
 describe('AmoSyncService full snapshot safeguards', () => {
+  it('does not invent RUB when source account currency is missing',async()=>{
+    const prisma={amoAccountSnapshot:{findFirst:jest.fn().mockResolvedValue(null)},deal:{findUnique:jest.fn()}};
+    const service=createService(prisma),maps=service.emptyMaps();maps.pipelines.set('1','pipeline');maps.stages.set('1_2','stage');
+    await expect(service.upsertDeal({pipeline_id:1,status_id:2},maps)).rejects.toThrow('Не подтверждена валюта');expect(prisma.deal.findUnique).not.toHaveBeenCalled();
+  });
   it('resumes a failed pull from the interrupted stage and skips completed stages', () => {
     const service = createService({});
     const resumeStage = service.pullResumeStage({
@@ -245,6 +250,7 @@ describe('AmoSyncService full snapshot safeguards', () => {
     const service = createService(prisma);
     service.syncDealProducts = jest.fn().mockResolvedValue(undefined);
     const maps = {
+      currency:'EUR',
       pipelines: new Map([['pipeline-external', 'pipeline-1']]),
       stages: new Map([['pipeline-external_stage-external', 'stage-1']]),
       users: new Map(),
@@ -264,7 +270,7 @@ describe('AmoSyncService full snapshot safeguards', () => {
     }, maps);
 
     expect(prisma.deal.update).toHaveBeenCalledWith(expect.objectContaining({
-      data: expect.objectContaining({ deletedAt: null }),
+      data: expect.objectContaining({ deletedAt: null,currency:'EUR' }),
     }));
   });
 });

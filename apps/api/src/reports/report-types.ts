@@ -1,4 +1,7 @@
 export interface ReportFilters {
+  // Server-only; HTTP input is never used as access authority.
+  _workspace?: { departmentKey: string; managerIds: string[]; ownManagerId: string | null;
+    pipelineIds: string[]; assemblyPipelineId: string; fingerprint: string };
   dateFrom?: string;
   dateTo?: string;
   pipelineIds?: string[];
@@ -152,6 +155,7 @@ export interface DataContractConfig {
 }
 
 export interface ReportConfig {
+  _commercialRevision?: string;
   filters?: ReportFilters;
   metric?:
     | 'count'

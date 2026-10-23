@@ -1,6 +1,15 @@
 import { RevenueForecastEngine } from './revenue-forecast-engine';
 
 describe('revenue forecast engine cohorts', () => {
+  it('shares only calibration, not personal predictions, and invalidates when source changes',async()=>{
+    const db={} as any;
+    const training=jest.fn().mockResolvedValue({byStageId:new Map(),latestEntryByDealStage:new Map()});
+    function engine(revision:string){const e=new RevenueForecastEngine(db,revision) as any;e.resolveFieldIds=jest.fn().mockResolvedValue({});e.buildStageEpisodes=training;e.loadDeliveryObservations=jest.fn().mockResolvedValue([]);e.buildAssemblyMonthlyCohort=jest.fn().mockResolvedValue({observations:[],monthCount:0,shipped:0});e.loadFeatureContexts=jest.fn().mockResolvedValue(undefined);return e;}
+    const input={now:new Date('2026-10-23T12:00:00Z'),monthTo:new Date('2026-10-31T20:59:59Z'),assemblyDeals:[],assemblyStageIds:['stage'],assemblyStartStageId:'start',itemsInTransitPosition:1,stagePositions:new Map(),shippingDoneStageId:'shipped',shippingLossStageIds:[],paymentGroups:[]};
+    const first=await engine('one').compute(input),second=await engine('one').compute(input);
+    expect(first).toEqual(second);expect(first.predictions).not.toBe(second.predictions);expect(training).toHaveBeenCalledTimes(1);
+    await engine('two').compute(input);expect(training).toHaveBeenCalledTimes(2);
+  });
   it('rebuilds the equivalent historical month snapshot and keeps non-shipped deals in the denominator', async () => {
     const intervals = [
       {

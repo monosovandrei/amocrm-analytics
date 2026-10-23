@@ -47,6 +47,8 @@ import {
 import { api, downloadExcel, downloadFile } from '@/lib/api';
 import { moscowPresetDateInputs } from './report-period';
 import CrmControl from './CrmControl';
+import RoleWorkspace from './RoleWorkspace';
+import FieldCombobox from './FieldCombobox';
 import type {
   BuilderOperator,
   ContractConversionDraft,
@@ -681,7 +683,6 @@ export default function HomePage() {
         const me = await api<User>('/auth/me');
         if (!mounted) return;
         setUser(me);
-        await loadData();
       } catch {
         localStorage.removeItem('accessToken');
         if (mounted) setUser(null);
@@ -780,7 +781,6 @@ export default function HomePage() {
 
   async function handleLogin(nextUser: User) {
     setUser(nextUser);
-    await loadData();
   }
 
   async function saveLayout(nextTemplates: ReportTemplate[]) {
@@ -900,119 +900,10 @@ export default function HomePage() {
     return <LoginScreen onLogin={handleLogin} />;
   }
 
-  return (
-    <main className="app-shell">
-      <section className="app-main">
-        <header className="topbar">
-          <div className="topbar-main">
-            <div className="topbar-brand">
-              <div className="topbar-logo">
-                <BarChart3 size={20} />
-              </div>
-              <div>
-                <div className="text-base font-bold">amoCRM Analytics</div>
-                <div className="text-xs text-[var(--pb-text-secondary)]">Рабочий стол РОПа</div>
-              </div>
-            </div>
+  return <RoleWorkspace onLogout={() => { localStorage.removeItem('accessToken'); setUser(null); }}
+    renderReport={(result, key, amoDomain) => <ReportResultDetails amoDomain={amoDomain ? `${amoDomain}.amocrm.ru` : ''} result={result} template={{ name: key, config: { builtinKey: key } } as ReportTemplate} />}
+    renderTelegram={() => <>{message&&<p role="status">{message}</p>}<PlatformTab user={user} onMessage={setMessage} /></>} />;
 
-            <nav className="topbar-nav" aria-label="Основное меню">
-              {visibleNavItems.map((item) => (
-                <button
-                  key={item.id}
-                  className={`topbar-nav-item ${tab === item.id ? 'active' : ''}`}
-                  onClick={() => setTab(item.id)}
-                  type="button"
-                >
-                  {item.icon}
-                  <span>{item.label}</span>
-                </button>
-              ))}
-            </nav>
-          </div>
-
-          <div className="topbar-actions">
-            <div
-              className={`sync-panel ${qualityBlocked ? 'sync-panel-error' : amoConnectionHealthy && !qualityChecking ? 'sync-panel-ok' : 'sync-panel-warn'}`}
-              title={`${dataQuality?.incidents?.[0]?.message ?? syncHealth?.message ?? amoStatusText}. ${amoSyncUpdatedText}`}
-            >
-              {amoConnectionHealthy && !qualityBlocked && !qualityChecking ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}
-              <div className="min-w-0">
-                <div className="sync-panel-title">{amoStatusText}</div>
-                <div className="sync-panel-meta">{amoSyncUpdatedText}</div>
-              </div>
-            </div>
-            <div className="topbar-user">
-                <div className="avatar">{user.name.slice(0, 1).toUpperCase()}</div>
-                <div className="topbar-user-text">
-                  <div className="truncate text-sm font-semibold">{user.name}</div>
-                <div className="truncate text-xs text-[var(--pb-text-muted)]">{businessRoleLabel(user.businessRole)}</div>
-                </div>
-              <button
-                className="icon-btn"
-                title="Выйти"
-                type="button"
-                onClick={() => {
-                  localStorage.removeItem('accessToken');
-                  setUser(null);
-                }}
-              >
-                <LogOut size={16} />
-              </button>
-            </div>
-          </div>
-        </header>
-
-        <section className="content">
-          <div className="content-inner">
-            {message && (
-              <div className="alert">
-                <CheckCircle2 className="mt-0.5 text-[var(--pb-accent-green)]" size={17} />
-                <span>{message}</span>
-              </div>
-            )}
-
-            {tab === 'ropDashboard' && canAccessRopDashboard && (
-              <RopDashboardTab />
-            )}
-
-            {tab === 'workspace' && (
-              <WorkspaceTab
-                amoDomain={connection?.subdomain ?? ''}
-                filters={filters}
-                options={options}
-                reportTemplates={ordered}
-                refreshStamp={refreshStamp}
-                onSetFilters={setFilters}
-              />
-            )}
-
-            {tab === 'planFact' && (
-              <PlanFactTab refreshStamp={refreshStamp} />
-            )}
-
-            {tab === 'leadSla' && (
-              <LeadSlaTab />
-            )}
-
-            {tab === 'crmControl' && (
-              <CrmControl />
-            )}
-
-            {tab === 'emailThreads' && (
-              <EmailThreadsTab onMessage={setMessage} />
-            )}
-
-            {tab === 'platform' && canAccessTelegram && (
-              <PlatformTab
-                user={user}
-                onMessage={setMessage}
-              />
-            )}
-          </div>
-        </section>
-      </section>
-    </main>
-  );
 }
 
 function LoginScreen({ onLogin }: { onLogin: (user: User) => void }) {
@@ -1044,7 +935,7 @@ function LoginScreen({ onLogin }: { onLogin: (user: User) => void }) {
           </div>
           <div>
             <h1 className="m-0 text-xl font-bold">amoCRM Analytics</h1>
-            <p className="m-0 text-sm text-[var(--pb-text-secondary)]">Вход в рабочий стол РОПа</p>
+            <p className="m-0 text-sm text-[var(--pb-text-secondary)]">Вход в платформу</p>
           </div>
         </div>
         <label>
@@ -5980,26 +5871,13 @@ function PlatformTab({ user, onMessage }: { user: User; onMessage: (message: str
       <div className="page-row">
         <div>
           <h1 className="page-title">Telegram</h1>
-          <p className="page-description">Пользователи, роли, Telegram и правила доставки уведомлений.</p>
+          <p className="page-description">Подключение сотрудников и правила доставки уведомлений.</p>
         </div>
         <button className="btn" type="button" onClick={() => void reload()} disabled={loading}>
           <RefreshCw size={15} />
           Обновить
         </button>
       </div>
-
-      {isOwner && (
-        <>
-          <UserLinksPanel
-            userLinks={userLinks}
-            userLinkDrafts={userLinkDrafts}
-            userLinkSaveState={userLinkSaveState}
-            setUserLinkDrafts={setUserLinkDrafts}
-            setUserLinkSaveState={setUserLinkSaveState}
-            onSaveUserLink={saveUserLink}
-          />
-        </>
-      )}
 
       <CrmTelegramLinksPanel
         crmTelegramLinks={crmTelegramLinks}
@@ -6997,86 +6875,6 @@ function MultiCheckbox({
   );
 }
 
-function FieldCombobox({
-  emptyText = 'Поля появятся после синхронизации amoCRM',
-  label,
-  onChange,
-  options,
-  placeholder,
-  value,
-}: {
-  emptyText?: string;
-  label: string;
-  onChange: (value: string) => void;
-  options: FieldOption[];
-  placeholder: string;
-  value: string;
-}) {
-  const [isOpen, setIsOpen] = useState(false);
-  const [query, setQuery] = useState('');
-  const selected = options.find((option) => option.value === value);
-  const normalizedQuery = query.trim().toLowerCase();
-  const filteredOptions = normalizedQuery
-    ? options.filter((option) =>
-        `${option.label} ${option.description ?? ''} ${option.value}`.toLowerCase().includes(normalizedQuery),
-      )
-    : options;
-
-  return (
-    <div
-      className="field-combobox"
-      onBlur={(event) => {
-        const nextTarget = event.relatedTarget;
-        if (!(nextTarget instanceof Node) || !event.currentTarget.contains(nextTarget)) setIsOpen(false);
-      }}
-    >
-      <span className="label">{label}</span>
-      <button
-        className="field-combobox-trigger"
-        type="button"
-        onClick={() => setIsOpen((current) => !current)}
-        aria-expanded={isOpen}
-      >
-        <span className={selected ? 'truncate' : 'truncate text-[var(--pb-text-muted)]'}>
-          {selected?.label ?? placeholder}
-        </span>
-        <ArrowDown size={14} className="shrink-0 text-[var(--pb-text-secondary)]" />
-      </button>
-
-      {isOpen && (
-        <div className="field-combobox-panel">
-          <input
-            className="field-combobox-search"
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder="Поиск по CRM-полям"
-            autoFocus
-          />
-          <div className="field-combobox-list">
-            {filteredOptions.length === 0 && (
-              <div className="px-2 py-2 text-xs text-[var(--pb-text-secondary)]">{emptyText}</div>
-            )}
-            {filteredOptions.map((option) => (
-              <button
-                key={`${option.value}:${option.label}`}
-                className={`field-combobox-option ${option.value === value ? 'active' : ''}`}
-                type="button"
-                onClick={() => {
-                  onChange(option.value);
-                  setQuery('');
-                  setIsOpen(false);
-                }}
-              >
-                <span className="truncate font-semibold">{option.label}</span>
-                {option.description && <span className="truncate text-xs text-[var(--pb-text-secondary)]">{option.description}</span>}
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
 
 function ReportResultDetails({
   amoDomain = '',

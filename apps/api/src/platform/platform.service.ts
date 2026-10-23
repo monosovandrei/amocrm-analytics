@@ -1875,6 +1875,8 @@ export class PlatformService {
       metrics: PLAN_FACT_METRICS,
       warnings: refs.warnings,
       teams: [sales, csm].filter(Boolean),
+      unassignedShipping:{ count:(monthShipping?.entries||[]).filter(e=>e.deal.responsibleId==='unassigned-commercial').length,
+        amount:(monthShipping?.entries||[]).filter(e=>e.deal.responsibleId==='unassigned-commercial').reduce((s,e)=>s+Number(e.deal.amount||0),0) },
     };
   }
 
@@ -2255,6 +2257,7 @@ export class PlatformService {
     const rowByManager = new Map(rows.map((row: any) => [row.groupId, row]));
     const summary = { metrics: mapMetrics(report.summaryRows?.[0]?.metrics) };
     for (const { deal } of shipping?.entries ?? []) {
+      if(deal.responsibleId==='unassigned-commercial')continue;
       const isCsm = deal.responsible?.group?.id === shipping!.csmGroupId;
       if ((team === 'csm') !== isCsm) continue;
       let row = rowByManager.get(deal.responsibleId);
@@ -2524,15 +2527,7 @@ export class PlatformService {
       return { id: alert.id, name: alert.name, status: 'SKIPPED', reason: 'Не выбран отчёт' };
     }
     const config = alert.reportTemplate.config as Record<string, any>;
-    const report = await this.reports.compute(
-      {
-        name: alert.reportTemplate.name,
-        sourceType: alert.reportTemplate.sourceType,
-        filters: config.filters ?? {},
-        config,
-      },
-      { id: alert.user.id, role: alert.user.role as UserRole },
-    );
+    const {report,scope:deliveryScope}=await this.reports.notificationReport(alert.reportTemplate,alert.user.id);
     const value = this.extractAlertValue(report, alert.metricKey ?? (alert.condition as any)?.metricKey);
     const threshold = alert.threshold == null ? null : Number(alert.threshold);
     const triggered = threshold != null && value != null && this.compare(value, threshold, alert.operator);
@@ -2544,7 +2539,8 @@ export class PlatformService {
       return { id: alert.id, name: alert.name, status: cooldownActive ? 'COOLDOWN' : 'OK', value, threshold };
     }
 
-    const recipients = this.parseRecipients(alert.recipients, alert.userId);
+    const recipients = await this.reports.notificationRecipients(deliveryScope,this.parseRecipients(alert.recipients, alert.userId));
+    if(!recipients.length)return {id:alert.id,status:'SKIPPED',reason:'Нет адресатов с правом просмотра этого отчёта'};
     const message = [
       `Алерт: ${alert.name}`,
       `Отчёт: ${alert.reportTemplate.name}`,
@@ -2580,17 +2576,14 @@ export class PlatformService {
     }
 
     const config = schedule.reportTemplate.config as Record<string, any>;
-    const report = await this.reports.compute(
-      {
-        name: schedule.reportTemplate.name,
-        sourceType: schedule.reportTemplate.sourceType,
-        filters: config.filters ?? {},
-        config,
-      },
-      { id: schedule.userId, role: schedule.user.role },
-    );
+    const {report,scope:deliveryScope}=await this.reports.notificationReport(schedule.reportTemplate,schedule.userId);
     const message = this.reportTelegramMessage(schedule.reportTemplate.name, report);
-    const recipients = this.parseRecipients(schedule.recipients, schedule.userId);
+    const recipients = await this.reports.notificationRecipients(deliveryScope,this.parseRecipients(schedule.recipients, schedule.userId));
+    if(!recipients.length){
+      await this.prisma.reportDeliveryLog.create({data:{scheduleId:schedule.id,status:'SKIPPED',error:'Нет адресатов с правом просмотра этого отчёта'}});
+      await this.prisma.reportSchedule.update({where:{id:schedule.id},data:{lastRunAt:now,nextRunAt}});
+      return {id:schedule.id,status:'SKIPPED',nextRunAt};
+    }
     const deliveries = await this.telegram.sendMessageToUsers(recipients, message, {
       type: 'scheduled_report',
       scheduleId: schedule.id,

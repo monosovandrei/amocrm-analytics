@@ -15,6 +15,7 @@ describe('shared section metrics', () => {
   };
   const fixture = () => {
     const db = {
+      amoConnection: { findFirst: jest.fn().mockResolvedValue(null) },
       factStageTransition: { findMany: jest.fn().mockResolvedValue([]) },
       factDealCurrent: { findMany: jest.fn().mockResolvedValue([]) },
       crmGroup: { findMany: jest.fn().mockResolvedValue([salesGroup, group]) },

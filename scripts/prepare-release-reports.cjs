@@ -114,6 +114,29 @@ async function main() {
     for (const key of ['sales_funnel_steps', 'csm_funnel', 'revenue_profit_forecast']) {
       if (!templates.some((template) => template.config.builtinKey === key)) throw new Error(`Missing required template: ${key}`);
     }
+    if(process.argv.includes('--workspaces')){
+      const access=app.get(load('./dist/workspaces/workspace-access.service').WorkspaceAccessService);
+      const accounts=await prisma.user.findMany({where:{isActive:true},select:{id:true}}),month=moscowWindows()[0].dateFrom;
+      const monthKey=new Intl.DateTimeFormat('sv-SE',{timeZone:'Europe/Moscow',year:'numeric',month:'2-digit'}).format(new Date(month));
+      let warmed=0;
+      for(const account of accounts){
+        const scope=await access.resolve(account.id).catch(()=>null);if(!scope)continue;
+        const departments=await prisma.workspaceDepartment.findMany({where:scope.role==='ADMIN'?{}:{key:scope.departmentKey}});
+        for(const department of departments)for(const key of [department.key==='sales'?'sales_funnel_steps':'csm_funnel','revenue_profit_forecast']){
+          const selected={...scope,departmentKey:department.key},started=Date.now();let certified=false;
+          for(let attempt=0;attempt<2&&!certified;attempt++){
+            await waitForCertification(quality,RELEASE_BUILD_ID,METRIC_VERSION);
+            const report=await reports.workspaceReport(key,selected,monthKey);
+            const dto=await reports.workspaceQuery(key,selected,monthKey);
+            const snapshots=await reports.snapshots([dto],{id:scope.userId,role:'ADMIN'});
+            certified=Boolean(report?.type&&report.ready!==false&&snapshots.reports[0]?.qualityStatus==='CERTIFIED'&&snapshots.reports[0]?.payload?.type&&snapshots.reports[0].payload.type!=='pending');
+          }
+          if(!certified)throw new Error(`Scoped snapshot not certified: ${scope.role}/${department.key}/${key}`);
+          warmed++;process.stdout.write(JSON.stringify({step:'workspace-warmup',role:scope.role,department:department.key,key,durationMs:Date.now()-started,status:'ready'})+'\n');if(global.gc)global.gc();
+        }
+      }
+      process.stdout.write(JSON.stringify({step:'complete',status:'ready',scopedReports:warmed})+'\n');return;
+    }
     // Force fresh calculation via the normal compute/save/quality path. A browser may
     // have created a PENDING cache row during startup; it must not count as warmed.
     reports.getCachedReport = async () => null;

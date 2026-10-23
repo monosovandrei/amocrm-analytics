@@ -900,6 +900,9 @@ describe('ReportsService data contract', () => {
     const repeatDeal = { responsible: { group: { id: 'group-csm', name: 'CSM' } } };
 
     expect(Object.keys(buckets)).toEqual([
+      'unassignedShippedThisMonth',
+      'unassignedShippingThisMonth',
+      'unassignedNotThisMonth',
       'salesShippedThisMonth',
       'salesShippingThisMonth',
       'salesInvoiceThisMonth',

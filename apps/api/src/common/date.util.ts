@@ -29,8 +29,9 @@ type MoscowParts = {
   dayOfWeek: number;
 };
 
-export function moscowParts(date: Date): MoscowParts {
-  const parts = new Intl.DateTimeFormat('en-CA', {
+// Intl formatters hold substantial ICU state. Reuse one for the fixed calendar,
+// especially when stage-age calculations traverse years for thousands of deals.
+const moscowPartsFormatter = new Intl.DateTimeFormat('en-CA', {
     timeZone: MOSCOW_TIME_ZONE,
     year: 'numeric',
     month: '2-digit',
@@ -39,7 +40,10 @@ export function moscowParts(date: Date): MoscowParts {
     minute: '2-digit',
     second: '2-digit',
     hourCycle: 'h23',
-  }).formatToParts(date);
+  });
+
+export function moscowParts(date: Date): MoscowParts {
+  const parts = moscowPartsFormatter.formatToParts(date);
   const value = (type: string) => Number(parts.find((part) => part.type === type)?.value ?? 0);
   const year = value('year');
   const month = value('month');

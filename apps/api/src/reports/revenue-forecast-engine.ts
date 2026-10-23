@@ -144,17 +144,23 @@ type AssemblyCohortBundle = {
   shipped: number;
 };
 
+type Calibration={shippingBundle:StageEpisodeBundle;paymentBundles:Map<string,StageEpisodeBundle>;deliveryObservations:ForecastDeliveryObservation[];assemblyCohort:AssemblyCohortBundle};
+// One bounded training snapshot per database client, never a shared user result.
+const calibrationCache=new WeakMap<PrismaService,{key:string;expires:number;value:Promise<Calibration>}>();
+
 export class RevenueForecastEngine {
   private readonly featureContexts = new Map<string, FeatureContext>();
   private fieldIds!: ForecastFieldIds;
 
-  constructor(private readonly db: PrismaService) {}
+  constructor(private readonly db: PrismaService,private readonly sourceRevision?:string) {}
 
   async compute(input: EngineInput): Promise<RevenueForecastEngineResult> {
     this.fieldIds = await this.resolveFieldIds();
     const warnings: string[] = [];
     const predictions = new Map<string, RevenueForecastPrediction>();
 
+    const daysLeft = Math.max(0, durationDays(input.now, input.monthTo));
+    const train=async():Promise<Calibration>=>{
     const shippingBundle = await this.buildStageEpisodes({
       stageIds: input.assemblyStageIds,
       successStageIds: [input.shippingDoneStageId],
@@ -171,6 +177,18 @@ export class RevenueForecastEngine {
       }));
     }
 
+    const deliveryObservations=await this.loadDeliveryObservations(input.shippingDoneStageId,input.now);
+    const assemblyCohort=await this.buildAssemblyMonthlyCohort({stageIds:input.assemblyStageIds,shippingDoneStageId:input.shippingDoneStageId,now:input.now,daysLeft});
+    return {shippingBundle,paymentBundles,deliveryObservations,assemblyCohort};
+    };
+    const calibrationKey=JSON.stringify([this.sourceRevision,Math.floor(+input.now/60000),input.monthTo.toISOString(),input.assemblyStageIds,input.shippingDoneStageId,input.shippingLossStageIds,input.paymentGroups.map(({key,stageIds,successStageIds,lossStageIds})=>({key,stageIds,successStageIds,lossStageIds}))]);
+    let cached=this.sourceRevision?calibrationCache.get(this.db):undefined;
+    if(!cached||cached.key!==calibrationKey||cached.expires<Date.now()){
+      const value=train();cached={key:calibrationKey,expires:Date.now()+60000,value};
+      if(this.sourceRevision){calibrationCache.set(this.db,cached);void value.catch(()=>{if(calibrationCache.get(this.db)?.value===value)calibrationCache.delete(this.db);});}
+    }
+    const {shippingBundle,paymentBundles,deliveryObservations,assemblyCohort}=await cached.value;
+
     const currentDealIds = [
       ...input.assemblyDeals.map((deal) => deal.id),
       ...input.paymentGroups.flatMap((group) => group.deals.map((deal) => deal.id)),
@@ -178,19 +196,11 @@ export class RevenueForecastEngine {
     await this.loadFeatureContexts(currentDealIds);
 
     const shippingDurations = completedDurations(shippingBundle.byStageId.get(input.assemblyStartStageId) ?? []);
-    const deliveryObservations = await this.loadDeliveryObservations(input.shippingDoneStageId, input.now);
     const deliveryErrors = deliveryObservations.map((item) => ({
       observedAt: item.observedAt,
       durationDays: item.errorDays,
       featureKeys: item.featureKeys,
     }));
-    const daysLeft = Math.max(0, durationDays(input.now, input.monthTo));
-    const assemblyCohort = await this.buildAssemblyMonthlyCohort({
-      stageIds: input.assemblyStageIds,
-      shippingDoneStageId: input.shippingDoneStageId,
-      now: input.now,
-      daysLeft,
-    });
     this.retainFeatureContexts(currentDealIds);
 
     for (const deal of input.assemblyDeals) {

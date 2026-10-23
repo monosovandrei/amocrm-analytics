@@ -1,0 +1,2 @@
+ALTER TABLE "Deal" ALTER COLUMN currency DROP DEFAULT;
+ALTER TABLE fact_deal_current ALTER COLUMN currency DROP DEFAULT;

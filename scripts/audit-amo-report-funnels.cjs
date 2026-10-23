@@ -82,6 +82,8 @@ async function main() {
     if (process.argv.includes('--live') && !evidence) {
       const amo = app.get(AmoService);
       client = await amo.getClient(await amo.getActiveConnectionOrFail(), { minRequestIntervalMs: 150 });
+      // A database clone must never rotate the production OAuth refresh token.
+      if(process.argv.includes('--no-token-refresh'))client.refreshToken=async()=>{throw new Error('OAuth refresh is forbidden in the isolated source audit; use a fresh credential snapshot');};
       const byId = new Map();
       for (let start = from.getTime(); start <= to.getTime(); start += 86_400_000) {
         const windowEnd = Math.min(to.getTime(), start + 86_400_000 - 1);

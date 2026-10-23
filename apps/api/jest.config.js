@@ -7,6 +7,8 @@ module.exports = {
   modulePathIgnorePatterns: ['<rootDir>/dist'],
   watchPathIgnorePatterns: ['<rootDir>/dist'],
   transform: {
-    '^.+\\.ts$': ['ts-jest', { tsconfig: '<rootDir>/tsconfig.json' }],
+    // Full type checking is a separate release gate (`npm run typecheck`).
+    // Avoid building the complete Prisma type graph in every test process.
+    '^.+\\.ts$': ['ts-jest', { tsconfig: '<rootDir>/tsconfig.test.json' }],
   },
 };

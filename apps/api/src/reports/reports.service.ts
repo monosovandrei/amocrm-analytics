@@ -36,6 +36,8 @@ import {
 } from './revenue-forecast-engine';
 import { DataQualityService } from '../quality/data-quality.service';
 import { METRIC_VERSION, RELEASE_BUILD_ID } from '../quality/release-info';
+import { CommercialLinksService } from '../workspaces/commercial-links.service';
+import { WorkspaceAccessService, WorkspaceScope } from '../workspaces/workspace-access.service';
 
 type XlsxValue = string | number | boolean | null | undefined;
 type XlsxSheet = { name: string; rows: XlsxValue[][] };
@@ -108,6 +110,9 @@ type ReportCacheRow = {
   build_id: string;
 };
 type RevenueForecastBucketKey =
+  | 'unassignedShippedThisMonth'
+  | 'unassignedShippingThisMonth'
+  | 'unassignedNotThisMonth'
   | 'salesShippedThisMonth'
   | 'salesShippingThisMonth'
   | 'salesInvoiceThisMonth'
@@ -163,9 +168,74 @@ export class ReportsService {
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
     @Optional() private readonly dataQuality?: DataQualityService,
+    @Optional() private readonly commercialLinks?: CommercialLinksService,
+    @Optional() private readonly workspaceAccess?: WorkspaceAccessService,
   ) {}
 
+  async workspaceReport(key: string, scope: WorkspaceScope, month: string, managerId?: string) {
+    const dto = await this.workspaceQuery(key, scope, month, managerId);
+    return this.compute(dto, { id: scope.userId, role: UserRole.ADMIN }, { requireFresh: true });
+  }
+
+  async enqueueWorkspaceExport(key: string, scope: WorkspaceScope, month: string, managerId?: string) {
+    const dto = await this.workspaceQuery(key, scope, month, managerId);
+    return this.enqueueExport(dto, { id: scope.userId, role: UserRole.ADMIN });
+  }
+  private async companyQuery(key:string,scope:WorkspaceScope,month:string){
+    if(!this.workspaceAccess||(await this.workspaceAccess.resolve(scope.userId)).role!=='ADMIN'||key!=='revenue_profit_forecast')throw new ForbiddenException('Общий отчёт доступен только администратору');
+    if(month!==new Intl.DateTimeFormat('sv-SE',{timeZone:'Europe/Moscow',year:'numeric',month:'2-digit'}).format(new Date()))throw new BadRequestException('Прогноз доступен на текущий месяц');
+    const template=this.buildRevenueForecastReportTemplate();return {name:template.name,sourceType:template.sourceType,filters:{},config:template.config} as ReportQueryDto;
+  }
+  async companyReport(key:string,scope:WorkspaceScope,month:string,exportOnly=false){
+    const dto=await this.companyQuery(key,scope,month),user={id:scope.userId,role:UserRole.ADMIN};
+    if(exportOnly)return this.enqueueExport(dto,user);
+    const report=await this.compute(dto,user,{requireFresh:true});
+    const snapshots=await this.snapshots([dto],user);const state=snapshots.reports[0];
+    return {...report,dataStatus:{cutoffAt:state?.dataCutoffAt||null,checkedAt:state?.qualityCheckedAt||null,status:state?.qualityStatus||'CHECKING',reason:state?.refreshError||null}};
+  }
+
+  async notificationReport(template:any,userId:string){
+    if(!this.workspaceAccess)throw new ServiceUnavailableException('Проверка прав рассылки недоступна');
+    const scope=await this.workspaceAccess.resolve(userId);
+    const config=template.config as ReportConfig;
+    const report=scope.role==='ADMIN'?await this.compute({name:template.name,sourceType:template.sourceType,filters:config.filters??{},config},{id:userId,role:UserRole.ADMIN}):
+      await this.workspaceReport(String(config.builtinKey||''),scope,new Intl.DateTimeFormat('sv-SE',{timeZone:'Europe/Moscow',year:'numeric',month:'2-digit'}).format(new Date()));
+    return {report,scope};
+  }
+
+  async notificationRecipients(scope:WorkspaceScope,ids:string[]){
+    if(!this.workspaceAccess)throw new ServiceUnavailableException('Проверка прав рассылки недоступна');
+    if((await this.workspaceAccess.resolve(scope.userId)).fingerprint!==scope.fingerprint)throw new ForbiddenException('Права автора рассылки изменились');
+    const allowed:string[]=[];
+    for(const id of [...new Set(ids)]){
+      const target=await this.workspaceAccess.resolve(id).catch(()=>null);
+      if(target&&(target.role==='ADMIN'||(scope.role!=='ADMIN'&&target.departmentKey===scope.departmentKey&&(target.role==='ROP'||(scope.role==='MANAGER'&&target.managerId===scope.managerId)))))allowed.push(id);
+    }
+    return allowed;
+  }
+
+  private async workspaceQuery(key: string, scope: WorkspaceScope, month: string, managerId?: string) {
+    if (!this.workspaceAccess) throw new ServiceUnavailableException('Кабинеты не настроены');
+    const department = await this.workspaceAccess.department(scope, scope.departmentKey || undefined);
+    const managers = await this.workspaceAccess.managerIds(scope, department, managerId);
+    const templates = department.key === 'sales' ? await this.buildSalesReportTemplates() : await this.buildCsmReportTemplates();
+    const template = key === 'revenue_profit_forecast' ? this.buildRevenueForecastReportTemplate()
+      : templates.find(t => t.config.builtinKey === key);
+    if (!template) throw new ForbiddenException('Отчёт недоступен для этого отдела');
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) throw new BadRequestException('Некорректный месяц');
+    const from = new Date(`${month}-01T00:00:00+03:00`);
+    const [year, number] = month.split('-').map(Number);
+    const to = new Date(Date.UTC(year, number, 1) - 3 * 3600000 - 1);
+    const filters: ReportFilters = { ...template.config.filters, dateFrom: from.toISOString(), dateTo: to.toISOString(),
+      managerIds: scope.managerId ? [scope.managerId] : managerId ? [managerId] : undefined,
+      _workspace: { departmentKey: department.key, managerIds: managers, ownManagerId: scope.managerId || managerId || null,
+        pipelineIds: department.pipelineIds, assemblyPipelineId: department.assemblyPipelineId, fingerprint: scope.fingerprint } };
+    const dto = { name: template.name, sourceType: template.sourceType, filters, config: { ...template.config, filters } } as ReportQueryDto;
+    return dto;
+  }
+
   async compute(dto: ReportQueryDto, user: { id: string; role: UserRole }, options: { requireFresh?: boolean } = {}) {
+    await this.assertWorkspaceActor(dto, user);
     this.assertReportPeriod(dto);
     [dto] = await this.normalizeBuiltinRequests([dto]);
     const cacheKey = this.reportCacheKey(dto, user);
@@ -173,21 +243,30 @@ export class ReportsService {
     const cached = await this.getCachedReport(cacheKey);
     if (cached?.payload && cached.payload.type !== 'pending') {
       await this.assertReportAvailable(dto, cached.sourceSyncAt);
-      const stale = this.cacheIsStale(cached.sourceSyncAt, latestSyncAt);
-      if (!stale) return cached.payload;
+      const stale = options.requireFresh
+        ? Boolean(latestSyncAt&&(!cached.sourceSyncAt||cached.sourceSyncAt.getTime()<latestSyncAt.getTime()))
+        : this.cacheIsStale(cached.sourceSyncAt, latestSyncAt);
+      if (!stale) return this.withWorkspaceMetadata(cached.payload,dto,cached.sourceSyncAt);
       if (!options.requireFresh) {
         await this.enqueueReportCacheRefresh(cacheKey, dto, user);
-        return cached.payload;
+        return this.withWorkspaceMetadata(cached.payload,dto,cached.sourceSyncAt);
       }
     }
 
     const report = await this.computeFresh(dto, user, true);
     await this.saveCachedReport(cacheKey, dto.name, report, latestSyncAt, dto, user);
     await this.assertReportAvailable(dto, latestSyncAt);
-    return report;
+    return this.withWorkspaceMetadata(report,dto,latestSyncAt);
+  }
+
+  private async withWorkspaceMetadata(report:any,dto:ReportQueryDto,cutoff:Date|null){
+    if(!dto.filters?._workspace)return report;
+    const quality=this.dataQuality?await this.dataQuality.reportQuality({name:dto.name,filters:dto.filters as Record<string,unknown>},cutoff):null;
+    return {...report,dataStatus:{cutoffAt:cutoff?.toISOString()??null,checkedAt:quality?.checkedAt??null,status:quality?.status??'CHECKING',reason:(quality as any)?.reason??null}};
   }
 
   async snapshots(dtos: ReportQueryDto[], user: { id: string; role: UserRole }) {
+    for (const dto of dtos) await this.assertWorkspaceActor(dto, user);
     for (const dto of dtos) this.assertReportPeriod(dto);
     dtos = await this.normalizeBuiltinRequests(dtos);
     await this.ensureReportCacheTable();
@@ -303,6 +382,10 @@ export class ReportsService {
   }
 
   private async normalizeBuiltinRequests(dtos: ReportQueryDto[]): Promise<ReportQueryDto[]> {
+    if(this.commercialLinks){
+      const revision=await this.commercialLinks.revision();
+      dtos=dtos.map(dto=>({...dto,config:{...dto.config,_commercialRevision:revision}}));
+    }
     const keys = new Set(dtos.map((dto) => String(dto.config?.builtinKey ?? '')).filter((key) => BUILTIN_REPORT_KEYS.has(key)));
     if (!keys.size) return dtos;
     const [sales, csm] = await Promise.all([
@@ -332,12 +415,13 @@ export class ReportsService {
         name: template.name,
         sourceType: template.sourceType,
         filters,
-        config: { ...template.config, filters, ...(dto.config.compare === undefined ? {} : { compare: dto.config.compare }) },
+        config: { ...template.config, filters, ...(dto.config._commercialRevision?{_commercialRevision:dto.config._commercialRevision}:{}), ...(dto.config.compare === undefined ? {} : { compare: dto.config.compare }) },
       };
     });
   }
 
   private async computeFresh(dto: ReportQueryDto, user: { id: string; role: UserRole }, normalized = false) {
+    await this.assertWorkspaceActor(dto, user);
     this.assertReportPeriod(dto);
     if (!normalized) [dto] = await this.normalizeBuiltinRequests([dto]);
     return this.withFreshComputeSlot(async () => {
@@ -356,6 +440,7 @@ export class ReportsService {
         filters: dto.filters,
         config: dto.config,
         role: user.role,
+        ...(dto.filters?._workspace ? { workspaceUser: user.id, accessFingerprint: dto.filters._workspace.fingerprint } : {}),
         metricVersion: METRIC_VERSION,
         ...(dto.config?.metric === 'loss_reasons' ? { lossReasonsPayloadVersion: 2 } : {}),
       }))
@@ -1777,6 +1862,7 @@ export class ReportsService {
   }
 
   async exportExcel(dto: ReportQueryDto, user: { id: string; role: UserRole }) {
+    await this.assertWorkspaceActor(dto, user);
     this.assertReportPeriod(dto);
     [dto] = await this.normalizeBuiltinRequests([dto]);
     const latestSyncAt = await this.latestReportSourceSyncAt();
@@ -1825,6 +1911,7 @@ export class ReportsService {
   }
 
   async enqueueExport(dto: ReportQueryDto, user: { id: string; role: UserRole }) {
+    await this.assertWorkspaceActor(dto, user);
     this.assertReportPeriod(dto);
     await this.assertReportAvailable(dto, await this.latestReportSourceSyncAt());
     const job = await this.prisma.exportJob.create({
@@ -1888,6 +1975,7 @@ export class ReportsService {
     const job = await this.prisma.exportJob.findUnique({ where: { id } });
     if (!job) throw new NotFoundException('Export job not found');
     this.ensureExportJobOwner(job.reportConfig, user);
+    await this.assertWorkspaceActor((job.reportConfig as any).dto, user);
     return {
       id: job.id,
       status: job.status,
@@ -1901,6 +1989,7 @@ export class ReportsService {
     const job = await this.prisma.exportJob.findUnique({ where: { id } });
     if (!job) throw new NotFoundException('Export job not found');
     this.ensureExportJobOwner(job.reportConfig, user);
+    await this.assertWorkspaceActor((job.reportConfig as any).dto, user);
     if (job.status !== ExportJobStatus.SUCCESS || !job.filePath) {
       throw new NotFoundException('Export file is not ready');
     }
@@ -1915,6 +2004,27 @@ export class ReportsService {
     if (user.role === UserRole.ADMIN) return;
     const ownerId = (reportConfig as any)?.user?.id;
     if (ownerId !== user.id) throw new ForbiddenException('Export job is not available');
+  }
+
+  private async assertWorkspaceActor(dto: ReportQueryDto, user: { id: string; role: UserRole }) {
+    if (!this.workspaceAccess) {
+      if(process.env.NODE_ENV==='test')return; // Isolated legacy unit fixtures only.
+      throw new ServiceUnavailableException('Проверка прав отчёта недоступна');
+    }
+    const current = await this.workspaceAccess.resolve(user.id);
+    const workspace = dto?.filters?._workspace as ReportFilters['_workspace'];
+    if (current.role === 'ADMIN' && !workspace) return;
+    if (!workspace || workspace.fingerprint !== current.fingerprint) {
+      throw new ForbiddenException('Права изменились. Пересоздайте отчёт в своём кабинете');
+    }
+    const department = await this.workspaceAccess.department(current, workspace.departmentKey);
+    const allowed = await this.workspaceAccess.managerIds(current, department);
+    if (workspace.managerIds.some(id => !allowed.includes(id)) ||
+      workspace.pipelineIds.some(id => !department.pipelineIds.includes(id)) ||
+      workspace.assemblyPipelineId !== department.assemblyPipelineId ||
+      (current.managerId && workspace.ownManagerId !== current.managerId)) {
+      throw new ForbiddenException('Недопустимая область отчёта');
+    }
   }
 
   private compactHeap() {
@@ -2050,6 +2160,7 @@ ${sheets}
     return this.xmlText(value).replace(/"/g, '&quot;');
   }
   private async computeDataContract(filters: ReportFilters, contract: DataContractConfig, role: UserRole) {
+    if (filters._workspace) filters = { ...filters, managerIds: filters._workspace.managerIds };
     if (contract.entity === 'task') return this.computeTaskDataContract(filters, contract, role);
 
     const groupBy = contract.groupBy ?? 'manager';
@@ -3867,6 +3978,7 @@ ${sheets}
   }
 
   private async computeCurrentStageAgeReport(filters: ReportFilters, role: UserRole) {
+    if (filters._workspace) filters = { ...filters, managerIds: filters._workspace.managerIds };
     const managers = await this.visibleManagers(role, filters.groupIds, filters.managerIds);
     const managerIds = managers.map((manager) => manager.id);
 
@@ -4161,8 +4273,8 @@ ${sheets}
     if (report.type !== 'revenueProfitForecast' || !report.ready || !csmGroup) {
       throw new ServiceUnavailableException('Данные отгрузок в общем снимке прогноза недоступны');
     }
-    const actualRows = (report.rows ?? []).filter((row: any) => ['salesShippedThisMonth', 'repeatShippedThisMonth'].includes(row.id));
-    if (actualRows.length !== 2) throw new ServiceUnavailableException('В снимке прогноза нет фактических отгрузок');
+    const actualRows = (report.rows ?? []).filter((row: any) => ['salesShippedThisMonth', 'repeatShippedThisMonth','unassignedShippedThisMonth'].includes(row.id));
+    if (actualRows.length < 2) throw new ServiceUnavailableException('В снимке прогноза нет фактических отгрузок');
     const entries = actualRows.flatMap((row: any) => (row.deals ?? []).map((sample: any) => {
       const shippedAt = new Date(sample.predictedShipAt);
       if (!sample.managerId || !sample.predictedShipAt || !Number.isFinite(shippedAt.getTime())) {
@@ -4204,9 +4316,11 @@ ${sheets}
         dealId: { in: [...new Set(entries.map((entry) => entry.dealId))] },
       },
     });
-    const dealsById = new Map(dealRows
+    const reportDeals = dealRows
       .filter((deal) => this.matchesCustomFieldFilters(deal.customFields as any, filters.customFields))
-      .map((deal) => [deal.dealId, this.factDealToReportDeal(deal)]));
+      .map((deal) => this.factDealToReportDeal(deal));
+    const attributed = this.commercialLinks ? await this.commercialLinks.attribute(reportDeals) : reportDeals;
+    const dealsById = new Map(attributed.map((deal) => [deal.id, deal]));
     const firstEntryByDeal = new Map<string, { deal: any; shippedAt: Date }>();
     for (const entry of entries) {
       const deal = dealsById.get(entry.dealId);
@@ -4236,13 +4350,15 @@ ${sheets}
     const actualShipping = await this.getActualShipping({ ...filters, dateFrom: monthFrom.toISOString(), dateTo: this.endOfMoscowDay(now).toISOString() }, role);
     const alreadyShippedIds = new Set(actualShipping.entries.map(({ deal }) => deal.id));
 
-    const assemblyDeals = (await this.findCurrentStageDealsFromFacts(this.fixedPipelineFilters(filters, refs.assemblyPipeline!.id), role))
+    const assemblyFilters=this.fixedPipelineFilters(filters, refs.assemblyPipeline!.id);
+    assemblyFilters.excludeStageIds=[...new Set([...(assemblyFilters.excludeStageIds||[]),refs.shippingDoneStage!.id,...refs.assemblyStages.filter(stage=>this.isBusinessWonStage(stage)||this.isBusinessLostStage(stage)).map(stage=>stage.id)])];
+    const assemblyDeals = (await this.findCurrentStageDealsFromFacts(assemblyFilters, role))
       .filter((deal) => !alreadyShippedIds.has(deal.id) && !this.isBusinessWonStage(deal.stage) && !this.isBusinessLostStage(deal.stage));
-    const invoiceDeals = await this.findCurrentStageDealsFromFacts(
+    let invoiceDeals = await this.findCurrentStageDealsFromFacts(
       this.fixedPipelineFilters(filters, refs.salesPipeline!.id, [refs.invoiceStage!.id]),
       role,
     );
-    const quoteDeals = await this.findCurrentStageDealsFromFacts(
+    let quoteDeals = await this.findCurrentStageDealsFromFacts(
       this.fixedPipelineFilters(filters, refs.salesPipeline!.id, refs.quoteStages.map((stage) => stage.id)),
       role,
     );
@@ -4261,6 +4377,17 @@ ${sheets}
       repeatDealGroups.push({ pipeline, invoiceDeals: repeatInvoiceDeals, quoteDeals: repeatQuoteDeals });
     }
 
+    if (this.commercialLinks) {
+      const possibleIds = [...invoiceDeals, ...quoteDeals, ...repeatDealGroups.flatMap(g => [...g.invoiceDeals, ...g.quoteDeals])].map(d => d.id);
+      const linked = possibleIds.length ? await this.prisma.commercialShipmentLink.findMany({ where: { saleDealId: { in: possibleIds }, status: 'CONFIRMED' }, select: { saleDealId: true } }) : [];
+      const alreadyTransferred = new Set(linked.map(l => l.saleDealId));
+      invoiceDeals = invoiceDeals.filter(d => !alreadyTransferred.has(d.id));
+      quoteDeals = quoteDeals.filter(d => !alreadyTransferred.has(d.id));
+      for (const group of repeatDealGroups) {
+        group.invoiceDeals = group.invoiceDeals.filter(d => !alreadyTransferred.has(d.id));
+        group.quoteDeals = group.quoteDeals.filter(d => !alreadyTransferred.has(d.id));
+      }
+    }
     const paymentGroups: ForecastPaymentGroup[] = [
       {
         key: 'sales',
@@ -4281,7 +4408,7 @@ ${sheets}
     ];
 
     const stagePositions = new Map(refs.assemblyStages.map((stage) => [stage.id, stage.position]));
-    const engineResult = await new RevenueForecastEngine(this.prisma).compute({
+    const engineResult = await new RevenueForecastEngine(this.prisma,(await this.latestReportSourceSyncAt())?.toISOString()).compute({
       now,
       monthTo,
       assemblyDeals,
@@ -4370,7 +4497,9 @@ ${sheets}
       }
     }
 
-    const rows = Object.values(buckets).map((bucket) => ({
+    const rows = Object.values(buckets).filter(bucket=>!bucket.id.startsWith('unassigned')||bucket.count>0)
+      .filter(bucket=>!filters._workspace||(filters._workspace.departmentKey==='sales'?!bucket.id.startsWith('repeat'):!bucket.id.startsWith('sales')))
+      .map((bucket) => ({
       ...bucket,
       revenue: Number(bucket.revenue.toFixed(2)),
       profit: Number((bucket.profit ?? 0).toFixed(2)),
@@ -4389,6 +4518,13 @@ ${sheets}
       .reduce((sum, item) => sum + item.amount * item.probability, 0);
     const report = {
       type: 'revenueProfitForecast',
+      paymentProjection: {
+        horizon: monthTo.toISOString(),
+        expectedOpenAmount: Number(paymentGroups.flatMap(g => g.deals).reduce((sum, d) => sum + Number(d.amount || 0) * (engineResult.predictions.get(d.id)?.paymentProbabilityPercent || 0) / 100, 0).toFixed(2)),
+        deals: paymentGroups.flatMap(g => g.deals).map(d => ({ dealId: d.id, title: d.title, amount: Number(d.amount || 0), managerId:d.responsibleId,
+          probabilityPercent: engineResult.predictions.get(d.id)?.paymentProbabilityPercent ?? null,
+          source: engineResult.predictions.get(d.id)?.probabilitySource ?? null })),
+      },
       ready: true,
       modelVersion: engineResult.modelVersion,
       month: {
@@ -4949,6 +5085,9 @@ ${sheets}
 
   private createRevenueForecastBuckets() {
     return {
+      unassignedShippedThisMonth:{id:'unassignedShippedThisMonth',label:'Не распределено: уже отгружено',count:0,revenue:0,profit:null as number|null,deals:[] as any[]},
+      unassignedShippingThisMonth:{id:'unassignedShippingThisMonth',label:'Не распределено: ожидаемая отгрузка',count:0,revenue:0,profit:null as number|null,deals:[] as any[]},
+      unassignedNotThisMonth:{id:'unassignedNotThisMonth',label:'Не распределено: низкая вероятность отгрузки',count:0,revenue:0,profit:null as number|null,deals:[] as any[]},
       salesShippedThisMonth: {
         id: 'salesShippedThisMonth',
         label: 'Продажи: уже отгружено',
@@ -5057,19 +5196,21 @@ ${sheets}
     };
 
     return [
-      combine('totalShippedThisMonth', 'Уже отгружено', ['salesShippedThisMonth', 'repeatShippedThisMonth']),
-      combine('totalShippingThisMonth', 'В отгрузке, вероятность от 50%', ['salesShippingThisMonth', 'repeatShippingThisMonth']),
+      combine('totalShippedThisMonth', 'Уже отгружено', ['salesShippedThisMonth', 'repeatShippedThisMonth','unassignedShippedThisMonth']),
+      combine('totalShippingThisMonth', 'В отгрузке, вероятность от 50%', ['salesShippingThisMonth', 'repeatShippingThisMonth','unassignedShippingThisMonth']),
       combine('totalInvoiceThisMonth', 'Счета, вероятность отгрузки от 50%', ['salesInvoiceThisMonth', 'repeatInvoiceThisMonth']),
       combine('totalQuoteThisMonth', 'КП, вероятность отгрузки от 50%', ['salesQuoteThisMonth', 'repeatQuoteThisMonth']),
-      combine('totalNotThisMonth', 'Низкая вероятность отгрузки', ['salesNotThisMonth', 'repeatNotThisMonth']),
+      combine('totalNotThisMonth', 'Низкая вероятность отгрузки', ['salesNotThisMonth', 'repeatNotThisMonth','unassignedNotThisMonth']),
     ];
   }
 
   private revenueForecastShippedBucket(deal: any, refs: { csmGroup?: { id: string; name: string } | null }): RevenueForecastBucketKey {
+    if(deal.responsibleId==='unassigned-commercial')return 'unassignedShippedThisMonth';
     return this.isRepeatRevenueForecastDeal(deal, refs) ? 'repeatShippedThisMonth' : 'salesShippedThisMonth';
   }
 
   private revenueForecastShippingBucket(deal: any, refs: { csmGroup?: { id: string; name: string } | null }, inMonth: boolean): RevenueForecastBucketKey {
+    if(deal.responsibleId==='unassigned-commercial')return inMonth?'unassignedShippingThisMonth':'unassignedNotThisMonth';
     const isRepeat = this.isRepeatRevenueForecastDeal(deal, refs);
     if (isRepeat) return inMonth ? 'repeatShippingThisMonth' : 'repeatNotThisMonth';
     return inMonth ? 'salesShippingThisMonth' : 'salesNotThisMonth';
@@ -5298,6 +5439,10 @@ ${sheets}
     fromStageId?: string,
     options: { amoEvent?: boolean; includeSystem?: boolean } = {},
   ) {
+    if (filters._workspace) {
+      const actor = filters._workspace.ownManagerId;
+      filters = { ...filters, groupIds: undefined, managerIds: actor ? [actor] : undefined };
+    }
     const targetStages = await this.prisma.pipelineStage.findMany({
       where: { id: { in: stageIds } },
       select: {
@@ -5423,9 +5568,12 @@ ${sheets}
     const dealById = new Map(deals.map((deal) => [deal.id, deal]));
     return occurrences.flatMap((occurrence) => {
       const deal = dealById.get(occurrence.dealId);
+      const scope=filters._workspace;
+      const redact=Boolean(deal&&scope&&(!scope.pipelineIds.includes(deal.pipelineId)||(scope.ownManagerId&&deal.responsibleId!==scope.ownManagerId)));
       return deal
         ? [{
             ...deal,
+            ...(redact?{externalId:null,title:'Историческое действие по переданной сделке',stage:null,pipeline:null,updatedAt:null}:{}),
             responsibleId: occurrence.responsibleId ?? deal.responsibleId,
             responsible: occurrence.responsibleId
               ? {
@@ -5520,9 +5668,10 @@ ${sheets}
       where: await this.buildFactDealWhere(filters, role, extraWhere),
       orderBy: { updatedAt: 'desc' },
     });
-    return deals
+    const result = deals
       .filter((deal) => this.matchesCustomFieldFilters(deal.customFields as any, filters.customFields))
       .map((deal) => this.factDealToReportDeal(deal));
+    return this.commercialLinks ? this.commercialLinks.attribute(result) : result;
   }
 
   private async findCurrentStageDealsFromFacts(filters: ReportFilters, role: UserRole) {
@@ -5531,9 +5680,10 @@ ${sheets}
       orderBy: { updatedAt: 'desc' },
     });
 
-    return rows
+    const result = rows
       .filter((deal) => this.matchesCustomFieldFilters(deal.customFields as any, filters.customFields))
       .map((deal) => this.factDealToReportDeal(deal));
+    return this.commercialLinks ? this.commercialLinks.attribute(result) : result;
   }
 
   private async buildFactDealWhere(
@@ -5566,6 +5716,23 @@ ${sheets}
       ? filters.managerIds.filter((id) => visibleManagerIds.includes(id))
       : visibleManagerIds;
     where.responsibleId = { in: responsibleIds };
+
+    const workspace = filters._workspace;
+    if (workspace && this.commercialLinks) {
+      delete where.responsibleId;
+      const assembly = await this.commercialLinks.assemblyScope(workspace.assemblyPipelineId, workspace.departmentKey, workspace.managerIds);
+      where.AND = [{ OR: [{ pipelineId: { in: workspace.pipelineIds }, responsibleId: { in: workspace.managerIds } }, assembly] }];
+    } else if (this.commercialLinks && filters.pipelineIds?.length === 1) {
+      const departments = await this.prisma.workspaceDepartment.findMany();
+      const assemblyId = departments[0]?.assemblyPipelineId;
+      if (assemblyId && filters.pipelineIds[0] === assemblyId) {
+        delete where.responsibleId;
+        if (filters.managerIds?.length || filters.groupIds?.length) {
+          const dept = departments.find(d => filters.groupIds?.includes(d.groupId));
+          where.AND = [await this.commercialLinks.assemblyScope(assemblyId, dept?.key, filters.managerIds)];
+        }
+      }
+    }
 
     return where;
   }
