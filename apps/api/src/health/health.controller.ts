@@ -2,12 +2,11 @@ import { Controller, Get, ServiceUnavailableException } from '@nestjs/common';
 import { ApiRuntimeMetrics } from '../common/api-memory.interceptor';
 import { PrismaService } from '../prisma/prisma.service';
 import { DataQualityService } from '../quality/data-quality.service';
-import { METRIC_VERSION, RELEASE_BUILD_ID } from '../quality/release-info';
+import { METRIC_VERSION, RELEASE_BUILD_ID, REQUIRED_WORKER_ROLES } from '../quality/release-info';
 
 const MB = 1024 * 1024;
 const PROCESS_STARTED_AT = new Date();
 const REPORT_ACTIVITY_WINDOW_MS = 60 * 60_000;
-const REQUIRED_WORKER_ROLES = ['sync', 'report', 'notification', 'export', 'bootstrap', 'crm-control'];
 
 @Controller('health')
 export class HealthController {
@@ -173,7 +172,7 @@ export class HealthController {
       apiP95: api.p95Ms > 3_000,
       workerRestarted: workerRestartedRecently,
       workerHeartbeatStale: staleWorkerHeartbeat,
-      crmControlWorkerMissing: !requiredWorkers.some((worker) => worker.role === 'crm-control'),
+      workerMissing: REQUIRED_WORKER_ROLES.some((role) => !requiredWorkers.some((worker) => worker.role === role)),
       reportFailures: reportQueue.failed > 0,
       syncFailures: failedRawAmoEvents > 0,
     };
