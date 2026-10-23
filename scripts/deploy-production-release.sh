@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Build artifacts and dependencies must remain readable by the service and nginx,
+# even when the operator protects the deployment log with a private umask.
+umask 022
 
 BRANCH="${BRANCH:-main}"
 WORKTREE="${WORKTREE:-/opt/analytics-worktree}"
