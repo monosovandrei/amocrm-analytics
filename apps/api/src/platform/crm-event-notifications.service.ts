@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { DeliveryStatus, PlatformBusinessRole, Prisma, UserRole } from '../generated/prisma';
 import { PrismaService } from '../prisma/prisma.service';
 import { TelegramService } from './telegram.service';
+import { TELEGRAM_PARAMETERS } from './telegram-configuration';
 import {
   addMoscowBusinessTime,
   isMoscowBusinessDay,
@@ -54,30 +55,22 @@ const TELEGRAM_DELIVERY_MODES = new Set<TelegramDeliveryMode>([
 ]);
 const PERSONAL_TELEGRAM_EVENTS = new Set(['amo_new_assigned_lead', 'amo_assigned_lead_10m', 'amo_take_to_work_enabled']);
 
-const PAYMENT_NOTIFICATION_ROUTES = [
-  {
-    pipelineNames: ['\u0412\u043e\u0440\u043e\u043d\u043a\u0430 \u041f\u0440\u043e\u0434\u0430\u0436\u0438'],
-    recipientCrmExternalIds: ['13930346'],
-  },
-  {
-    pipelineNames: ['\u0411\u0430\u0437\u0430', '\u0417\u0430\u043a\u0440\u0435\u043f\u043b\u0435\u043d\u043d\u044b\u0435 \u041a\u043e\u043c\u043f\u0430\u043d\u0438\u0438'],
-    recipientCrmExternalIds: ['7462243'],
-  },
-] as const;
 
 @Injectable()
 export class CrmEventNotificationsService {
   private readonly logger = new Logger(CrmEventNotificationsService.name);
-  private readonly workSlaMinutes = 20;
-  private readonly assignedLeadReminderMinutes = 10;
-  private readonly offHoursFirstPingHour = 10;
-  private readonly offHoursFirstPingMinute = 30;
-  private readonly massTaskMoveThreshold = 5;
-  private readonly massTaskMoveWindowMinutes = 15;
-  private readonly overdueTasksThreshold = 5;
-  private readonly csmDailyCheckHour = 13;
-  private readonly highValueIdleAmount = 20_000;
-  private readonly highValueIdleHours = 24;
+  private parameters:Record<string,number>={};
+  private parameter(key:string){return this.parameters[key]??TELEGRAM_PARAMETERS.find(p=>p.key===key)!.value;}
+  private get workSlaMinutes(){return this.parameter('workSlaMinutes');}
+  private get assignedLeadReminderMinutes(){return this.parameter('assignedLeadReminderMinutes');}
+  private get offHoursFirstPingHour(){return this.parameter('offHoursFirstPingHour');}
+  private get offHoursFirstPingMinute(){return this.parameter('offHoursFirstPingMinute');}
+  private get massTaskMoveThreshold(){return this.parameter('massTaskMoveThreshold');}
+  private get massTaskMoveWindowMinutes(){return this.parameter('massTaskMoveWindowMinutes');}
+  private get overdueTasksThreshold(){return this.parameter('overdueTasksThreshold');}
+  private get csmDailyCheckHour(){return this.parameter('csmDailyCheckHour');}
+  private get highValueIdleAmount(){return this.parameter('highValueIdleAmount');}
+  private get highValueIdleHours(){return this.parameter('highValueIdleHours');}
 
   constructor(
     private readonly prisma: PrismaService,
@@ -87,7 +80,10 @@ export class CrmEventNotificationsService {
   async processRecentAmoEvents(
     options: { since?: Date; domain?: string; includeEventDriven?: boolean; includeStateScans?: boolean } = {},
   ) {
-    const since = options.since ?? new Date(Date.now() - 15 * 60_000);
+    const settings=await this.prisma.telegramSettings.findUnique({where:{id:'default'}});
+    this.parameters=(settings?.parameters||{}) as Record<string,number>;
+    const originalSince=options.since??new Date(Date.now()-15*60_000);
+    const since=settings?.resumedAt&&settings.resumedAt>originalSince?settings.resumedAt:originalSince;
     const domain = options.domain ?? (await this.resolveAmoDomain());
     const includeEventDriven = options.includeEventDriven ?? true;
     const includeStateScans = options.includeStateScans ?? true;
@@ -136,6 +132,7 @@ export class CrmEventNotificationsService {
       proposalStale: 0,
       highValueIdle: 0,
     };
+    if(!settings?.enabled)return result;
     const leaders = this.salesLeaderUsers(users);
     const csmLeaders = this.csmLeaderUsers(users);
 
@@ -294,14 +291,10 @@ export class CrmEventNotificationsService {
     });
 
     const eventKey = `amo:payment:${event.externalId}:${deal.responsibleId}`;
-    const routeDeliveries = await this.sendPaymentNotificationByPipeline(stage, message, payload, eventKey);
-    if (routeDeliveries) return routeDeliveries.some((delivery) => delivery?.status === 'SENT');
-
     const configuredDeliveries = await this.sendConfiguredNotification('amo_payment_received', message, payload, eventKey);
     if (configuredDeliveries) return configuredDeliveries.some((delivery) => delivery?.status === 'SENT');
-
-    const delivery = await this.telegram.sendDirectMessageToCrmUser(deal.responsibleId, message, payload, undefined, eventKey);
-    return delivery.status === 'SENT';
+    const routed=await this.sendPaymentNotificationByPipeline(stage,message,payload,eventKey);
+    return Boolean(routed?.some(delivery=>delivery.status==='SENT'));
   }
 
   private async sendPaymentNotificationByPipeline(
@@ -310,48 +303,10 @@ export class CrmEventNotificationsService {
     payload: Record<string, unknown>,
     eventKey: string,
   ) {
-    const route = PAYMENT_NOTIFICATION_ROUTES.find((item) => {
-      const pipelineName = this.normalizeText(stage.pipeline.name);
-      return item.pipelineNames.some((name) => this.normalizeText(name) === pipelineName);
-    });
-    if (!route) return null;
-
-    const recipients = await this.prisma.crmUser.findMany({
-      where: {
-        externalId: { in: [...route.recipientCrmExternalIds] },
-        isActive: true,
-        isVisible: true,
-        telegramAccount: { is: { isActive: true } },
-      },
-      select: { id: true },
-    });
-
-    if (!recipients.length) {
-      return [
-        await this.recordSkipped(
-          `${eventKey}:payment-route`,
-          message,
-          {
-            ...payload,
-            paymentRoute: 'pipeline',
-            paymentPipeline: stage.pipeline.name,
-            reason: '\u041f\u043e\u043b\u0443\u0447\u0430\u0442\u0435\u043b\u044c Telegram \u0434\u043b\u044f \u0432\u043e\u0440\u043e\u043d\u043a\u0438 \u043d\u0435 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0451\u043d',
-          },
-        ),
-      ];
-    }
-
-    return this.telegram.sendDirectMessageToCrmUsers(
-      recipients.map((recipient) => recipient.id),
-      message,
-      {
-        ...payload,
-        paymentRoute: 'pipeline',
-        paymentPipeline: stage.pipeline.name,
-      },
-      undefined,
-      `${eventKey}:payment-route`,
-    );
+    const department=await this.prisma.workspaceDepartment.findFirst({where:{paymentStageIds:{has:stage.id}},select:{key:true}});
+    if(!department)return [];
+    const heads=await this.prisma.user.findMany({where:{isActive:true,businessRole:'ROP',departmentKey:department.key},select:{id:true}});
+    return this.telegram.sendDirectMessageToUsers(heads.map(head=>head.id),message,payload,undefined,`${eventKey}:department-heads`);
   }
 
   private async notifyWorkAccepted(event: any, leaders: AppUser[], domain: string) {
@@ -857,7 +812,7 @@ export class CrmEventNotificationsService {
   private async notifyInvoiceNoPayment(deal: any, leaders: AppUser[], domain: string, now: Date) {
     if (!leaders.length) return { sent: 0, skipped: 0 };
     const enteredAt = this.currentStageEnteredAt(deal);
-    if (moscowWeekdayElapsedMs(enteredAt, now) < 3 * 24 * 60 * 60_000) return { sent: 0, skipped: 0 };
+    if (moscowWeekdayElapsedMs(enteredAt, now) < this.parameter('invoiceNoPaymentDays') * 24 * 60 * 60_000) return { sent: 0, skipped: 0 };
 
     const eventKey = `amo:invoice-no-payment-3d:${deal.id}:${deal.stageId}`;
     const message = await this.renderNotification('amo_invoice_no_payment_3d', 'amo_invoice_no_payment_3d', {
@@ -884,7 +839,7 @@ export class CrmEventNotificationsService {
   private async notifyProposalStale(deal: any, leaders: AppUser[], domain: string, now: Date) {
     if (!leaders.length) return { sent: 0, skipped: 0 };
     const enteredAt = this.currentStageEnteredAt(deal);
-    if (moscowWeekdayElapsedMs(enteredAt, now) < 24 * 60 * 60_000) return { sent: 0, skipped: 0 };
+    if (moscowWeekdayElapsedMs(enteredAt, now) < this.parameter('proposalStaleHours') * 60 * 60_000) return { sent: 0, skipped: 0 };
 
     const eventKey = `amo:proposal-stale-24h:${deal.id}:${deal.stageId}`;
     const message = await this.renderNotification('amo_proposal_stale_24h', 'amo_proposal_stale_24h', {
@@ -1270,7 +1225,7 @@ export class CrmEventNotificationsService {
   }
 
   private preparedProposalIsStale(enteredAt: Date, now: Date) {
-    return moscowWeekdayElapsedMs(enteredAt, now) >= 2 * 24 * 60 * 60_000;
+    return moscowWeekdayElapsedMs(enteredAt, now) >= this.parameter('preparedProposalDays') * 24 * 60 * 60_000;
   }
 
   async leadSlaCards(options: { domain?: string } = {}) {
@@ -1543,13 +1498,7 @@ export class CrmEventNotificationsService {
     }
 
     if (config.mode === 'group') {
-      return this.telegram.sendMessageToGroups(
-        [],
-        message,
-        { ...payload, deliveryMode: config.mode },
-        undefined,
-        eventKey ? `${eventKey}:telegram-group` : undefined,
-      );
+      return this.telegram.sendMessageToSelectedGroups(config.groupIds||[],message,{...payload,deliveryMode:config.mode},eventKey?`${eventKey}:telegram-group`:undefined);
     }
 
     if (config.mode === 'all_connected') {
@@ -1565,6 +1514,7 @@ export class CrmEventNotificationsService {
 
     const deliveries = [];
     for (const recipient of config.recipients) {
+      if(!await this.recipientMaySeeNotification(recipient,payload))continue;
       const recipientEventKey = eventKey ? `${eventKey}:configured:${recipient.kind}:${recipient.id}` : undefined;
       if (recipient.kind === 'platform_user') {
         deliveries.push(await this.telegram.sendDirectMessageToUser(
@@ -1586,12 +1536,29 @@ export class CrmEventNotificationsService {
     }
     return deliveries;
   }
+  private async recipientMaySeeNotification(recipient:TelegramTemplateRecipient,payload:Record<string,unknown>){
+    let managerId=this.payloadCrmUserId(payload);
+    if(!managerId&&typeof payload.managerExternalId==='string')managerId=(await this.prisma.crmUser.findUnique({where:{externalId:payload.managerExternalId},select:{id:true}}))?.id||null;
+    const user=recipient.kind==='platform_user'?await this.prisma.user.findUnique({where:{id:recipient.id},select:{isActive:true,role:true,businessRole:true,departmentKey:true,crmUserId:true}}):
+      await this.prisma.user.findFirst({where:{crmUserId:recipient.id,isActive:true},select:{isActive:true,role:true,businessRole:true,departmentKey:true,crmUserId:true}});
+    if(user?.isActive&&(user.role==='ADMIN'||user.businessRole==='OWNER'))return true;
+    if(user?.isActive&&user.businessRole==='ROP'){
+      let department=typeof payload.team==='string'?payload.team:null;
+      if(!department&&typeof payload.dealId==='string'){
+        const deal=await this.prisma.factDealCurrent.findUnique({where:{dealId:payload.dealId},select:{pipelineId:true}});
+        if(deal)department=(await this.prisma.workspaceDepartment.findFirst({where:{pipelineIds:{has:deal.pipelineId}},select:{key:true}}))?.key||null;
+      }
+      return Boolean(department&&user.departmentKey===department);
+    }
+    return Boolean(managerId&&(recipient.kind==='crm_user'?recipient.id===managerId:user?.isActive&&user.crmUserId===managerId));
+  }
 
-  private async configuredTelegramDelivery(eventType: string): Promise<{ mode: TelegramDeliveryMode; recipients: TelegramTemplateRecipient[] }> {
+  private async configuredTelegramDelivery(eventType: string): Promise<{ mode: TelegramDeliveryMode; recipients: TelegramTemplateRecipient[];groupIds?:string[] }> {
     const template = await this.prisma.notificationTemplate.findUnique({
       where: { eventType },
-      select: { recipients: true },
+      select: { recipients: true,isActive:true,groupIds:true },
     });
+    if(!template||template.isActive===false)return {mode:'disabled',recipients:[]};
     const raw = template?.recipients;
     if (!Array.isArray(raw)) return { mode: 'system', recipients: [] };
     const disabled = raw.some((item) => {
@@ -1611,7 +1578,7 @@ export class CrmEventNotificationsService {
       .filter((item): item is TelegramTemplateRecipient =>
         (item.kind === 'platform_user' || item.kind === 'crm_user') && Boolean(item.id),
       );
-    if (deliveryMode) return { mode: String(deliveryMode.id) as TelegramDeliveryMode, recipients };
+    if (deliveryMode) return { mode: String(deliveryMode.id) as TelegramDeliveryMode, recipients,groupIds:template.groupIds };
     return recipients.length ? { mode: 'selected', recipients } : { mode: 'system', recipients: [] };
   }
 
@@ -1633,7 +1600,7 @@ export class CrmEventNotificationsService {
     const body = template?.isActive && template.body.trim()
       ? template.body
       : this.defaultNotificationBody(fallbackType);
-    return body.replace(/\{([a-zA-Z0-9_]+)\}/g, (_, key: string) => variables[key] ?? '');
+    return body.replace(/\{([a-zA-Z0-9_]+)\}/g, (_, key: string) => key==='checkTime'?`${String(this.csmDailyCheckHour).padStart(2,'0')}:00`:variables[key] ?? '');
   }
 
   private defaultNotificationBody(type: string) {

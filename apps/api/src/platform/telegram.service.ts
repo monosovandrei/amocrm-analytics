@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { randomInt } from 'crypto';
 import { DeliveryStatus, Prisma } from '../generated/prisma';
 import { PrismaService } from '../prisma/prisma.service';
+import { TELEGRAM_SEND_LOCK, TelegramPausedError } from './telegram-configuration';
 
 type TelegramUpdate = {
   update_id: number;
@@ -164,20 +165,23 @@ export class TelegramService {
     }
 
     const from = update.message?.from;
+    const linkedCrmUserId=linkCode.crmUserId??linkCode.user?.crmUserId??null;
+    const platformUsers=linkedCrmUserId&&!linkCode.userId?await this.prisma.user.findMany({where:{crmUserId:linkedCrmUserId,isActive:true},select:{id:true},take:2}):[];
+    const linkedUserId=linkCode.userId??(platformUsers.length===1?platformUsers[0].id:null);
     await this.prisma.$transaction(async (tx) => {
       await tx.telegramAccount.deleteMany({
         where: {
           OR: [
-            ...(linkCode.userId ? [{ userId: linkCode.userId }] : []),
-            ...(linkCode.crmUserId ? [{ crmUserId: linkCode.crmUserId }] : []),
+            ...(linkedUserId ? [{ userId: linkedUserId }] : []),
+            ...(linkedCrmUserId ? [{ crmUserId: linkedCrmUserId }] : []),
             { chatId },
           ],
         },
       });
       await tx.telegramAccount.create({
         data: {
-          userId: linkCode.userId ?? null,
-          crmUserId: linkCode.crmUserId ?? null,
+          userId: linkedUserId,
+          crmUserId: linkedCrmUserId,
           chatId,
           username: from?.username ?? null,
           firstName: from?.first_name ?? null,
@@ -287,7 +291,7 @@ export class TelegramService {
         eventKey,
         userId,
         telegramAccountId: account.id,
-        status: 'ERROR',
+        status: error instanceof TelegramPausedError ? 'SKIPPED' : 'ERROR',
         message,
         payload,
         alertEventId,
@@ -346,7 +350,7 @@ export class TelegramService {
       return this.recordDelivery({
         eventKey,
         telegramAccountId: account.id,
-        status: 'ERROR',
+        status: error instanceof TelegramPausedError ? 'SKIPPED' : 'ERROR',
         message,
         payload: { ...payload, crmUserId },
         alertEventId,
@@ -421,6 +425,10 @@ export class TelegramService {
   ) {
     return this.sendMessageToActiveGroups(userIds, message, payload, alertEventId, eventKey, false);
   }
+  async sendMessageToSelectedGroups(groupIds:string[],message:string,payload:Record<string,unknown>={},eventKey?:string){
+    if(!groupIds.length)return [];
+    return this.sendMessageToActiveGroups([],message,payload,undefined,eventKey,false,[],groupIds);
+  }
 
   async sendMessageToGroupsByCrmUsers(
     crmUserIds: string[],
@@ -483,7 +491,7 @@ export class TelegramService {
           eventKey: deliveryEventKey,
           userId: account.userId ?? undefined,
           telegramAccountId: account.id,
-          status: 'ERROR',
+          status: error instanceof TelegramPausedError ? 'SKIPPED' : 'ERROR',
           message,
           payload,
           alertEventId,
@@ -505,7 +513,13 @@ export class TelegramService {
   }
 
   async sendChatMessage(chatId: string, text: string, options: { parseMode?: 'HTML' } = {}) {
-    return this.telegramRequest('sendMessage', {
+    // Shared lock holds until Telegram responds. Pause takes the exclusive lock,
+    // so when the admin's pause finishes, no in-flight sender can bypass it.
+    return this.prisma.$transaction(async tx => {
+      await tx.$queryRaw`SELECT 1 AS locked FROM pg_advisory_xact_lock_shared(${TELEGRAM_SEND_LOCK})`;
+      const settings=await tx.telegramSettings.findUnique({where:{id:'default'}});
+      if(!settings?.enabled)throw new TelegramPausedError();
+      return this.telegramRequest('sendMessage', {
       method: 'POST',
       body: JSON.stringify({
         chat_id: chatId,
@@ -514,7 +528,8 @@ export class TelegramService {
         disable_web_page_preview: true,
       }),
       headers: { 'Content-Type': 'application/json' },
-    });
+      });
+    },{timeout:20000,maxWait:10000});
   }
 
   private async sendMessageToActiveGroups(
@@ -525,8 +540,9 @@ export class TelegramService {
     eventKey?: string,
     prependMentions = true,
     crmUserIds: string[] = [],
+    selectedGroupIds?:string[],
   ) {
-    const groupChats = await this.prisma.telegramChat.findMany({ where: { isActive: true }, orderBy: { linkedAt: 'desc' } });
+    const groupChats = await this.prisma.telegramChat.findMany({ where: { isActive: true,...(selectedGroupIds?{id:{in:selectedGroupIds}}:{}) }, orderBy: { linkedAt: 'desc' } });
     if (!groupChats.length) return [];
 
     if (!this.botToken) {
@@ -566,7 +582,7 @@ export class TelegramService {
         return this.recordDelivery({
           eventKey: deliveryEventKey,
           telegramChatId: chat.id,
-          status: 'ERROR',
+          status: error instanceof TelegramPausedError ? 'SKIPPED' : 'ERROR',
           message: groupMessage.text,
           payload,
           alertEventId,
@@ -639,7 +655,7 @@ export class TelegramService {
   }
 
   private async telegramRequest<T = any>(method: string, init?: RequestInit): Promise<T> {
-    const response = await fetch(`https://api.telegram.org/bot${this.botToken}/${method}`, init);
+    const response = await fetch(`https://api.telegram.org/bot${this.botToken}/${method}`, {...init,signal:AbortSignal.timeout(12000)});
     const data = (await response.json()) as T;
     if (!response.ok) {
       throw new Error(JSON.stringify(data));

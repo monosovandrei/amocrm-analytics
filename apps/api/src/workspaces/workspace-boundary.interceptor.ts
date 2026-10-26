@@ -8,6 +8,7 @@ export class WorkspaceBoundaryInterceptor implements NestInterceptor {
         const req = context.switchToHttp().getRequest();
         const path = String(req.url || '').split('?')[0].replace(/^\/api\/v1/, '');
         if(req.method==='PATCH'&&/^\/platform\/admin\/user-links\//.test(path))throw new GoneException('Назначайте права в новых настройках кабинетов');
+        if(req.method!=='GET'&&/^\/platform\/(alerts|schedules)(\/|$)/.test(path))throw new GoneException('Настраивайте рассылки в администраторском разделе Telegram');
         if (/^\/(crm-control(?:\/|$)|platform\/(?:rop-dashboard(?:-v2)?|email-threads)(?:\/|$))/.test(path)) {
             throw new GoneException('Раздел удалён. Используйте новый кабинет');
         }

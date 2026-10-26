@@ -40,7 +40,7 @@ export class PlatformSchedulerService {
       for (const incident of due.incidents) {
         const deliveries = await this.telegram.sendMessageToUsers(
           due.ownerUserIds,
-          this.quality.notificationText(incident),
+          this.quality.notificationText(incident,due.templates),
           { type: 'data-quality-incident', incidentId: incident.id, status: incident.status },
           undefined,
           `data-quality:${incident.id}:${incident.status}:${incident.notificationCount}`,

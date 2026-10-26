@@ -1,5 +1,16 @@
 import { ReportsService } from './reports.service';
 describe('report access revalidation', () => {
+    it.each(['CHECKING','BLOCKED','CERTIFIED'])('only sends certified Telegram report data: %s',async status=>{
+        const quality={reportQuality:jest.fn().mockResolvedValue({status})};
+        const access={resolve:jest.fn().mockResolvedValue({userId:'admin',role:'ADMIN'})};
+        const service=new ReportsService({} as any,{} as any,quality as any,undefined,access as any) as any;
+        service.latestReportSourceSyncAt=jest.fn().mockResolvedValue(new Date());
+        service.compute=jest.fn().mockResolvedValue({summary:{count:1}});
+        const result=service.notificationReport({name:'Отчёт',sourceType:'DEALS',config:{}},'admin');
+        if(status==='CERTIFIED')await expect(result).resolves.toMatchObject({report:{summary:{count:1}}});
+        else await expect(result).rejects.toThrow('данные ещё не прошли проверку');
+        expect(service.compute).toHaveBeenCalledWith(expect.anything(),expect.anything(),{requireFresh:true});
+    });
     const scope = { userId: 'a', role: 'MANAGER', departmentKey: 'sales', managerId: 'seller', fingerprint: 'v1', version: 1 };
     const department = { key: 'sales', pipelineIds: ['sales-pipeline'], assemblyPipelineId: 'assembly' };
     const dto = { filters: { _workspace: { departmentKey: 'sales', managerIds: ['seller'], ownManagerId: 'seller', pipelineIds: ['sales-pipeline'], assemblyPipelineId: 'assembly', fingerprint: 'v1' } } };

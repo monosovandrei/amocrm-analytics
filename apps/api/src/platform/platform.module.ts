@@ -8,10 +8,11 @@ import { CrmEventNotificationsService } from './crm-event-notifications.service'
 import { TelegramService } from './telegram.service';
 import { QualityModule } from '../quality/quality.module';
 import { QualityNotificationController } from './quality-notification.controller';
+import { TelegramAdminController } from './telegram-admin.controller';
 
 @Module({
   imports: [AuditModule, FactMartsModule, ReportsModule, QualityModule],
-  controllers: [PlatformController, QualityNotificationController],
+  controllers: [PlatformController, QualityNotificationController, TelegramAdminController],
   providers: [PlatformService, TelegramService, CrmEventNotificationsService],
   exports: [PlatformService, TelegramService, CrmEventNotificationsService],
 })

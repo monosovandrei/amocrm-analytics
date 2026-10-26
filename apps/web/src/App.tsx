@@ -48,6 +48,7 @@ import { api, downloadExcel, downloadFile } from '@/lib/api';
 import { moscowPresetDateInputs } from './report-period';
 import CrmControl from './CrmControl';
 import RoleWorkspace from './RoleWorkspace';
+import TelegramAdmin from './TelegramAdmin';
 import FieldCombobox from './FieldCombobox';
 import type {
   BuilderOperator,
@@ -902,7 +903,7 @@ export default function HomePage() {
 
   return <RoleWorkspace onLogout={() => { localStorage.removeItem('accessToken'); setUser(null); }}
     renderReport={(result, key, amoDomain) => <ReportResultDetails amoDomain={amoDomain ? `${amoDomain}.amocrm.ru` : ''} result={result} template={{ name: key, config: { builtinKey: key } } as ReportTemplate} />}
-    renderTelegram={() => <>{message&&<p role="status">{message}</p>}<PlatformTab user={user} onMessage={setMessage} /></>} />;
+    renderTelegram={() => <TelegramAdmin/>} />;
 
 }
 

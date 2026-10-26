@@ -362,6 +362,9 @@ export class DataQualityService {
   }
 
   async notificationsDue() {
+    const settings=await this.prisma.telegramSettings.findUnique({where:{id:'default'}});
+    const notification=(settings?.quality||{}) as any;
+    if(!settings?.enabled||notification.enabled!==true)return {incidents:[],ownerUserIds:[],templates:undefined as any};
     const now = Date.now();
     const incidents = await this.prisma.dataQualityIncident.findMany({
       where: {
@@ -373,16 +376,16 @@ export class DataQualityService {
       orderBy: { firstDetectedAt: 'asc' },
     });
     const due = incidents.filter((incident) => {
-      if (incident.status === 'RESOLVED') return !incident.resolvedNotifiedAt;
+      if (incident.status === 'RESOLVED') return notification.includeRecovery===true&&!incident.resolvedNotifiedAt&&(!settings.resumedAt||(incident.resolvedAt&&incident.resolvedAt>=settings.resumedAt));
       if (!incident.lastNotifiedAt) return true;
-      const delay = incident.notificationCount <= 1 ? 30 * 60_000 : 2 * 60 * 60_000;
+      const delay = (notification.repeatMinutes||30) * 60_000;
       return now - incident.lastNotifiedAt.getTime() >= delay;
     });
     const owners = await this.prisma.user.findMany({
-      where: { isActive: true, OR: [{ role: 'ADMIN' }, { businessRole: 'OWNER' }] },
+      where: { id:{in:notification.recipientIds||[]},isActive: true, OR: [{ role: 'ADMIN' }, { businessRole: 'OWNER' }] },
       select: { id: true },
     });
-    return { incidents: due, ownerUserIds: owners.map((owner) => owner.id) };
+    return { incidents: due, ownerUserIds: owners.map((owner) => owner.id),templates:notification.messages };
   }
 
   async markNotified(id: string, resolved: boolean) {
@@ -394,7 +397,9 @@ export class DataQualityService {
     });
   }
 
-  notificationText(incident: { id: string; code: string; message: string; status: string; firstDetectedAt: Date; resolvedAt: Date | null }) {
+  notificationText(incident: { id: string; code: string; message: string; status: string; firstDetectedAt: Date; resolvedAt: Date | null },templates?:{open:string;resolved:string}) {
+    const custom=incident.status==='RESOLVED'?templates?.resolved:templates?.open;
+    if(custom){const values:Record<string,string>={incidentId:incident.id,message:incident.message,detectedAt:incident.firstDetectedAt.toLocaleString('ru-RU',{timeZone:'Europe/Moscow'}),resolvedAt:(incident.resolvedAt||new Date()).toLocaleString('ru-RU',{timeZone:'Europe/Moscow'})};return custom.replace(/\{([^{}]+)\}/g,(_,key)=>values[key]||'');}
     if (incident.status === 'RESOLVED') {
       return `✅ Данные восстановлены\nИнцидент: ${incident.id}\nПроблема: ${incident.message}\nИсправлено: ${(incident.resolvedAt ?? new Date()).toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' })}`;
     }

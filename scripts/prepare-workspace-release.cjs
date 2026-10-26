@@ -22,6 +22,10 @@ process.env.WORKER_ROLE='verification';
     const applied=process.argv.includes('--apply');
     const summary={applied,departments:definitions.map(d=>d.key),accounts:[],links:null,plansCopied:0};
     if(!applied){console.log(JSON.stringify(summary));return;}
+    // This is a one-time migration, not a source of truth for later admin edits.
+    if(!process.argv.includes('--currency-only')&&!process.argv.includes('--reapply-workspace-migration')&&await p.auditLog.findFirst({where:{action:'workspace.migration.prepared'},select:{id:true}})){
+      console.log(JSON.stringify({applied:false,alreadyPrepared:true}));return;
+    }
     const connection=await p.amoConnection.findFirst({orderBy:{createdAt:'desc'},select:{accountId:true}});
     const account=connection?.accountId?await p.amoAccountSnapshot.findUnique({where:{externalId:connection.accountId},select:{raw:true}}):null;
     if(account?.raw?.currency!=='EUR')throw new Error('Валюта аккаунта не подтверждена как EUR. Автоматический пересчёт или подмена единиц запрещены');

@@ -1151,6 +1151,7 @@ model AlertRule {
   name              String
   description       String?
   enabled           Boolean       @default(true)
+  version           Int           @default(1)
   metricKey         String?
   operator          AlertOperator @default(GTE)
   threshold         Decimal?
@@ -1222,8 +1223,21 @@ model NotificationTemplate {
   body      String
   recipients Json    @default("[]")
   isActive  Boolean  @default(true)
+  version   Int      @default(1)
+  enabledAt DateTime?
+  groupIds  String[] @default([])
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+model TelegramSettings {
+  id          String   @id @default("default")
+  enabled     Boolean  @default(false)
+  resumedAt   DateTime?
+  version     Int      @default(1)
+  parameters  Json     @default("{}")
+  quality     Json     @default("{}")
+  updatedAt   DateTime @updatedAt
 }
 
 model PlanSet {
@@ -1346,6 +1360,7 @@ model ReportSchedule {
   reportTemplateId String?
   name             String
   enabled          Boolean                 @default(true)
+  version          Int                     @default(1)
   frequency        ReportScheduleFrequency @default(DAILY)
   cron             String?
   timeOfDay        String                  @default("09:00")

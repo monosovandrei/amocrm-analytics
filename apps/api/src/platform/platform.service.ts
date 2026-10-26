@@ -1,4 +1,4 @@
-import { BadRequestException, ForbiddenException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, GoneException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import {
   AlertOperator,
   DeliveryStatus,
@@ -1501,39 +1501,8 @@ export class PlatformService {
 
   async updateTelegramTemplate(actor: AuthUser, eventType: string, body: Record<string, any>) {
     this.ensureTelegramOwner(actor);
-    const defaults = this.defaultTelegramTemplates().find((template) => template.eventType === eventType);
-    if (!defaults) throw new NotFoundException('Шаблон не найден');
-    const text = String(body.body ?? '').trim();
-    if (!text) throw new BadRequestException('Текст уведомления обязателен');
-    const recipients = body.recipients === undefined ? undefined : await this.parseTelegramRecipients(body.recipients);
-    const deliveryMode = this.parseTelegramDeliveryMode(body.deliveryMode, body.recipientsMode, recipients);
-    if (!this.telegramDeliveryModeAllowed(eventType, deliveryMode)) {
-      throw new BadRequestException('\u041d\u0435\u0434\u043e\u043f\u0443\u0441\u0442\u0438\u043c\u044b\u0439 \u0440\u0435\u0436\u0438\u043c \u0434\u043e\u0441\u0442\u0430\u0432\u043a\u0438 \u0434\u043b\u044f \u044d\u0442\u043e\u0433\u043e \u0443\u0432\u0435\u0434\u043e\u043c\u043b\u0435\u043d\u0438\u044f');
-    }
-    if (deliveryMode === 'selected' && !(recipients ?? []).length) {
-      throw new BadRequestException('\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u043f\u043e\u043b\u0443\u0447\u0430\u0442\u0435\u043b\u0435\u0439');
-    }
-    const storedRecipients = body.deliveryMode === undefined && body.recipientsMode === undefined && recipients === undefined
-      ? undefined
-      : this.telegramRecipientsForStorage(deliveryMode, recipients ?? []);
-    return this.prisma.notificationTemplate.upsert({
-      where: { eventType },
-      create: {
-        eventType,
-        name: defaults.name,
-        body: text,
-        recipients: this.json(storedRecipients ?? []),
-        isActive: body.isActive === undefined ? true : Boolean(body.isActive),
-      },
-      update: {
-        name: defaults.name,
-        body: text,
-        ...(storedRecipients === undefined ? {} : { recipients: this.json(storedRecipients) }),
-        isActive: body.isActive === undefined ? true : Boolean(body.isActive),
-      },
-    });
+    throw new GoneException('Настраивайте правила в новом разделе Telegram');
   }
-
   createTelegramLinkCode(userId: string) {
     return this.telegram.createLinkCode(userId);
   }
@@ -1563,91 +1532,91 @@ export class PlatformService {
         eventType: 'amo_new_assigned_lead',
         name: '\u041d\u043e\u0432\u044b\u0439 \u043b\u0438\u0434 \u043c\u0435\u043d\u0435\u0434\u0436\u0435\u0440\u0443',
         body: '{managerMention}, \u0442\u0435\u0431\u0435 \u043f\u0440\u0438\u0448\u0435\u043b \u043d\u043e\u0432\u044b\u0439 \u043b\u0438\u0434! \u0421\u0441\u044b\u043b\u043a\u0430: {dealUrl}',
-        isActive: true,
+        isActive: false,
       },
       {
         eventType: 'amo_assigned_lead_10m',
         name: '\u041b\u0438\u0434 \u0432\u0438\u0441\u0438\u0442 10 \u043c\u0438\u043d\u0443\u0442',
         body: '{managerMention}, \u043b\u0438\u0434 \u0432\u0438\u0441\u0438\u0442 10 \u043c\u0438\u043d\u0443\u0442! \u0411\u0435\u0440\u0438: {dealUrl}',
-        isActive: true,
+        isActive: false,
       },
       {
         eventType: 'amo_take_to_work_enabled',
         name: '\u0412\u0437\u044f\u0442\u044c \u0432 \u0440\u0430\u0431\u043e\u0442\u0443 = \u0415\u0441\u0442\u044c',
         body: '{managerMention}, \u0443 \u0442\u0435\u0431\u044f \u0432\u0445\u043e\u0434\u044f\u0449\u0438\u0439 \u043b\u0438\u0434 \u043f\u0440\u043e\u0441\u0440\u043e\u0447\u0435\u043d! \u0421\u0441\u044b\u043b\u043a\u0430 \u043d\u0430 \u0441\u0434\u0435\u043b\u043a\u0443: {dealUrl}',
-        isActive: true,
+        isActive: false,
       },
       {
         eventType: 'amo_payment_received',
         name: '\u041e\u043f\u043b\u0430\u0442\u0430 \u043f\u043e\u043b\u0443\u0447\u0435\u043d\u0430',
         body: '\u041e\u043f\u043b\u0430\u0442\u0430 \u043f\u043e\u043b\u0443\u0447\u0435\u043d\u0430\n\u0421\u0434\u0435\u043b\u043a\u0430: {deal}\n\u041c\u0435\u043d\u0435\u0434\u0436\u0435\u0440: {manager}\n\u0421\u0443\u043c\u043c\u0430: {amount}\n\u0421\u0441\u044b\u043b\u043a\u0430 \u043d\u0430 \u0441\u0434\u0435\u043b\u043a\u0443: {dealUrl}',
-        isActive: true,
+        isActive: false,
       },
       {
         eventType: 'amo_task_mass_reschedule',
         name: '\u041c\u0430\u0441\u0441\u043e\u0432\u044b\u0439 \u043f\u0435\u0440\u0435\u043d\u043e\u0441 \u0437\u0430\u0434\u0430\u0447',
         body: '{manager} \u043f\u0435\u0440\u0435\u043d\u0435\u0441 {taskCount} \u0437\u0430\u0434\u0430\u0447, \u043f\u0440\u043e\u0432\u0435\u0440\u044c.',
-        isActive: true,
+        isActive: false,
       },
       {
         eventType: 'amo_deal_mass_move',
         name: '\u041c\u0430\u0441\u0441\u043e\u0432\u044b\u0439 \u043f\u0435\u0440\u0435\u043d\u043e\u0441 \u0441\u0434\u0435\u043b\u043e\u043a',
         body: '{manager} \u043f\u0435\u0440\u0435\u043d\u0435\u0441 {dealCount} \u0441\u0434\u0435\u043b\u043e\u043a, \u043f\u0440\u043e\u0432\u0435\u0440\u044c.',
-        isActive: true,
+        isActive: false,
       },
       {
         eventType: 'amo_csm_task_mass_reschedule',
         name: 'CSM: \u043c\u0430\u0441\u0441\u043e\u0432\u044b\u0439 \u043f\u0435\u0440\u0435\u043d\u043e\u0441 \u0437\u0430\u0434\u0430\u0447',
         body: '{manager} \u043f\u0435\u0440\u0435\u043d\u0435\u0441 {taskCount} \u0437\u0430\u0434\u0430\u0447, \u043f\u0440\u043e\u0432\u0435\u0440\u044c.',
-        isActive: true,
+        isActive: false,
       },
       {
         eventType: 'amo_csm_deal_mass_move',
         name: 'CSM: \u043c\u0430\u0441\u0441\u043e\u0432\u044b\u0439 \u043f\u0435\u0440\u0435\u043d\u043e\u0441 \u0441\u0434\u0435\u043b\u043e\u043a',
         body: '{manager} \u043f\u0435\u0440\u0435\u043d\u0435\u0441 {dealCount} \u0441\u0434\u0435\u043b\u043e\u043a, \u043f\u0440\u043e\u0432\u0435\u0440\u044c.',
-        isActive: true,
+        isActive: false,
       },
       {
         eventType: 'amo_csm_overdue_tasks',
         name: 'CSM: \u0431\u043e\u043b\u044c\u0448\u0435 5 \u043f\u0440\u043e\u0441\u0440\u043e\u0447\u0435\u043d\u043d\u044b\u0445 \u0437\u0430\u0434\u0430\u0447',
         body: '\u0423 {manager} {taskCount} \u043f\u0440\u043e\u0441\u0440\u043e\u0447\u0435\u043d\u043d\u044b\u0445 \u0437\u0430\u0434\u0430\u0447, \u043f\u0440\u043e\u0432\u0435\u0440\u044c.',
-        isActive: true,
+        isActive: false,
       },
       {
         eventType: 'amo_csm_zero_taken_to_work_13',
         name: 'CSM: 0 \u0432\u0437\u044f\u0442\u044b\u0445 \u0432 \u0440\u0430\u0431\u043e\u0442\u0443 \u043a 13:00',
         body: '{managerMention}, \u043a 13:00 \u0443 \u0442\u0435\u0431\u044f 0 \u043b\u0438\u0434\u043e\u0432 \u0432\u0437\u044f\u0442\u043e \u0432 \u0440\u0430\u0431\u043e\u0442\u0443. \u041f\u0440\u043e\u0432\u0435\u0440\u044c CSM-\u0432\u043e\u0440\u043e\u043d\u043a\u0443.',
-        isActive: true,
+        isActive: false,
       },
       {
         eventType: 'amo_csm_zero_offer_made_13',
         name: 'CSM: 0 \u041a\u041f \u043a 13:00',
         body: '{managerMention}, \u043a 13:00 \u0443 \u0442\u0435\u0431\u044f 0 \u041a\u041f \u043e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u043e. \u041f\u0440\u043e\u0432\u0435\u0440\u044c CSM-\u0432\u043e\u0440\u043e\u043d\u043a\u0443.',
-        isActive: true,
+        isActive: false,
       },
       {
         eventType: 'amo_invoice_no_payment_3d',
         name: '\u0421\u0447\u0435\u0442 \u0431\u0435\u0437 \u043e\u043f\u043b\u0430\u0442\u044b 3 \u0434\u043d\u044f',
         body: '\u0421\u0447\u0435\u0442 {deal} \u0431\u0435\u0437 \u043e\u043f\u043b\u0430\u0442\u044b \u0442\u0440\u0438 \u0434\u043d\u044f. {dealUrl}',
-        isActive: true,
+        isActive: false,
       },
       {
         eventType: 'amo_proposal_stale_24h',
         name: '\u041a\u041f / \u0432\u043e\u0437\u0440\u0430\u0436\u0435\u043d\u0438\u044f \u0441\u0442\u043e\u044f\u0442 24 \u0447\u0430\u0441\u0430',
         body: '\u0421\u0434\u0435\u043b\u043a\u0430 \u043d\u0430 {amount} \u0441\u0442\u043e\u0438\u0442 \u0432\u0442\u043e\u0440\u043e\u0439 \u0434\u0435\u043d\u044c - {dealUrl}',
-        isActive: true,
+        isActive: false,
       },
       {
         eventType: 'amo_proposal_prepared_stale_2bd',
         name: '\u041a\u041f \u043d\u0435 \u043f\u0440\u0435\u0437\u0435\u043d\u0442\u043e\u0432\u0430\u043d\u043e \u0437\u0430 2 \u0440\u0430\u0431\u043e\u0447\u0438\u0445 \u0434\u043d\u044f',
         body: '\u041a\u041f \u043f\u043e\u0434\u0433\u043e\u0442\u043e\u0432\u043b\u0435\u043d\u043e, \u043d\u043e \u043d\u0435 \u043f\u0440\u0435\u0437\u0435\u043d\u0442\u043e\u0432\u0430\u043d\u043e \u043a\u043b\u0438\u0435\u043d\u0442\u0443 \u0437\u0430 2 \u0440\u0430\u0431\u043e\u0447\u0438\u0445 \u0434\u043d\u044f.\n\u0421\u0434\u0435\u043b\u043a\u0430: {deal}\n\u041c\u0435\u043d\u0435\u0434\u0436\u0435\u0440: {manager}\n\u0421\u0443\u043c\u043c\u0430: {amount}\n\u0421\u0441\u044b\u043b\u043a\u0430: {dealUrl}',
-        isActive: true,
+        isActive: false,
       },
       {
         eventType: 'amo_high_value_idle_24h',
         name: '\u041a\u0440\u0443\u043f\u043d\u0430\u044f \u0441\u0434\u0435\u043b\u043a\u0430 \u0431\u0435\u0437 \u0434\u0432\u0438\u0436\u0435\u043d\u0438\u044f 24 \u0447\u0430\u0441\u0430',
         body: '\u041a\u0440\u0443\u043f\u043d\u0430\u044f \u0441\u0434\u0435\u043b\u043a\u0430 \u0431\u0435\u0437 \u0434\u0432\u0438\u0436\u0435\u043d\u0438\u044f 24 \u0447\u0430\u0441\u0430.\n\u0421\u0434\u0435\u043b\u043a\u0430: {deal}\n\u0421\u0443\u043c\u043c\u0430: {amount}\n\u041c\u0435\u043d\u0435\u0434\u0436\u0435\u0440: {manager}\n\u042d\u0442\u0430\u043f: {stage}\n\u0421\u0441\u044b\u043b\u043a\u0430: {dealUrl}',
-        isActive: true,
+        isActive: false,
       },
     ];
   }
@@ -2828,14 +2797,14 @@ export class PlatformService {
   private extractAlertValue(report: any, metricKey?: string | null) {
     if (!metricKey) return null;
     const direct = this.getByPath(report, metricKey);
-    if (Number.isFinite(Number(direct))) return Number(direct);
+    if (direct!=null&&direct!==''&&Number.isFinite(Number(direct))) return Number(direct);
     if (Array.isArray(report?.tableRows)) {
       const fromTable = report.tableRows.find((row: Record<string, unknown>) => row[metricKey] !== undefined)?.[metricKey];
-      if (Number.isFinite(Number(fromTable))) return Number(fromTable);
+      if (fromTable!=null&&fromTable!==''&&Number.isFinite(Number(fromTable))) return Number(fromTable);
     }
     for (const row of report?.rows ?? []) {
       const metric = row.metrics?.[metricKey] ?? Object.values(row.metrics ?? {}).find((item: any) => item.label === metricKey);
-      if (Number.isFinite(Number((metric as any)?.value))) return Number((metric as any).value);
+      if ((metric as any)?.value!=null&&Number.isFinite(Number((metric as any)?.value))) return Number((metric as any).value);
     }
     return null;
   }
@@ -2860,10 +2829,16 @@ export class PlatformService {
 
   private reportTelegramMessage(name: string, report: any) {
     const lines = [`Отчёт: ${name}`];
+    for(const metric of Object.values(report?.summaryRows?.[0]?.metrics||{}) as any[]){
+      if(metric.value!=null)lines.push(`${metric.label}: ${Number(metric.value).toLocaleString('ru-RU')}${metric.unit==='money'?' €':metric.unit==='percent'?'%':''}`);
+    }
     if (report?.summary) {
+      for(const [key,label] of Object.entries({revenue:'Прогноз выручки',profit:'Прогноз прибыли',actualRevenue:'Полученная выручка',committedRevenue:'Подтверждённая выручка',lowRevenue:'Нижний прогноз выручки',highRevenue:'Верхний прогноз выручки'})){
+        if(report.summary[key]!=null)lines.push(`${label}: ${Math.round(Number(report.summary[key])).toLocaleString('ru-RU')} €`);
+      }
       if (report.summary.count !== undefined) lines.push(`Количество: ${report.summary.count}`);
-      if (report.summary.totalAmount !== undefined) lines.push(`Сумма: ${Math.round(report.summary.totalAmount).toLocaleString('ru-RU')} ₽`);
-      if (report.summary.avgAmount !== undefined) lines.push(`Средний чек: ${Math.round(report.summary.avgAmount).toLocaleString('ru-RU')} ₽`);
+      if (report.summary.totalAmount != null) lines.push(`Сумма: ${Math.round(report.summary.totalAmount).toLocaleString('ru-RU')} €`);
+      if (report.summary.avgAmount != null) lines.push(`Средний чек: ${Math.round(report.summary.avgAmount).toLocaleString('ru-RU')} €`);
     }
     if (Array.isArray(report?.tableRows)) {
       lines.push(`Строк в таблице: ${report.tableRows.length}`);
@@ -2896,14 +2871,14 @@ export class PlatformService {
 
   private nextScheduleRun(frequency: ReportScheduleFrequency, timeOfDay: string, from = new Date()) {
     const [hoursRaw, minutesRaw] = timeOfDay.split(':');
-    const hours = Math.min(Math.max(Number(hoursRaw) || 9, 0), 23);
+    const hours = Math.min(Math.max(Number(hoursRaw), 0), 23);
     const minutes = Math.min(Math.max(Number(minutesRaw) || 0, 0), 59);
-    const next = new Date(from);
-    next.setHours(hours, minutes, 0, 0);
+    const parts=moscowParts(from);
+    let next = moscowDate(parts.year,parts.month,parts.day,hours,minutes);
     if (next <= from) {
-      if (frequency === 'WEEKLY') next.setDate(next.getDate() + 7);
-      else if (frequency === 'MONTHLY') next.setMonth(next.getMonth() + 1);
-      else next.setDate(next.getDate() + 1);
+      if (frequency === 'WEEKLY') next=moscowDate(parts.year,parts.month,parts.day+7,hours,minutes);
+      else if (frequency === 'MONTHLY') next=moscowDate(parts.year,parts.month+1,Math.min(parts.day,new Date(Date.UTC(parts.year,parts.month+1,0)).getUTCDate()),hours,minutes);
+      else next=moscowDate(parts.year,parts.month,parts.day+1,hours,minutes);
     }
     return next;
   }
@@ -3627,7 +3602,7 @@ export class PlatformService {
   }
 
   private ensureTelegramOwner(user: AuthUser) {
-    if (user.businessRole !== 'OWNER') {
+    if (user.role !== 'ADMIN' && user.businessRole !== 'OWNER') {
       throw new ForbiddenException('Нет доступа');
     }
   }

@@ -198,8 +198,12 @@ export class ReportsService {
     if(!this.workspaceAccess)throw new ServiceUnavailableException('Проверка прав рассылки недоступна');
     const scope=await this.workspaceAccess.resolve(userId);
     const config=template.config as ReportConfig;
-    const report=scope.role==='ADMIN'?await this.compute({name:template.name,sourceType:template.sourceType,filters:config.filters??{},config},{id:userId,role:UserRole.ADMIN}):
+    if(!this.dataQuality)throw new ServiceUnavailableException('Проверка данных рассылки недоступна');
+    const sourceCutoff=await this.latestReportSourceSyncAt();
+    const report=scope.role==='ADMIN'?await this.compute({name:template.name,sourceType:template.sourceType,filters:config.filters??{},config},{id:userId,role:UserRole.ADMIN},{requireFresh:true}):
       await this.workspaceReport(String(config.builtinKey||''),scope,new Intl.DateTimeFormat('sv-SE',{timeZone:'Europe/Moscow',year:'numeric',month:'2-digit'}).format(new Date()));
+    const quality=await this.dataQuality.reportQuality({name:template.name,filters:config.filters as any},report.dataStatus?.cutoffAt?new Date(report.dataStatus.cutoffAt):sourceCutoff);
+    if(quality.status!=='CERTIFIED')throw new ServiceUnavailableException('Отчёт не отправлен: данные ещё не прошли проверку');
     return {report,scope};
   }
 
