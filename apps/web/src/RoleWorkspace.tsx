@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { LogOut } from 'lucide-react';
 import { api, downloadFile } from './lib/api';
+import PerformanceWorkspace, { DisplaySettings } from './PerformanceWorkspace';
+import WorkspaceOnboarding from './WorkspaceOnboarding';
+import { accessDenied, useWorkspaceResource, WorkspaceConnectionContext } from './workspace-data';
 import FieldCombobox from './FieldCombobox';
 type Session = {
     configured: boolean;
@@ -42,9 +45,14 @@ export default function RoleWorkspace({ onLogout, renderReport, renderTelegram }
     renderReport: ReportRenderer;
     renderTelegram: () => ReactNode;
 }) {
-    const [session, setSession] = useState<Session | null>(null), [error, setError] = useState(''), [tab, setTab] = useState('');
-    const [department, setDepartment] = useState(''), [manager, setManager] = useState(''), [month, setMonth] = useState(() => new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Moscow', year: 'numeric', month: '2-digit' }).format(new Date()));
+    const initial = new URLSearchParams(window.location.search);
+    const [session, setSession] = useState<Session | null>(null), [error, setError] = useState(''), [tab, setTab] = useState(initial.get('view') || 'home');
+    const [department, setDepartment] = useState(initial.get('department') || ''), [manager, setManager] = useState(initial.get('manager') || ''), [month, setMonth] = useState(() => /^20\d\d-(0[1-9]|1[0-2])$/.test(initial.get('month') || '') ? initial.get('month')! : new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Moscow', year: 'numeric', month: '2-digit' }).format(new Date()));
+    const [dealKind, setDealKind] = useState(initial.get('kind') === 'shipments' ? 'shipments' : 'sales');
+    const [retry, setRetry] = useState(0);
     const fingerprint = useRef('');
+    const contentRef = useRef<HTMLElement | null>(null);
+    useEffect(() => { contentRef.current?.scrollTo({ top: 0 }); }, [tab, department, manager, month]);
     useEffect(() => {
         let alive = true;
         const load = async () => {
@@ -55,17 +63,20 @@ export default function RoleWorkspace({ onLogout, renderReport, renderTelegram }
                 if (fingerprint.current && fingerprint.current !== s.fingerprint) {
                     setManager('');
                     setDepartment(s.departmentKey || s.departments?.[0]?.key || '');
-                    setTab(s.role === 'MANAGER' ? 'plan' : 'reports');
+                    setTab('home');
                 }
                 fingerprint.current = s.fingerprint;
                 setSession(s);
-                setDepartment(d => d || s.departmentKey || s.departments?.[0]?.key || '');
-                setTab(t => t || (s.role === 'MANAGER' ? 'plan' : 'reports'));
+                if (s.configured) {
+                    setDepartment(d => s.role !== 'ADMIN' ? s.departmentKey! : s.departments.some(item => item.key === d) || d === 'all' ? d : s.departments[0]?.key || '');
+                    setManager(m => s.managers.some(item => item.id === m) ? m : '');
+                    setTab(t => (s.role === 'ADMIN' ? ['home','reports','plan','forecast','deals','admin','telegram','display'] : s.role === 'MANAGER' ? ['home','plan','forecast','deals'] : ['home','reports','plan','forecast','deals']).includes(t) ? t : 'home');
+                }
                 setError('');
             }
             catch (e) {
                 if (alive) {
-                    setSession(null);
+                    if (accessDenied(e)) setSession(null);
                     setError(errorText(e));
                 }
             }
@@ -73,57 +84,52 @@ export default function RoleWorkspace({ onLogout, renderReport, renderTelegram }
         void load();
         const timer = window.setInterval(load, 20000);
         return () => { alive = false; clearInterval(timer); };
-    }, []);
-    if (error)
-        return <main className="content"><p role="alert">{error}</p><button className="btn" onClick={onLogout}>Выйти</button></main>;
+    }, [retry]);
+    useEffect(() => {
+        if (!session?.configured) return;
+        const params = new URLSearchParams({ view: tab, department, month, ...(manager ? { manager } : {}), ...(tab === 'deals' ? { kind: dealKind } : {}) });
+        const previous = new URLSearchParams(window.location.search);
+        if (['reports','forecast'].includes(tab) && previous.get('view') === tab && previous.has('report')) params.set('report', previous.get('report')!);
+        const url = `${window.location.pathname}?${params}`;
+        if (`${window.location.pathname}${window.location.search}` !== url) window.history.pushState(null, '', url);
+    }, [tab, department, manager, month, dealKind, session?.configured]);
+    useEffect(() => { const back = () => { const p = new URLSearchParams(window.location.search); setTab(p.get('view') || 'home'); setDepartment(p.get('department') || ''); setManager(p.get('manager') || ''); if (/^20\d\d-(0[1-9]|1[0-2])$/.test(p.get('month') || '')) setMonth(p.get('month')!); setDealKind(p.get('kind') === 'shipments' ? 'shipments' : 'sales'); }; window.addEventListener('popstate', back); return () => window.removeEventListener('popstate', back); }, []);
+    if (error && !session)
+        return <main className="content"><p role="alert">{error}</p><button className="btn" onClick={() => setRetry(r => r + 1)}>Повторить</button><button className="btn" onClick={onLogout}>Выйти</button></main>;
     if (!session)
         return <main className="content" aria-live="polite">Загрузка кабинета…</main>;
     if (!session.configured)
         return <main className="content"><h1>Доступ не настроен</h1><p>{session.message || 'Обратитесь к администратору'}</p><button className="btn" onClick={onLogout}>Выйти</button></main>;
     const personal = session.role === 'MANAGER';
-    const nav = [...(!personal ? [['reports', 'Отчёты']] : []), ['plan', personal ? 'Мой план' : 'План-факт'], ['forecast', personal ? 'Мой прогноз' : 'Прогноз'], ['deals', personal ? 'Мои сделки' : 'Сделки отдела'], ...(session.role === 'ADMIN' ? [['admin', 'Настройки'], ['telegram', 'Telegram']] : [])];
+    const nav = [['home', personal ? 'Мой день' : 'Обзор отдела'], ...(!personal ? [['reports', 'Отчёты']] : []), ['plan', personal ? 'Денежный план' : 'План-факт'], ['forecast', personal ? 'Мой прогноз' : 'Прогноз'], ['deals', personal ? 'Мои сделки' : 'Сделки отдела'], ...(session.role === 'ADMIN' ? [['admin', 'Настройки'], ['display', 'Табло'], ['telegram', 'Telegram']] : [])];
+    const navigate = (id: string, kind?: string) => { if (department === 'all' && id !== 'forecast') setDepartment(session.departments[0].key); if (kind) setDealKind(kind); setTab(id); };
+    const visibleTab = nav.some(([id]) => id === tab) ? tab : 'home';
+    const safeDepartment = session.role === 'ADMIN' ? (department === 'all' && visibleTab === 'forecast' ? 'all' : session.departments.some(d => d.key === department) ? department : session.departments[0].key) : session.departmentKey!;
     const forecastMonth=new Intl.DateTimeFormat('sv-SE',{timeZone:'Europe/Moscow',year:'numeric',month:'2-digit'}).format(new Date());
-    const query = new URLSearchParams({ department, month:tab==='forecast'?forecastMonth:month, ...(manager ? { manager } : {}) }).toString();
-    return <main className="app-shell"><section className="app-main"><header className="topbar"><div className="topbar-main">
+    const query = new URLSearchParams({ department: safeDepartment, month:visibleTab==='forecast'?forecastMonth:month, ...(!personal && manager ? { manager } : {}) }).toString();
+    return <WorkspaceConnectionContext.Provider value={error}><main className="app-shell"><section className="app-main"><header className="topbar"><div className="topbar-main">
     <div className="topbar-brand"><div><strong>amoCRM Analytics</strong><div className="text-sm muted">{personal ? 'Кабинет менеджера' : session.role === 'ADMIN' ? 'Администрирование' : 'Кабинет РОПа'}</div></div></div>
-    <nav className="topbar-nav" aria-label="Разделы кабинета">{nav.map(([id, label]) => <button key={id} className={`topbar-nav-item ${tab === id ? 'active' : ''}`} onClick={() => {if(department==='all'&&id!=='forecast')setDepartment(session.departments[0].key);setTab(id);}}>{label}</button>)}</nav>
+    <nav className="topbar-nav" aria-label="Разделы кабинета">{nav.map(([id, label]) => <button key={id} className={`topbar-nav-item ${visibleTab === id ? 'active' : ''}`} aria-current={visibleTab === id ? 'page' : undefined} onClick={() => navigate(id)}>{label}</button>)}</nav>
     <div className="flex items-center gap-3"><span>{session.name}</span><button className="icon-btn" aria-label="Выйти" onClick={onLogout}><LogOut size={18}/></button></div>
-  </div></header><section className="content" key={session.fingerprint}><div className="content-inner">
+  </div></header><section className="content" ref={contentRef} key={session.fingerprint}><div className="content-inner">
+    {error && <p role="alert" className="workspace-warning">{error} Кабинет сохранён, но данные не подтверждены до восстановления связи.<button className="btn" onClick={() => setRetry(r => r + 1)}>Повторить проверку</button></p>}
     {['admin','deals','telegram'].includes(tab)&&<p role="status" className="text-sm">{session.fresh ? 'Синхронизация актуальна' : 'Данные требуют проверки'} · Данные: {date(session.cutoffAt)} · Проверка: {date(session.checkedAt)}</p>}
-    {!['admin', 'telegram'].includes(tab) && <div className="flex flex-wrap items-end gap-3 mb-4">
+    {!['admin', 'telegram', 'display'].includes(tab) && <div className="flex flex-wrap items-end gap-3 mb-4">
       <label><span className="label">{tab==='forecast'?'Текущий месяц прогноза':'Месяц'}</span><input className="field" type="month" disabled={tab==='forecast'} value={tab==='forecast'?forecastMonth:month} onChange={e => setMonth(e.target.value)}/></label>
       {session.role === 'ADMIN' && <label><span className="label">Отдел</span><select className="field" value={department} onChange={e => { setDepartment(e.target.value); setManager(''); }}>{session.departments.map(d => <option key={d.key} value={d.key}>{d.name}</option>)}{tab==='forecast'&&<option value="all">Все отделы и нераспределённые отгрузки</option>}</select></label>}
       {!personal && department!=='all' && <FieldCombobox label="Сотрудник" value={manager} onChange={setManager} options={[{value:'',label:'Весь отдел'},...session.managers.filter(m=>m.groupId===session.departments.find(d=>d.key===department)?.groupId).map(m=>({value:m.id,label:m.name}))]} placeholder="Выберите сотрудника" />}
     </div>}
-    {tab === 'plan' && <PlanTable key={session.fingerprint} query={query} department={department} month={month} amoDomain={session.amoDomain} renderReport={renderReport}/>}
-    {tab === 'reports' && <ReportPanel key={department} query={query} keys={session.reports[department] || []} amoDomain={session.amoDomain} renderReport={renderReport}/>}
-    {tab === 'forecast' && <ReportPanel query={query} keys={department==='all'?['revenue_profit_forecast']:['revenue_profit_forecast', department === 'sales' ? 'sales_weighted_funnel' : 'csm_weighted_funnel']} amoDomain={session.amoDomain} renderReport={renderReport}/>}
-    {tab === 'deals' && <Deals query={query} amoDomain={session.amoDomain}/>}
-    {tab === 'admin' && <AdminSettings amoDomain={session.amoDomain}/>}
-    {tab === 'telegram' && session.role === 'ADMIN' && renderTelegram()}
-  </div></section></section></main>;
+    {visibleTab === 'home' && <PerformanceWorkspace key={`${session.fingerprint}:${safeDepartment}`} query={query} department={safeDepartment} month={month} personal={personal} amoDomain={session.amoDomain} navigate={navigate}/>}
+    {visibleTab === 'display' && session.role === 'ADMIN' && <DisplaySettings departments={session.departments}/>}
+    {visibleTab === 'plan' && <PlanTable key={session.fingerprint} query={query} department={safeDepartment} month={month} amoDomain={session.amoDomain} renderReport={renderReport}/>}
+    {visibleTab === 'reports' && <ReportPanel key={safeDepartment} query={query} keys={session.reports[safeDepartment] || []} amoDomain={session.amoDomain} renderReport={renderReport}/>}
+    {visibleTab === 'forecast' && <ReportPanel query={query} keys={safeDepartment==='all'?['revenue_profit_forecast']:['revenue_profit_forecast', safeDepartment === 'sales' ? 'sales_weighted_funnel' : 'csm_weighted_funnel']} amoDomain={session.amoDomain} renderReport={renderReport}/>}
+    {visibleTab === 'deals' && <Deals key={`${session.fingerprint}:${dealKind}`} initialKind={dealKind} query={query} amoDomain={session.amoDomain}/>}
+    {visibleTab === 'admin' && session.role === 'ADMIN' && <AdminSettings amoDomain={session.amoDomain}/>}
+    {visibleTab === 'telegram' && session.role === 'ADMIN' && renderTelegram()}
+  </div></section></section></main></WorkspaceConnectionContext.Provider>;
 }
-function useResource<T>(path: string | null) {
-    const [data, setData] = useState<T | null>(null), [error, setError] = useState(''), [loading, setLoading] = useState(true);
-    useEffect(() => { let alive = true, busy = false; setData(null); setError(''); setLoading(Boolean(path)); if(!path)return; const load = async () => { if (busy)
-        return; busy = true; try {
-        const result = await api<T>(path);
-        if (alive) {
-            setData(result);
-            setError('');
-        }
-    }
-    catch (e) {
-        if (alive)
-            setError(errorText(e));
-    }
-    finally {
-        busy = false;
-        if (alive)
-            setLoading(false);
-    } }; void load(); const timer = window.setInterval(load, 20000); return () => { alive = false; clearInterval(timer); }; }, [path]);
-    return { data, error, loading, setData };
-}
+const useResource = useWorkspaceResource;
 function PlanTable({ query, department, month, amoDomain, renderReport }: {
     query: string;
     department: string;
@@ -138,7 +144,7 @@ function PlanTable({ query, department, month, amoDomain, renderReport }: {
     useEffect(() => { setDrafts({}); setVersions({}); setNotice(''); }, [department, month]);
     if (loading)
         return <p>Загрузка плана и факта…</p>;
-    if (error)
+    if (error && !data)
         return <p role="alert">{error}</p>;
     if (!data)
         return null;
@@ -158,7 +164,7 @@ function PlanTable({ query, department, month, amoDomain, renderReport }: {
     finally {
         setSaving(false);
     } }
-    return <><h1 className="page-title">План по оплатам и отгрузкам</h1><p className="text-sm muted">{data.paymentDefinition}</p><DataStatus value={data.dataStatus}/>{data.incompleteShipments && <p role="status">Часть отгрузок ещё не связана с продажами. Персональный результат может быть неполным.</p>}{notice && <p role="status">{notice}</p>}
+    return <><h1 className="page-title">План по оплатам и отгрузкам</h1>{error && <p role="alert" className="workspace-warning">{error} Показан предыдущий результат.</p>}<p className="text-sm muted">{data.paymentDefinition}</p><DataStatus value={error?{...data.dataStatus,status:'CHECKING',reason:'Обновление приостановлено'}:data.dataStatus}/>{data.incompleteShipments && <p role="status">Часть отгрузок ещё не связана с продажами. Персональный результат может быть неполным.</p>}{notice && <p role="status">{notice}</p>}
     {forecast.error&&<p role="alert">Прогноз недоступен: {forecast.error}. Подтверждённый факт показан отдельно.</p>}
     {data.planReconciliation&&<div className="overflow-x-auto"><table className="data-table mb-4"><caption>Согласование планов отдела и сотрудников</caption><thead><tr><th>Показатель</th><th>Сумма личных планов</th><th>План отдела</th><th>Разница</th><th>Не задан личный план</th></tr></thead><tbody>{data.planReconciliation.map((r:any)=><tr key={r.metric}><td>{r.metric==='payments'?'Оплаты':'Отгрузки'}</td><td>{money(r.individualSum)}</td><td>{money(r.departmentPlan)}</td><td>{money(r.difference)}</td><td>{r.missingPlans}</td></tr>)}</tbody></table></div>}
     <div className="overflow-x-auto"><table className={`data-table ${data.canEdit?'':'personal-plan-table'}`}><thead><tr>{[...(data.canEdit?['Сотрудник']:[]), 'Показатель', 'План', 'Факт', 'Выполнение', 'Осталось', 'Прогноз месяца', 'Отклонение от плана', ...(data.canEdit?['Изменить план']:[])].map(t => <th key={t}>{t}</th>)}</tr></thead><tbody>{rows.flatMap((row: any) => row.values.map((m: any) => { const key = `${row.id}:${m.metric}`; return <tr key={key}>{data.canEdit&&<td>{row.name}</td>}<td>{m.metric === 'payments' ? 'Оплаты' : 'Отгрузки'}</td><td>{m.plan == null ? 'План не задан' : money(m.plan)}</td><td>{money(m.fact)}</td><td>{m.completion == null ? 'Не рассчитывается' : `${m.completion.toFixed(1)}%`}</td><td>{money(m.remaining)}</td><td>{m.forecast == null ? forecast.loading?'Расчёт…':'Не рассчитан' : money(m.forecast)}</td><td>{money(m.forecastDelta)}</td>{data.canEdit&&<td><div className="flex gap-2"><input type="number" min="0" className="field" aria-label={`План ${row.name}: ${m.metric === 'payments' ? 'оплаты' : 'отгрузки'}`} value={drafts[key] ?? String(m.plan ?? '')} onChange={e => { if (!(key in drafts))
@@ -174,9 +180,11 @@ function ReportPanel({ query, keys, amoDomain, renderReport }: {
     amoDomain: string;
     renderReport: ReportRenderer;
 }) {
-    const [key, setKey] = useState(keys[0] || '');
+    const [key, setKey] = useState(() => new URLSearchParams(window.location.search).get('report') || keys[0] || '');
     const [exporting, setExporting] = useState(false), [exportError, setExportError] = useState('');
     const selected = keys.includes(key) ? key : keys[0];
+    useEffect(() => { const url = new URL(window.location.href); if (url.searchParams.get('report') !== selected) { url.searchParams.set('report', selected); window.history.replaceState(null, '', url); } }, [selected, query]);
+    useEffect(() => { const back = () => setKey(new URLSearchParams(window.location.search).get('report') || keys[0] || ''); window.addEventListener('popstate', back); return () => window.removeEventListener('popstate', back); }, [keys.join(',')]);
     const { data, error, loading } = useResource<any>(`/workspaces/reports/${selected}?${query}`);
     async function exportReport() { setExporting(true); setExportError(''); try {
         const job = await api<{
@@ -215,22 +223,27 @@ function DataStatus({value}:{value?:{cutoffAt:string|null;checkedAt:string|null;
     const status=value.status==='BLOCKED'?'Выявлено расхождение':stale?'Источник давно не обновлялся':value.status==='CERTIFIED'?'Сверка источника пройдена':value.reason||'Полнота данных пока не подтверждена';
     return <p role="status" className="text-sm muted">{status}. Данные расчёта: {date(value.cutoffAt)}. Проверка: {date(value.checkedAt)}.</p>;
 }
-function Deals({ query, amoDomain }: {
+function Deals({ query, amoDomain, initialKind = 'sales' }: {
     query: string;
     amoDomain: string;
+    initialKind?: string;
 }) {
     const shipped=query.includes('shipped=true');
-    const [kind, setKind] = useState(shipped?'shipments':'sales'), [attention, setAttention] = useState(!shipped), [stage, setStage] = useState(''), [search, setSearch] = useState(''), [page, setPage] = useState(1);
-    useEffect(() => { setPage(1); }, [query, kind, stage, search, attention]);
-    const { data, error, loading } = useResource<any>(`/workspaces/deals?${query}&${new URLSearchParams({ kind, attention: String(attention), stage, search, page: String(page) })}`);
+    const [kind, setKind] = useState(shipped?'shipments':initialKind), [attention, setAttention] = useState(!shipped), [stage, setStage] = useState(''), [search, setSearch] = useState(''), [page, setPage] = useState(1), [sort, setSort] = useState('overdue'), [assessment, setAssessment] = useState(''), [debouncedSearch, setDebouncedSearch] = useState('');
+    useEffect(() => { const timer = window.setTimeout(() => setDebouncedSearch(search), 300); return () => clearTimeout(timer); }, [search]);
+    useEffect(() => { setPage(1); }, [query, kind, stage, debouncedSearch, attention, sort, assessment]);
+    const { data, error, loading } = useResource<any>(`/workspaces/deals?${query}&${new URLSearchParams({ kind, attention: String(attention), stage, search: debouncedSearch, page: String(page), sort, assessment })}`);
     return <><h1 className="page-title">Текущие сделки</h1><div className="flex flex-wrap gap-3 mb-4"><label><span className="label">Воронка</span><select className="field" value={kind} onChange={e => { setKind(e.target.value); setStage(''); }}><option value="sales">Рабочая воронка</option><option value="shipments">Отгрузки</option></select></label><label><span className="label">Показать</span><select className="field" value={String(attention)} onChange={e => setAttention(e.target.value === 'true')}><option value="true">Требуют внимания</option><option value="false">Все</option></select></label><label><span className="label">Поиск</span><input className="field" value={search} onChange={e => setSearch(e.target.value)}/></label><label><span className="label">Этап</span><select className="field" value={stage} onChange={e => setStage(e.target.value)}><option value="">Все этапы</option>{data?.stages.map((s: any) => <option key={s.id} value={s.id}>{s.name}</option>)}</select></label></div>
-    {loading ? <p>Загрузка сделок…</p> : error ? <p role="alert">{error}</p> : data && <><p>Найдено: {data.total}. Сумма: {money(data.amount)}. Без оценки срока: {data.unknown}.</p><div className="overflow-x-auto"><table className="data-table"><thead><tr>{['Сделка', 'Этап', 'Сумма', 'Дней на этапе', 'Срок, дней', 'Просрочка, дней', 'Причина', 'Ответственный в сборке'].map(t => <th key={t}>{t}</th>)}</tr></thead><tbody>{data.rows.map((r: any) => <tr key={r.id}><td><a target="_blank" rel="noreferrer" href={`https://${amoDomain}.amocrm.ru/leads/detail/${r.externalId}`}>{r.title}</a></td><td>{r.stage}</td><td>{money(r.amount)}</td><td>{r.days == null ? 'Неизвестно' : r.days.toFixed(1)}</td><td>{r.limit ?? 'Не задан'}</td><td>{r.overdueDays == null ? 'Нет оценки' : r.overdueDays.toFixed(1)}</td><td>{r.reason || 'В пределах срока'}</td><td>{r.operationalManager || '—'}</td></tr>)}</tbody></table></div>{!data.rows.length && <p>Сделок по этим условиям нет.</p>}<div className="flex items-center gap-3 mt-4"><button className="btn" disabled={page === 1} onClick={() => setPage(p => p - 1)}>Назад</button><span>Страница {page}</span><button className="btn" disabled={page * 50 >= data.total} onClick={() => setPage(p => p + 1)}>Далее</button></div></>}
+    <div className="workspace-toolbar"><label><span className="label">Причина внимания</span><select className="field" value={assessment} onChange={e => setAssessment(e.target.value)}><option value="">Все причины</option><option value="OVERDUE">Просрочен срок</option><option value="UNKNOWN">Нет оценки срока</option></select></label><label><span className="label">Сначала</span><select className="field" value={sort} onChange={e => setSort(e.target.value)}><option value="overdue">Наибольшая просрочка</option><option value="amount">Наибольшая сумма</option><option value="days">Дольше на этапе</option></select></label></div>
+    {error && <p role="alert" className="workspace-warning">{error} {data ? 'Показан предыдущий результат.' : ''}</p>}
+    {loading ? <p>Загрузка сделок…</p> : data && <><p>Найдено: {data.total}. Сумма: {money(data.amount)}. Без оценки срока: {data.unknown}.</p><div className="overflow-x-auto"><table className="data-table"><thead><tr>{['Сделка', 'Коммерческий менеджер', 'Этап', 'Сумма', 'Дней на этапе', 'Срок, дней', 'Просрочка, дней', 'Причина', ...(kind==='shipments'?['Ответственный в сборке']:[])].map(t => <th key={t}>{t}</th>)}</tr></thead><tbody>{data.rows.map((r: any) => <tr key={r.id}><td><a target="_blank" rel="noreferrer" href={`https://${amoDomain}.amocrm.ru/leads/detail/${r.externalId}`}>{r.title}</a></td><td>{r.commercialManager || 'Не определён'}</td><td>{r.stage}</td><td className="numeric-cell">{money(r.amount)}</td><td className="numeric-cell">{r.days == null ? 'Неизвестно' : r.days.toFixed(1)}</td><td className="numeric-cell">{r.limit ?? 'Не задан'}</td><td className="numeric-cell">{r.overdueDays == null ? 'Нет оценки' : r.overdueDays.toFixed(1)}</td><td>{r.reason || 'В пределах срока'}</td>{kind==='shipments'&&<td>{r.operationalManager || '—'}</td>}</tr>)}</tbody></table></div>{!data.rows.length && <p>Сделок по этим условиям нет.</p>}<div className="flex items-center gap-3 mt-4"><button className="btn" disabled={page === 1} onClick={() => setPage(p => p - 1)}>Назад</button><span>Страница {page}</span><button className="btn" disabled={page * 50 >= data.total} onClick={() => setPage(p => p + 1)}>Далее</button></div></>}
   </>;
 }
 function AdminSettings({amoDomain}:{amoDomain:string}) {
     const { data, error, loading } = useResource<any>('/workspaces/admin/access');
     const [notice, setNotice] = useState(''), [department, setDepartment] = useState('sales');
     const [newUser, setNewUser] = useState({ crmUserId: '', businessRole: 'MANAGER', departmentKey: 'sales', password: '' });
+    const [section, setSection] = useState('invite');
     if (loading)
         return <p>Загрузка настроек…</p>;
     if (error)
@@ -245,12 +258,12 @@ function AdminSettings({amoDomain}:{amoDomain:string}) {
     catch (e) {
         setNotice(errorText(e));
     } }
-    return <><h1 className="page-title">Доступ и сроки этапов</h1>{notice && <p role="status">{notice}</p>}
-    <h2>Учётные записи</h2><div className="overflow-x-auto"><table className="data-table"><thead><tr>{['Сотрудник', 'Роль', 'Отдел', 'Учётная запись amoCRM', 'Активен', 'Новый личный пароль', 'Действие'].map(t => <th key={t}>{t}</th>)}</tr></thead><tbody>{data.users.map((u: any) => <AccountRow key={`${u.id}:${u.accessVersion}`} user={u} data={data} onNotice={setNotice}/>)}</tbody></table></div>
+    return <><h1 className="page-title">Настройки кабинетов</h1><nav className="workspace-toolbar" aria-label="Настройки">{[['invite','Первый вход'],['access','Права сотрудников'],['sla','Сроки этапов'],['links','Связи отгрузок']].map(([id,label])=><button className="btn" aria-pressed={section===id} key={id} onClick={()=>setSection(id)}>{label}</button>)}</nav>{notice && <p role="status">{notice}</p>}
+    <section hidden={section!=='access'}><h2>Учётные записи</h2><div className="overflow-x-auto"><table className="data-table"><thead><tr>{['Сотрудник', 'Роль', 'Отдел', 'Учётная запись amoCRM', 'Активен', 'Новый личный пароль', 'Действие'].map(t => <th key={t}>{t}</th>)}</tr></thead><tbody>{data.users.map((u: any) => <AccountRow key={`${u.id}:${u.accessVersion}`} user={u} data={data} onNotice={setNotice}/>)}</tbody></table></div>
     <h2 className="mt-6">Добавить сотрудника</h2><div className="flex flex-wrap items-end gap-3"><FieldCombobox label="Сотрудник amoCRM" value={newUser.crmUserId} onChange={value=>setNewUser({...newUser,crmUserId:value})} options={data.crmUsers.map((u:any)=>({value:u.id,label:u.name}))} placeholder="Выберите сотрудника" /><label><span className="label">Роль</span><select className="field" value={newUser.businessRole} onChange={e => setNewUser({ ...newUser, businessRole: e.target.value })}><option value="MANAGER">Менеджер</option><option value="ROP">РОП</option></select></label><label><span className="label">Отдел</span><select className="field" value={newUser.departmentKey} onChange={e => setNewUser({ ...newUser, departmentKey: e.target.value })}>{data.departments.map((d: any) => <option key={d.key} value={d.key}>{d.name}</option>)}</select></label><label><span className="label">Личный пароль, от 12 символов</span><input className="field" type="password" autoComplete="new-password" value={newUser.password} onChange={e => setNewUser({ ...newUser, password: e.target.value })}/></label><button className="btn" onClick={() => void create()}>Создать</button></div>
-    <h2 className="mt-6">Сроки по этапам</h2><label><span className="label">Отдел</span><select className="field" value={department} onChange={e => setDepartment(e.target.value)}>{data.departments.map((d: any) => <option key={d.key} value={d.key}>{d.name}</option>)}</select></label>
+    </section>{section==='invite'&&<WorkspaceOnboarding/>}<section hidden={section!=='sla'}><h2 className="mt-6">Сроки по этапам</h2><label><span className="label">Отдел</span><select className="field" value={department} onChange={e => setDepartment(e.target.value)}>{data.departments.map((d: any) => <option key={d.key} value={d.key}>{d.name}</option>)}</select></label>
     <div className="overflow-x-auto"><table className="data-table"><thead><tr><th>Этап</th><th>Срок, календарных дней</th><th>Контроль включён</th><th>Действие</th></tr></thead><tbody>{data.stages.filter((s: any) => { const d = data.departments.find((d: any) => d.key === department); return d && [...d.pipelineIds, d.assemblyPipelineId].includes(s.pipelineId); }).map((s: any) => <StageRule key={`${department}:${s.id}`} department={department} stage={s} rule={data.rules.find((r: any) => r.departmentKey === department && r.stageId === s.id)} onNotice={setNotice}/>)}</tbody></table></div>
-    <h2 className="mt-6">Связи отгрузок</h2><p>Без подтверждённого продавца: {data.unresolved}. Такие отгрузки не назначаются по имени клиента или сумме.</p><UnassignedShipments crmUsers={data.commercialSellers||data.crmUsers} amoDomain={amoDomain}/>
+    </section>{section==='links'&&<section><h2 className="mt-6">Связи отгрузок</h2><p>Без подтверждённого продавца: {data.unresolved}. Такие отгрузки не назначаются по имени клиента или сумме.</p><UnassignedShipments crmUsers={data.commercialSellers||data.crmUsers} amoDomain={amoDomain}/></section>}
   </>;
 }
 function UnassignedShipments({crmUsers,amoDomain}:{crmUsers:Array<{id:string;name:string}>;amoDomain:string}){

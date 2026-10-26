@@ -4,6 +4,10 @@ import { WorkspacesController } from './workspaces.controller';
 import { WorkspacesService } from './workspaces.service';
 import { QualityModule } from '../quality/quality.module';
 import {WorkspaceLinksAdminController} from './workspace-links-admin.controller';
-@Module({ imports: [ReportsModule, QualityModule], controllers: [WorkspacesController,WorkspaceLinksAdminController], providers: [WorkspacesService] })
+import { PerformanceService } from './performance.service';
+import { DisplayController, PerformanceController, WorkspaceInviteController } from './performance.controller';
+import { WorkspaceOnboardingService } from './workspace-onboarding.service';
+import { AuthModule } from '../auth/auth.module';
+@Module({ imports: [ReportsModule, QualityModule, AuthModule], controllers: [WorkspacesController,WorkspaceLinksAdminController, PerformanceController, DisplayController, WorkspaceInviteController], providers: [WorkspacesService, PerformanceService, WorkspaceOnboardingService] })
 export class WorkspacesModule {
 }

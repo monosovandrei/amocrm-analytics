@@ -9,6 +9,10 @@ export function getToken() {
   return localStorage.getItem('accessToken') || '';
 }
 
+export class ApiError extends Error {
+  constructor(message: string, public readonly status: number) { super(message); }
+}
+
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const token = getToken();
   const headers = new Headers(options.headers);
@@ -19,15 +23,23 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
     headers.set('Authorization', `Bearer ${token}`);
   }
 
-  const res = await fetch(`${API_URL}${path}`, {
-    ...options,
-    headers,
-  });
-  const text = await res.text();
-  if (!res.ok) {
-    throw new Error(text);
+  const controller = new AbortController();
+  const abort = () => controller.abort(options.signal?.reason);
+  options.signal?.addEventListener('abort', abort, { once: true });
+  if (options.signal?.aborted) abort();
+  const deadline = (!options.method || options.method === 'GET') ? window.setTimeout(() => controller.abort(), 15000) : null;
+  try {
+    const res = await fetch(`${API_URL}${path}`, { ...options, headers, signal: controller.signal });
+    const text = await res.text();
+    if (!res.ok) throw new ApiError(text, res.status);
+    return (text ? JSON.parse(text) : undefined) as T;
+  } catch (error) {
+    if (controller.signal.aborted && !options.signal?.aborted) throw new ApiError(JSON.stringify({ message: 'Сервер не ответил за 15 секунд. Данные не обновлены; можно повторить запрос.' }), 504);
+    throw error;
+  } finally {
+    if (deadline != null) clearTimeout(deadline);
+    options.signal?.removeEventListener('abort', abort);
   }
-  return (text ? JSON.parse(text) : undefined) as T;
 }
 
 export async function downloadExcel(path: string, body: unknown) {

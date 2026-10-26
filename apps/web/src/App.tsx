@@ -45,6 +45,7 @@ import {
   X,
 } from 'lucide-react';
 import { api, downloadExcel, downloadFile } from '@/lib/api';
+import { accessDenied, workspaceError } from './workspace-data';
 import { moscowPresetDateInputs } from './report-period';
 import CrmControl from './CrmControl';
 import RoleWorkspace from './RoleWorkspace';
@@ -639,6 +640,7 @@ function getDefaultDraft(): ReportDraft {
 export default function HomePage() {
   const [user, setUser] = useState<User | null>(null);
   const [tokenLoaded, setTokenLoaded] = useState(false);
+  const [bootError, setBootError] = useState(''), [bootRetry, setBootRetry] = useState(0);
   const [tab, setTab] = useState<AppTab>('workspace');
   const [options, setOptions] = useState<Options | null>(null);
   const [connection, setConnection] = useState<Record<string, any> | null>(null);
@@ -675,6 +677,7 @@ export default function HomePage() {
   useEffect(() => {
     let mounted = true;
     async function boot() {
+      setBootError('');
       const token = localStorage.getItem('accessToken');
       if (!token) {
         setTokenLoaded(true);
@@ -684,9 +687,11 @@ export default function HomePage() {
         const me = await api<User>('/auth/me');
         if (!mounted) return;
         setUser(me);
-      } catch {
-        localStorage.removeItem('accessToken');
-        if (mounted) setUser(null);
+      } catch (error) {
+        if (accessDenied(error)) {
+          localStorage.removeItem('accessToken');
+          if (mounted) setUser(null);
+        } else if (mounted) setBootError(workspaceError(error));
       } finally {
         if (mounted) setTokenLoaded(true);
       }
@@ -695,7 +700,7 @@ export default function HomePage() {
     return () => {
       mounted = false;
     };
-  }, [loadData]);
+  }, [loadData, bootRetry]);
 
   const ordered = useMemo(() => orderTemplates(templates), [templates]);
   const canAccessTelegram = user?.businessRole === 'OWNER';
@@ -897,11 +902,12 @@ export default function HomePage() {
     return <main className="content">Загрузка</main>;
   }
 
+  if (bootError && !user) return <main className="content"><p role="alert">{bootError}</p><button className="btn" onClick={() => setBootRetry(r => r + 1)}>Повторить подключение</button><button className="btn" onClick={() => { localStorage.removeItem('accessToken'); setBootError(''); }}>Выйти</button></main>;
   if (!user) {
     return <LoginScreen onLogin={handleLogin} />;
   }
 
-  return <RoleWorkspace onLogout={() => { localStorage.removeItem('accessToken'); setUser(null); }}
+  return <RoleWorkspace onLogout={() => { localStorage.removeItem('accessToken'); setUser(null); setBootError(''); }}
     renderReport={(result, key, amoDomain) => <ReportResultDetails amoDomain={amoDomain ? `${amoDomain}.amocrm.ru` : ''} result={result} template={{ name: key, config: { builtinKey: key } } as ReportTemplate} />}
     renderTelegram={() => <TelegramAdmin/>} />;
 
@@ -6909,6 +6915,7 @@ function ReportResultDetails({
     }
 
     return (
+      <FunnelReportView result={result} amoDomain={amoDomain}>
       <div className="report-matrix-wrap">
         <table className="report-matrix">
           <thead>
@@ -6983,6 +6990,7 @@ function ReportResultDetails({
           </tbody>
         </table>
       </div>
+      </FunnelReportView>
     );
   }
 
@@ -7116,6 +7124,20 @@ type ContractDurationValue = {
   sampleSize?: number;
   samples?: ContractDurationSample[];
 };
+
+function FunnelReportView({ result, amoDomain, children }: { result: Record<string, any>; amoDomain: string; children: ReactNode }) {
+  const [expanded, setExpanded] = useState(false);
+  const metrics = (result.metrics || []) as ContractMetricPayload[];
+  const ids = [metrics.some(m => m.id === 'kp_presented') ? 'kp_presented' : 'offer_made', 'invoice_sent', 'paid', metrics.some(m => m.id === 'payment_amount') ? 'payment_amount' : 'paid_amount'];
+  const selected = ids.map(id => metrics.find(m => m.id === id)).filter(Boolean) as ContractMetricPayload[];
+  if (selected.length < 3) return <>{children}</>;
+  const rows = [...(result.rows || []), ...(result.summaryRows?.[0] ? [{ ...result.summaryRows[0], groupName: result.summaryRows[0].label || 'Итого' }] : [])];
+  return <>
+    <div className="overflow-x-auto"><table className="data-table funnel-summary-table"><thead><tr><th>Сотрудник</th>{selected.map(m => <th key={m.id}>{m.label}</th>)}</tr></thead><tbody>{rows.map(row => <tr key={row.groupId || row.id}><th scope="row">{row.groupName}</th>{selected.map(metric => <td key={metric.id} className="numeric-cell"><ContractMetricCell amoDomain={amoDomain} metric={metric} value={row.metrics?.[metric.id] || {}}/></td>)}</tr>)}</tbody></table></div>
+    <button className="btn mt-4 mb-4" aria-expanded={expanded} onClick={() => setExpanded(!expanded)}>{expanded ? 'Скрыть подробную таблицу' : 'Все показатели и конверсии'}</button>
+    {expanded && children}
+  </>;
+}
 
 function ContractMetricCell({
   amoDomain,
@@ -7632,17 +7654,6 @@ function RevenueProfitForecastReport({ amoDomain, result }: { amoDomain: string;
 
   return (
     <div className="revenue-forecast-report">
-      {totalRows.length > 0 && (
-        <RevenueForecastTable
-          amoDomain={amoDomain}
-          expandedRows={expandedRows}
-          profitAvailable={profitAvailable}
-          rows={totalRows}
-          setExpandedRows={setExpandedRows}
-          title="Всего"
-        />
-      )}
-
       <div className="revenue-forecast-summary">
         <div className="revenue-forecast-card">
           <span>Ожидаемая выручка</span>
@@ -7660,11 +7671,14 @@ function RevenueProfitForecastReport({ amoDomain, result }: { amoDomain: string;
           <small>Факт + сделки с вероятностью от 80%</small>
         </div>
         <div className="revenue-forecast-card">
-          <span>Прибыль</span>
+          <span>Расчётная прибыль</span>
           <strong className="mono-num">{profitAvailable ? formatMoney(summary.profit) : 'не настроено'}</strong>
           <small>{profitAvailable ? profitBasis : 'не настроено'}</small>
         </div>
       </div>
+
+      <p className="text-sm muted">Прогноз выручки относится к отгрузкам. Прибыль — расчёт по заданной доле, не фактическая маржа по себестоимости. Диапазон — модельная оценка, не подтверждённая точность прогноза.</p>
+      {totalRows.length > 0 && <RevenueForecastTable amoDomain={amoDomain} expandedRows={expandedRows} profitAvailable={profitAvailable} rows={totalRows} setExpandedRows={setExpandedRows} title="Всего"/>}
 
       <div className="revenue-forecast-model-meta">
         <span>Медианный цикл: <strong>{formatDurationFromDays(shippingCycle.medianDays)}</strong></span>
@@ -7722,7 +7736,7 @@ function RevenueForecastTable({
               <th>Сценарий</th>
               <th>Сделок</th>
               <th>Взвешенная выручка</th>
-              <th>Прибыль</th>
+              <th>Расчётная прибыль</th>
               <th>Сделки в расчёте</th>
             </tr>
           </thead>
@@ -7757,7 +7771,7 @@ function RevenueForecastTable({
                                 <small>
                                   {deal.manager} · {deal.stage} · {deal.probabilityPercent}%
                                   {deal.reliabilityPercent !== undefined
-                                    ? ` · надёжность оценки: ${deal.reliabilityPercent > 0 ? `${deal.reliabilityPercent}%` : 'нет данных'}`
+                                    ? ` · уверенность модели: ${deal.reliabilityPercent > 0 ? `${deal.reliabilityPercent}% (не точность прогноза)` : 'нет данных'}`
                                     : ''}
                                 </small>
                                 {(deal.paymentProbabilityPercent !== null && deal.paymentProbabilityPercent !== undefined) && (

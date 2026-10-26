@@ -96,6 +96,7 @@ databaseUrl.searchParams.delete("schema");
 process.stdout.write(databaseUrl.toString());
 ' "$RELEASE/.env")"
 BACKUP_FILE="$BACKUPS_DIR/pre-$COMMIT-$STAMP.dump"
+install -m 0600 /dev/null "$BACKUP_FILE"
 if command -v pg_dump >/dev/null 2>&1; then
   pg_dump "$DATABASE_URL_VALUE" --format=custom --file="$BACKUP_FILE"
 else
@@ -127,7 +128,10 @@ systemctl stop "${SERVICES[@]}" "${RETIRED_SERVICES[@]}"
 trap 'trap - ERR; restore_previous_release || true' ERR
 if ! npm run db:deploy || ! systemd-run --scope --quiet --unit="analytics-workspace-prepare-$COMMIT-$STAMP" \
   -p MemoryHigh=1152M -p MemoryMax=1280M -p MemorySwapMax=0 -p CPUWeight=20 \
-  node --expose-gc --max-old-space-size=512 "$RELEASE/scripts/prepare-workspace-release.cjs" --apply; then
+  node --expose-gc --max-old-space-size=512 "$RELEASE/scripts/prepare-workspace-release.cjs" --apply || \
+  ! systemd-run --scope --quiet --unit="analytics-performance-prepare-$COMMIT-$STAMP" \
+  -p MemoryHigh=1152M -p MemoryMax=1280M -p MemorySwapMax=0 -p CPUWeight=20 \
+  node --expose-gc --max-old-space-size=512 "$RELEASE/scripts/prepare-performance-release.cjs" --apply-owner-approved-rollout; then
   restore_previous_release || true
   exit 1
 fi
@@ -215,6 +219,10 @@ run_report_verification() {
 SOURCE_AUDIT_TO="$(node -e 'process.stdout.write(new Date(Date.now() - 120000).toISOString())')"
 if ! run_report_verification prepare "$RELEASE/scripts/prepare-release-reports.cjs" --workspaces || \
    ! run_report_verification consistency "$RELEASE/scripts/verify-workspace-consistency.cjs" || \
+   ! (umask 077; run_report_verification performance "$RELEASE/scripts/verify-performance-workspaces.cjs" \
+     > "$BACKUPS_DIR/performance-$COMMIT-$STAMP.json") || \
+   ! (umask 077; run_report_verification performance-http "$RELEASE/scripts/verify-performance-http.cjs" \
+     > "$BACKUPS_DIR/performance-http-$COMMIT-$STAMP.json") || \
    ! (umask 077; run_report_verification source "$RELEASE/scripts/audit-amo-report-funnels.cjs" --live --verify "--to=$SOURCE_AUDIT_TO" \
      > "$BACKUPS_DIR/source-audit-$COMMIT-$STAMP.json"); then
   echo "Release report consistency gate failed; restoring previous application release" >&2

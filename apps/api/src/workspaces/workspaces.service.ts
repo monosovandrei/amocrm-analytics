@@ -241,6 +241,7 @@ export class WorkspacesService {
         if (query.search)
             where.title = { contains: query.search.slice(0, 120), mode: 'insensitive' };
         const data = await this.prisma.factDealCurrent.findMany({ where, orderBy: { updatedAt: 'asc' } });
+        const commercialNames = await this.prisma.crmUser.findMany({ where: { id: { in: managers } }, select: { id: true, name: true } });
         const intervals = data.length ? await this.prisma.factDealStageInterval.findMany({ where: { dealId: { in: data.map(d => d.dealId) }, isCurrent: true }, select: { dealId: true, stageId: true, enteredAt: true }, orderBy: { enteredAt: 'desc' } }) : [];
         const rules = await this.prisma.ropStageSlaRule.findMany({ where: { departmentKey: department.key } });
         const deliveryField = shipping ? await this.prisma.customFieldDefinition.findFirst({ where: { entityType: 'LEAD', name: { equals: 'Delivery', mode: 'insensitive' } }, select: { externalId: true } }) : null;
@@ -266,13 +267,15 @@ export class WorkspacesService {
             const assessment = deliveryOverdue ? 'OVERDUE' : knownRule && !rule.isEnabled ? 'EXCLUDED' : !knownRule || !enteredAt ? 'UNKNOWN' : excess ? 'OVERDUE' : 'OK';
             return { id: d.dealId, externalId: d.dealExternalId, title: d.title, pipeline: d.pipelineName, stageId: d.stageId, stage: d.stageName,
                 amount: Number(d.amount), currency: 'EUR', managerId: shipping ? linkById.get(d.dealId)?.managerId : d.responsibleId,
+                commercialManager: commercialNames.find(m => m.id === (shipping ? linkById.get(d.dealId)?.managerId : d.responsibleId))?.name || null,
                 operationalManager: shipping ? d.responsibleName : null, saleDealId: shipping ? linkById.get(d.dealId)?.saleDealId : null,
                 enteredAt, days, limit: knownRule ? rule.slaDays : null, overdueDays: Math.max(excess || 0, deliveryOverdue ? (now - deliveryDeadline!) / 86400000 : 0) || excess, assessment,
                 reason: deliveryOverdue ? `Просрочена обещанная дата отгрузки${excess ? '; превышен срок этапа' : ''}` : assessment === 'UNKNOWN' ? !enteredAt ? 'Нет подтверждённой даты входа в этап' : 'Срок для этапа не задан'
                     : assessment === 'OVERDUE' ? 'Превышен срок этапа' : assessment === 'EXCLUDED' ? 'Этап исключён из контроля' : null };
         });
-        const selected = query.attention === 'true' && query.shipped!=='true' ? all.filter(d => ['UNKNOWN', 'OVERDUE'].includes(d.assessment)) : all;
-        selected.sort((a, b) => query.sort === 'amount' ? b.amount - a.amount : (b.overdueDays || 0) - (a.overdueDays || 0));
+        const attended = query.attention === 'true' && query.shipped!=='true' ? all.filter(d => ['UNKNOWN', 'OVERDUE'].includes(d.assessment)) : all;
+        const selected = ['UNKNOWN', 'OVERDUE', 'OK', 'EXCLUDED'].includes(query.assessment) ? attended.filter(d => d.assessment === query.assessment) : attended;
+        selected.sort((a, b) => (query.sort === 'amount' ? b.amount - a.amount : query.sort === 'days' ? (b.days ?? -1) - (a.days ?? -1) : (b.overdueDays || 0) - (a.overdueDays || 0)) || a.id.localeCompare(b.id));
         const page = Math.max(1, Math.min(Number(query.page) || 1, 100000));
         return { rows: selected.slice((page - 1) * 50, page * 50), page, pageSize: 50, total: selected.length,
             amount: selected.reduce((s, d) => s + d.amount, 0), unknown: all.filter(d => d.assessment === 'UNKNOWN').length,

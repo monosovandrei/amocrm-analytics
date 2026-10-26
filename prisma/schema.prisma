@@ -159,6 +159,7 @@ model User {
   notificationDeliveries NotificationDelivery[]
   planSets         PlanSet[] @relation("PlanSetCreator")
   reportSchedules  ReportSchedule[]
+  workspaceInvite WorkspaceInvite?
 
   @@index([businessRole, isActive])
 }
@@ -204,6 +205,57 @@ model WorkspacePlan {
   updatedAt DateTime @updatedAt
 
   @@unique([month, departmentKey, targetType, targetId, metric])
+}
+
+model WorkspaceKpiGoal {
+  id String @id @default(uuid())
+  departmentKey String
+  period String
+  start String
+  targetType String
+  targetId String
+  metric String
+  value Decimal
+  version Int @default(1)
+  updatedAt DateTime @updatedAt
+
+  @@unique([departmentKey, period, start, targetType, targetId, metric], map: "WorkspaceKpiGoal_scope_key")
+}
+
+model WorkspaceCompetitionPeriod {
+  id String @id @default(uuid())
+  departmentKey String
+  month String
+  mode String
+  memberIds String[] @default([])
+  createdBy String
+  createdAt DateTime @default(now())
+
+  @@unique([departmentKey, month])
+}
+
+model WorkspaceDisplay {
+  id String @id @default(uuid())
+  name String
+  departmentKey String
+  tokenHash String @unique
+  createdBy String
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+  revokedAt DateTime?
+
+  @@index([expiresAt])
+}
+
+model WorkspaceInvite {
+  id String @id @default(uuid())
+  userId String @unique
+  tokenHash String @unique
+  accessVersion Int
+  expiresAt DateTime
+  usedAt DateTime?
+  createdAt DateTime @default(now())
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
 
 model AmoConnection {
