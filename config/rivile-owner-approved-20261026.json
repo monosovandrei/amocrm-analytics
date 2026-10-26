@@ -9,6 +9,12 @@
   "seniorMarginTarget": 40000,
   "managerLinks": [
     {
+      "code": "102",
+      "amoExternalId": null,
+      "departmentKey": null,
+      "source": "OWNER_CONFIRMED_20261026_OUTSIDE_SALES_CSM"
+    },
+    {
       "code": "103",
       "amoExternalId": "7462243",
       "departmentKey": "csm"
