@@ -1,0 +1,4 @@
+'use strict';
+const path=require('node:path'),{createRequire}=require('node:module'),root=path.resolve(__dirname,'..'),load=createRequire(`${root}/apps/api/package.json`);
+load('dotenv').config({path:`${root}/.env`,quiet:true});load('reflect-metadata');process.env.WORKER_ROLE='verification';
+(async()=>{const app=await load('@nestjs/core').NestFactory.createApplicationContext(load('./dist/app.module').AppModule,{logger:false});try{const service=app.get(load('./dist/workspaces/rivile-sales.service').RivileSalesService);const month=process.argv.find(v=>v.startsWith('--month='))?.slice(8)||new Intl.DateTimeFormat('sv-SE',{timeZone:'Europe/Moscow',year:'numeric',month:'2-digit'}).format(new Date());console.log(JSON.stringify(await service.refresh(month)));}finally{await app.close();}})().catch(e=>{console.error(e.message);process.exitCode=1;});

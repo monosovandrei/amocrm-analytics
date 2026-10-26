@@ -1,3 +1,3 @@
-export const kpiLabels = { proposals: 'КП', invoices: 'Счета отправлены', paid: 'Оплаты, шт.', shipments: 'Отгружено' };
-export type KpiValue = { metric: keyof typeof kpiLabels; fact: number; raw: number; plan: number | null; version: number; completion: number | null; remaining: number | null };
-export const kpiNumber = (value: number | null, metric: string) => value == null ? 'Не задано' : new Intl.NumberFormat('ru-RU', metric === 'shipments' ? { style: 'currency', currency: 'EUR', maximumFractionDigits: 0 } : { maximumFractionDigits: 0 }).format(value);
+export const kpiLabels = { proposals: 'КП', invoices: 'Счета отправлены', paid: 'Оплаченные сделки, шт.', shipments: 'Сумма отгрузок amoCRM', shipmentMargin: 'Маржа отгрузок · Ривиле' };
+export type KpiValue = { metric: keyof typeof kpiLabels; fact: number | null; raw: number | null; plan: number | null; version: number; completion: number | null; remaining: number | null };
+export const kpiNumber = (value: number | null, metric: string) => value == null ? 'Нет данных' : new Intl.NumberFormat('ru-RU', ['shipments','shipmentMargin'].includes(metric) ? { style: 'currency', currency: 'EUR', maximumFractionDigits: 0 } : { maximumFractionDigits: 0 }).format(value);

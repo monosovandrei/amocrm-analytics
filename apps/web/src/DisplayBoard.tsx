@@ -4,7 +4,7 @@ import { apiUrl } from './lib/api';
 import { kpiLabels, kpiNumber, type KpiValue } from './performance-format';
 import { workspaceDate, workspaceError } from './workspace-data';
 
-type Board = { metric: keyof typeof kpiLabels; paused: boolean; reason: string | null; rows: Array<KpiValue & { name: string; rank: number | null }> };
+type Board = { by?: string; sourceCutoffAt?: string | null; metric: keyof typeof kpiLabels; paused: boolean; reason: string | null; rows: Array<KpiValue & { name: string; rank: number | null }> };
 export type DisplaySnapshot = { department: string; departmentKey: string; month: string; by: string; definition: string; dataStatus: { cutoffAt: string | null; checkedAt: string | null; status: string }; boards: Board[] };
 
 export default function DisplayBoard({ previewSnapshot }: { previewSnapshot?: DisplaySnapshot }) {
@@ -33,7 +33,7 @@ export default function DisplayBoard({ previewSnapshot }: { previewSnapshot?: Di
                 if (alive) {
                     if (lastMonth.current && lastMonth.current !== next.month) lastGood.current = {};
                     lastMonth.current = next.month;
-                    next.boards.forEach(board => { if (!board.paused) lastGood.current[board.metric] = { ...board, cutoffAt: next.dataStatus.cutoffAt }; });
+                    next.boards.forEach(board => { if (!board.paused) lastGood.current[board.metric] = { ...board, cutoffAt: board.sourceCutoffAt || next.dataStatus.cutoffAt }; });
                     setSnapshot(next); setError(''); lastReceived.current = Date.now();
                 }
             } catch (e) { if (alive) setError(workspaceError(e)); }
@@ -55,31 +55,32 @@ export default function DisplayBoard({ previewSnapshot }: { previewSnapshot?: Di
     const label = board?.metric === 'proposals' ? snapshot?.departmentKey === 'csm' ? 'КП сделано' : 'КП презентовано' : board ? kpiLabels[board.metric] : 'Табло отдела';
     const monthDate = snapshot?.month ? new Date(`${snapshot.month}-01T12:00:00Z`) : null;
     const monthLabel = monthDate && !Number.isNaN(+monthDate) ? new Intl.DateTimeFormat('ru-RU', { month: 'long', year: 'numeric', timeZone: 'Europe/Moscow' }).format(monthDate) : 'Текущий месяц';
-    const maximumFact = Math.max(0, ...visible?.rows.map(row => row.fact) || []);
-    const completionBars = !previewSnapshot && by === 'completion';
+    const maximumFact = Math.max(0, ...(visible?.rows.map(row => row.fact ?? 0) || []));
+    const completionBars = !previewSnapshot && (board?.by || by) === 'completion';
+    const hasGoal = snapshot?.departmentKey !== 'sales' || ['paid','shipmentMargin'].includes(board?.metric || '');
     const Surface = previewSnapshot ? 'section' : 'main';
     return <Surface className="tv-board" aria-label={previewSnapshot ? 'Предпросмотр табло' : 'Табло отдела'}>
         <header className="tv-header">
             <div><p>{snapshot?.department || 'Отдел'} <span> / {monthLabel}</span></p><h1>{label}</h1></div>
             {!previewSnapshot && <label><span>Соревнование</span><select value={by} onChange={e => { setBy(e.target.value); setFrame(0); }}><option value="completion">По выполнению цели</option><option value="fact">По факту</option></select></label>}
         </header>
-        {snapshot && <nav className="tv-metrics" aria-label="Показатель соревнования">{snapshot.boards.map(item => <button key={item.metric} aria-current={item.metric === board?.metric ? 'page' : undefined} onClick={() => setFrame(frames.findIndex(entry => entry.board.metric === item.metric))}>{item.metric === 'proposals' ? snapshot.departmentKey === 'csm' ? 'КП сделано' : 'КП презентовано' : kpiLabels[item.metric]}</button>)}</nav>}
+        {snapshot && <nav className="tv-metrics" aria-label="Показатель соревнования">{snapshot.boards.map(item => <button key={item.metric} aria-current={item.metric === board?.metric ? 'page' : undefined} onClick={() => setFrame(frames.findIndex(entry => entry.board.metric === item.metric))}>{{proposals:snapshot.departmentKey==='csm'?'КП сделано':'КП презентовано',invoices:'Счета',paid:'Оплаты',shipments:'Сумма отгрузок',shipmentMargin:'Маржа Ривиле'}[item.metric]}</button>)}</nav>}
         <div className="tv-race">
-        <p className={!previewSnapshot && paused ? 'tv-status tv-paused' : 'tv-status'} role="status">{previewSnapshot ? 'Предпросмотр · места скрыты до проверки данных и целей' : !snapshot ? error || 'Загрузка…' : paused ? `Рейтинг приостановлен: ${error ? 'нет связи' : board?.reason || 'данные не обновлены'}. ${visible ? 'Последний подтверждённый результат.' : 'Подтверждённого результата нет.'}` : by === 'fact' ? 'Рейтинг по факту · длина полос — относительно лучшего результата' : 'Рейтинг по выполнению цели · полоса заполняется до 100%'}</p>
+        <p className={!previewSnapshot && paused ? 'tv-status tv-paused' : 'tv-status'} role="status">{previewSnapshot ? `Предпросмотр · места скрыты.${board?.paused ? ` Источник не подтверждён: ${board.reason || 'данные требуют проверки'}.` : ''}` : !snapshot ? error || 'Загрузка…' : paused ? `Рейтинг приостановлен: ${error ? 'нет связи' : board?.reason || 'данные не обновлены'}. ${visible ? 'Последний подтверждённый результат.' : 'Подтверждённого результата нет.'}` : !completionBars ? 'Рейтинг по факту · длина полос — относительно лучшего результата' : 'Рейтинг по выполнению цели · полоса заполняется до 100%'}</p>
         {snapshot && rows.length > 0 && <table className="tv-table"><thead><tr><th>Место</th><th>Менеджер</th><th>Результат</th><th>{completionBars ? 'Выполнение цели' : 'Сравнение факта'}</th></tr></thead><tbody key={`${board?.metric}:${selected?.page}`}>{rows.map((row, index) => {
             const rank = previewSnapshot ? null : row.rank;
-            const progress = completionBars ? row.completion : maximumFact > 0 ? row.fact / maximumFact * 100 : 0;
+            const progress = completionBars ? row.completion : maximumFact > 0 && row.fact != null ? row.fact / maximumFact * 100 : 0;
             return <tr key={`${row.name}:${index}`} className={rank != null && rank <= 3 ? `tv-place-${rank}` : undefined}>
                 <td><span className="tv-rank">{rank === 1 ? <><Trophy aria-hidden="true"/><span className="sr-only">Место </span>1</> : rank ?? '—'}</span></td>
                 <th scope="row">{row.name}</th>
-                <td className="tv-result"><strong>{kpiNumber(row.fact, board!.metric)}</strong><span>{row.plan == null ? 'Цель не задана' : `Цель ${kpiNumber(row.plan, board!.metric)}`}</span></td>
-                <td className="tv-progress-cell"><div className="tv-progress-label">{row.completion == null ? 'Без цели' : <><strong>{row.completion.toFixed(0)}%</strong><span>{row.completion >= 100 ? 'Цель достигнута' : 'от цели'}</span></>}</div><div className="tv-progress-track" role={progress == null ? undefined : 'meter'} aria-label={completionBars ? `Выполнение цели: ${row.name}` : `Факт относительно лучшего результата: ${row.name}`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress == null ? undefined : Math.max(0, Math.min(100, progress))} aria-valuetext={completionBars ? row.completion == null ? 'Цель не задана' : `${row.completion.toFixed(0)}%` : kpiNumber(row.fact, board!.metric)}>{progress != null && <span style={{ width: `${Math.max(0, Math.min(100, progress))}%` }}/>}</div></td>
+                <td className="tv-result"><strong>{kpiNumber(row.fact, board!.metric)}</strong><span>{!hasGoal ? 'Показатель активности' : row.plan == null ? 'Цель не задана' : `Цель ${kpiNumber(row.plan, board!.metric)}`}</span></td>
+                <td className="tv-progress-cell"><div className="tv-progress-label">{row.completion == null ? hasGoal ? row.plan == null ? 'Без цели' : 'Нет подтверждённого расчёта' : 'Факт за месяц' : <><strong>{row.completion.toFixed(0)}%</strong><span>{row.completion >= 100 ? 'Цель достигнута' : 'от цели'}</span></>}</div><div className="tv-progress-track" role={progress == null ? undefined : 'meter'} aria-label={completionBars ? `Выполнение цели: ${row.name}` : `Факт относительно лучшего результата: ${row.name}`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress == null ? undefined : Math.max(0, Math.min(100, progress))} aria-valuetext={completionBars ? row.completion == null ? 'Цель не задана' : `${row.completion.toFixed(0)}%` : kpiNumber(row.fact, board!.metric)}>{progress != null && <span style={{ width: `${Math.max(0, Math.min(100, progress))}%` }}/>}</div></td>
             </tr>;
         })}</tbody></table>}
         {snapshot && !rows.length && <p className="tv-empty">{paused ? 'Ожидаем подтверждения данных и правил' : 'Нет участников на этой странице'}</p>}
         </div>
         <footer className="tv-footer">
-            <span>Данные: {workspaceDate(!previewSnapshot && paused && board ? lastGood.current[board.metric]?.cutoffAt || null : snapshot?.dataStatus.cutoffAt || null)}<br/>{snapshot?.definition}</span>
+            <span>Данные: {workspaceDate(!previewSnapshot && paused && board ? lastGood.current[board.metric]?.cutoffAt || null : board?.sourceCutoffAt || snapshot?.dataStatus.cutoffAt || null)}<br/>{board?.metric === 'shipmentMargin' ? 'Ривиле · проведённые документы оборудования · выручка без НДС минус себестоимость · возвраты вычитаются' : snapshot?.definition}</span>
             <span>{selected ? `${(selected.page + 1)} / ${Math.max(1, Math.ceil(selected.board.rows.length / 5))}` : ''} · Смена экрана каждые 20 с</span>
             <button onClick={event => {
                 const target = previewSnapshot ? event.currentTarget.closest('.tv-board') as HTMLElement : document.documentElement;

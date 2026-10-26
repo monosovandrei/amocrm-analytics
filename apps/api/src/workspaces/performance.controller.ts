@@ -13,6 +13,10 @@ export class PerformanceController {
     @Post('onboarding/:id/invite') invite(@Req() req: any, @Param('id') id: string) { return this.onboarding.invite(req.user.id, id); }
     @Get('performance') overview(@Req() req: any, @Query() query: Record<string, string>) { return this.performance.overview(req.user.id, query); }
     @Patch('performance/goals') goal(@Req() req: any, @Body() body: Record<string, any>) { return this.performance.saveGoal(req.user.id, body); }
+    @Post('rivile/refresh') rivileRefresh(@Req() req: any, @Body() body: Record<string, string>) { return this.performance.rivileRefresh(req.user.id, body); }
+    @Get('rivile/settings') rivileSettings(@Req() req: any) { return this.performance.rivileSettings(req.user.id); }
+    @Patch('rivile/mapping') rivileMapping(@Req() req: any, @Body() body: Record<string, any>) { return this.performance.rivileMapping(req.user.id, body); }
+    @Patch('sales-target-profile') salesTargetProfile(@Req() req: any, @Body() body: Record<string, any>) { return this.performance.salesTargetProfile(req.user.id, body); }
     @Get('competition') settings(@Req() req: any, @Query() query: Record<string, string>) { return this.performance.competitionSettings(req.user.id, query); }
     @Post('competition') competition(@Req() req: any, @Body() body: Record<string, any>) { return this.performance.setCompetition(req.user.id, body); }
     @Get('displays') displays(@Req() req: any) { return this.performance.displays(req.user.id); }

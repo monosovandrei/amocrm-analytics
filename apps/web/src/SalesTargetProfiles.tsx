@@ -1,0 +1,14 @@
+import { useState } from 'react';
+import FieldCombobox from './FieldCombobox';
+import { api } from './lib/api';
+import { workspaceError } from './workspace-data';
+export type TargetProfile = { crmUserId:string; marginTarget:string|number; paidTarget:number; version:number };
+export default function SalesTargetProfiles({profiles,users,onSaved}:{profiles:TargetProfile[];users:{id:string;name:string}[];onSaved:()=>void}){
+    const [draft,setDraft]=useState({crmUserId:'',marginTarget:'',paidTarget:'',version:0}),[busy,setBusy]=useState(false),[notice,setNotice]=useState('');
+    function choose(id:string){const p=profiles.find(p=>p.crmUserId===id);setDraft({crmUserId:id,marginTarget:p?String(p.marginTarget):'',paidTarget:p?String(p.paidTarget):'',version:p?.version||0});}
+    async function save(){setBusy(true);try{await api('/workspaces/sales-target-profile',{method:'PATCH',body:JSON.stringify(draft)});setNotice('Шаблон сохранён. Уже заданные планы месяцев не изменены.');setDraft({crmUserId:'',marginTarget:'',paidTarget:'',version:0});onSaved();}catch(e){setNotice(workspaceError(e));}finally{setBusy(false);}}
+    return <section className="workspace-settings"><h2>Шаблоны месячных целей продаж</h2><p>По этим значениям создаются недостающие планы нового месяца. Ручные изменения плана месяца и закрытые месяцы не перезаписываются. Цели текущего месяца редактируются в «План-факт».</p>{notice&&<p role="status">{notice}</p>}
+        <div className="overflow-x-auto"><table className="data-table"><thead><tr><th>Менеджер</th><th>Маржа отгрузок, EUR</th><th>Оплаченных сделок</th><th>Действие</th></tr></thead><tbody>{profiles.map(p=><tr key={p.crmUserId}><td>{users.find(u=>u.id===p.crmUserId)?.name||'Сотрудник не найден'}</td><td>{Number(p.marginTarget).toLocaleString('ru-RU')}</td><td>{p.paidTarget}</td><td><button className="btn" onClick={()=>choose(p.crmUserId)}>Изменить шаблон</button></td></tr>)}</tbody></table></div>
+        <form className="workspace-toolbar" onSubmit={e=>{e.preventDefault();void save();}}><FieldCombobox label="Менеджер продаж" value={draft.crmUserId} onChange={choose} options={users.map(u=>({value:u.id,label:u.name}))} placeholder="Выберите менеджера"/><label><span className="label">Маржа отгрузок, EUR</span><input className="field" type="number" required min="0" max="1000000000000" step="0.01" value={draft.marginTarget} onChange={e=>setDraft({...draft,marginTarget:e.target.value})}/></label><label><span className="label">Оплаченных сделок</span><input className="field" type="number" required min="0" max="100000" step="1" value={draft.paidTarget} onChange={e=>setDraft({...draft,paidTarget:e.target.value})}/></label><button className="btn" disabled={busy||!draft.crmUserId}>{busy?'Сохранение…':'Сохранить шаблон'}</button></form>
+    </section>;
+}

@@ -21,9 +21,9 @@ export function performancePeriod(query: Record<string, string>, now = new Date(
     return { period, month, day, key: new Date(+start + 10800000).toISOString().slice(0, 10), start, end, monthStart, monthEnd };
 }
 
-export function rankPerformance<T extends { id: string; values: Array<{ metric: string; fact: number; plan: number | null }> }>(rows: T[], metric: string, by: string, incompleteShipments: boolean) {
-    const eligible = rows.filter(row => !(metric === 'shipments' && incompleteShipments) && (by !== 'completion' || (row.values.find(v => v.metric === metric)?.plan || 0) > 0));
-    const score = (row: T) => { const v = row.values.find(v => v.metric === metric)!; return by === 'completion' ? v.fact / v.plan! : v.fact; };
+export function rankPerformance<T extends { id: string; values: Array<{ metric: string; fact: number | null; plan: number | null }> }>(rows: T[], metric: string, by: string, incompleteShipments: boolean) {
+    const eligible = rows.filter(row => row.values.find(v => v.metric === metric)?.fact != null && !(['shipments', 'shipmentMargin'].includes(metric) && incompleteShipments) && (by !== 'completion' || (row.values.find(v => v.metric === metric)?.plan || 0) > 0));
+    const score = (row: T) => { const v = row.values.find(v => v.metric === metric)!; return by === 'completion' ? v.fact! / v.plan! : v.fact!; };
     eligible.sort((a, b) => score(b) - score(a) || a.id.localeCompare(b.id));
     let rank = 0, previous: number | null = null;
     const ranks = new Map<string, number>();

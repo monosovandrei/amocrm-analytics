@@ -1,0 +1,117 @@
+{
+  "source": "warehouse/server/manager-identities.ts; confirmed 2026-10-26",
+  "seniorAmoIds": [
+    "10182918",
+    "11643946"
+  ],
+  "paidTarget": 14,
+  "juniorMarginTarget": 30000,
+  "seniorMarginTarget": 40000,
+  "managerLinks": [
+    {
+      "code": "103",
+      "amoExternalId": "7462243",
+      "departmentKey": "csm"
+    },
+    {
+      "code": "104",
+      "amoExternalId": "10064554",
+      "departmentKey": "sales"
+    },
+    {
+      "code": "105",
+      "amoExternalId": "10182918",
+      "departmentKey": "sales"
+    },
+    {
+      "code": "107",
+      "amoExternalId": "10608966",
+      "departmentKey": "csm"
+    },
+    {
+      "code": "115",
+      "amoExternalId": "11643946",
+      "departmentKey": "sales"
+    },
+    {
+      "code": "122",
+      "amoExternalId": "11991638",
+      "departmentKey": "csm"
+    },
+    {
+      "code": "120",
+      "amoExternalId": "12158210",
+      "departmentKey": "csm"
+    },
+    {
+      "code": "121",
+      "amoExternalId": "12209282",
+      "departmentKey": "sales"
+    },
+    {
+      "code": "124",
+      "amoExternalId": "12530798",
+      "departmentKey": "sales"
+    },
+    {
+      "code": "123",
+      "amoExternalId": "12615022",
+      "departmentKey": null
+    },
+    {
+      "code": "125",
+      "amoExternalId": "13744394",
+      "departmentKey": "sales"
+    },
+    {
+      "code": "126",
+      "amoExternalId": "13872318",
+      "departmentKey": "csm"
+    },
+    {
+      "code": "127",
+      "amoExternalId": "13895762",
+      "departmentKey": "sales"
+    },
+    {
+      "code": "109",
+      "amoExternalId": "14088750",
+      "departmentKey": "sales"
+    },
+    {
+      "code": "128",
+      "amoExternalId": "14088750",
+      "departmentKey": "sales"
+    },
+    {
+      "code": "131",
+      "amoExternalId": "14111062",
+      "departmentKey": "csm"
+    },
+    {
+      "code": "129",
+      "amoExternalId": "14146286",
+      "departmentKey": "sales"
+    },
+    {
+      "code": "130",
+      "amoExternalId": "14163130",
+      "departmentKey": "sales"
+    },
+    {
+      "code": "133",
+      "amoExternalId": "14180258",
+      "departmentKey": "sales"
+    },
+    {
+      "code": "132",
+      "amoExternalId": "14191918",
+      "departmentKey": "csm"
+    },
+    {
+      "code": "134",
+      "amoExternalId": "14231382",
+      "departmentKey": "csm"
+    }
+  ]
+}

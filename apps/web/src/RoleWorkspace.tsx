@@ -5,6 +5,7 @@ import PerformanceWorkspace, { DisplaySettings } from './PerformanceWorkspace';
 import WorkspaceOnboarding from './WorkspaceOnboarding';
 import { accessDenied, useWorkspaceResource, WorkspaceConnectionContext } from './workspace-data';
 import FieldCombobox from './FieldCombobox';
+import RivileSettings from './RivileSettings';
 type Session = {
     configured: boolean;
     message?: string;
@@ -101,7 +102,7 @@ export default function RoleWorkspace({ onLogout, renderReport, renderTelegram }
     if (!session.configured)
         return <main className="content"><h1>Доступ не настроен</h1><p>{session.message || 'Обратитесь к администратору'}</p><button className="btn" onClick={onLogout}>Выйти</button></main>;
     const personal = session.role === 'MANAGER';
-    const nav = [['home', personal ? 'Мой день' : 'Обзор отдела'], ...(!personal ? [['reports', 'Отчёты']] : []), ['plan', personal ? 'Денежный план' : 'План-факт'], ['forecast', personal ? 'Мой прогноз' : 'Прогноз'], ['deals', personal ? 'Мои сделки' : 'Сделки отдела'], ...(session.role === 'ADMIN' ? [['admin', 'Настройки'], ['display', 'Табло'], ['telegram', 'Telegram']] : [])];
+    const nav = [['home', personal ? 'Мой день' : 'Обзор отдела'], ...(!personal ? [['reports', 'Отчёты']] : []), ['plan', personal ? 'Мой план' : 'План-факт'], ['forecast', personal ? 'Мой прогноз' : 'Прогноз'], ['deals', personal ? 'Мои сделки' : 'Сделки отдела'], ...(session.role === 'ADMIN' ? [['admin', 'Настройки'], ['display', 'Табло'], ['telegram', 'Telegram']] : [])];
     const navigate = (id: string, kind?: string) => { if (department === 'all' && id !== 'forecast') setDepartment(session.departments[0].key); if (kind) setDealKind(kind); setTab(id); };
     const visibleTab = nav.some(([id]) => id === tab) ? tab : 'home';
     const safeDepartment = session.role === 'ADMIN' ? (department === 'all' && visibleTab === 'forecast' ? 'all' : session.departments.some(d => d.key === department) ? department : session.departments[0].key) : session.departmentKey!;
@@ -121,7 +122,7 @@ export default function RoleWorkspace({ onLogout, renderReport, renderTelegram }
     </div>}
     {visibleTab === 'home' && <PerformanceWorkspace key={`${session.fingerprint}:${safeDepartment}`} query={query} department={safeDepartment} month={month} personal={personal} amoDomain={session.amoDomain} navigate={navigate}/>}
     {visibleTab === 'display' && session.role === 'ADMIN' && <DisplaySettings departments={session.departments}/>}
-    {visibleTab === 'plan' && <PlanTable key={session.fingerprint} query={query} department={safeDepartment} month={month} amoDomain={session.amoDomain} renderReport={renderReport}/>}
+    {visibleTab === 'plan' && (safeDepartment === 'sales' ? <PerformanceWorkspace key={`${session.fingerprint}:plan:${safeDepartment}`} query={query} department={safeDepartment} month={month} personal={personal} amoDomain={session.amoDomain} navigate={navigate} goalsOnly/> : <PlanTable key={session.fingerprint} query={query} department={safeDepartment} month={month} amoDomain={session.amoDomain} renderReport={renderReport}/>)}
     {visibleTab === 'reports' && <ReportPanel key={safeDepartment} query={query} keys={session.reports[safeDepartment] || []} amoDomain={session.amoDomain} renderReport={renderReport}/>}
     {visibleTab === 'forecast' && <ReportPanel query={query} keys={safeDepartment==='all'?['revenue_profit_forecast']:['revenue_profit_forecast', safeDepartment === 'sales' ? 'sales_weighted_funnel' : 'csm_weighted_funnel']} amoDomain={session.amoDomain} renderReport={renderReport}/>}
     {visibleTab === 'deals' && <Deals key={`${session.fingerprint}:${dealKind}`} initialKind={dealKind} query={query} amoDomain={session.amoDomain}/>}
@@ -258,12 +259,12 @@ function AdminSettings({amoDomain}:{amoDomain:string}) {
     catch (e) {
         setNotice(errorText(e));
     } }
-    return <><h1 className="page-title">Настройки кабинетов</h1><nav className="workspace-toolbar" aria-label="Настройки">{[['invite','Первый вход'],['access','Права сотрудников'],['sla','Сроки этапов'],['links','Связи отгрузок']].map(([id,label])=><button className="btn" aria-pressed={section===id} key={id} onClick={()=>setSection(id)}>{label}</button>)}</nav>{notice && <p role="status">{notice}</p>}
+    return <><h1 className="page-title">Настройки кабинетов</h1><nav className="workspace-toolbar" aria-label="Настройки">{[['invite','Первый вход'],['access','Права сотрудников'],['sla','Сроки этапов'],['links','Связи отгрузок'],['rivile','Ривиле']].map(([id,label])=><button className="btn" aria-pressed={section===id} key={id} onClick={()=>setSection(id)}>{label}</button>)}</nav>{notice && <p role="status">{notice}</p>}
     <section hidden={section!=='access'}><h2>Учётные записи</h2><div className="overflow-x-auto"><table className="data-table"><thead><tr>{['Сотрудник', 'Роль', 'Отдел', 'Учётная запись amoCRM', 'Активен', 'Новый личный пароль', 'Действие'].map(t => <th key={t}>{t}</th>)}</tr></thead><tbody>{data.users.map((u: any) => <AccountRow key={`${u.id}:${u.accessVersion}`} user={u} data={data} onNotice={setNotice}/>)}</tbody></table></div>
     <h2 className="mt-6">Добавить сотрудника</h2><div className="flex flex-wrap items-end gap-3"><FieldCombobox label="Сотрудник amoCRM" value={newUser.crmUserId} onChange={value=>setNewUser({...newUser,crmUserId:value})} options={data.crmUsers.map((u:any)=>({value:u.id,label:u.name}))} placeholder="Выберите сотрудника" /><label><span className="label">Роль</span><select className="field" value={newUser.businessRole} onChange={e => setNewUser({ ...newUser, businessRole: e.target.value })}><option value="MANAGER">Менеджер</option><option value="ROP">РОП</option></select></label><label><span className="label">Отдел</span><select className="field" value={newUser.departmentKey} onChange={e => setNewUser({ ...newUser, departmentKey: e.target.value })}>{data.departments.map((d: any) => <option key={d.key} value={d.key}>{d.name}</option>)}</select></label><label><span className="label">Личный пароль, от 12 символов</span><input className="field" type="password" autoComplete="new-password" value={newUser.password} onChange={e => setNewUser({ ...newUser, password: e.target.value })}/></label><button className="btn" onClick={() => void create()}>Создать</button></div>
     </section>{section==='invite'&&<WorkspaceOnboarding/>}<section hidden={section!=='sla'}><h2 className="mt-6">Сроки по этапам</h2><label><span className="label">Отдел</span><select className="field" value={department} onChange={e => setDepartment(e.target.value)}>{data.departments.map((d: any) => <option key={d.key} value={d.key}>{d.name}</option>)}</select></label>
     <div className="overflow-x-auto"><table className="data-table"><thead><tr><th>Этап</th><th>Срок, календарных дней</th><th>Контроль включён</th><th>Действие</th></tr></thead><tbody>{data.stages.filter((s: any) => { const d = data.departments.find((d: any) => d.key === department); return d && [...d.pipelineIds, d.assemblyPipelineId].includes(s.pipelineId); }).map((s: any) => <StageRule key={`${department}:${s.id}`} department={department} stage={s} rule={data.rules.find((r: any) => r.departmentKey === department && r.stageId === s.id)} onNotice={setNotice}/>)}</tbody></table></div>
-    </section>{section==='links'&&<section><h2 className="mt-6">Связи отгрузок</h2><p>Без подтверждённого продавца: {data.unresolved}. Такие отгрузки не назначаются по имени клиента или сумме.</p><UnassignedShipments crmUsers={data.commercialSellers||data.crmUsers} amoDomain={amoDomain}/></section>}
+    </section>{section==='rivile'&&<RivileSettings/>}{section==='links'&&<section><h2 className="mt-6">Связи отгрузок</h2><p>Без подтверждённого продавца: {data.unresolved}. Такие отгрузки не назначаются по имени клиента или сумме.</p><UnassignedShipments crmUsers={data.commercialSellers||data.crmUsers} amoDomain={amoDomain}/></section>}
   </>;
 }
 function UnassignedShipments({crmUsers,amoDomain}:{crmUsers:Array<{id:string;name:string}>;amoDomain:string}){

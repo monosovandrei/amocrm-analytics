@@ -8,6 +8,7 @@ import { PerformanceService } from './performance.service';
 import { DisplayController, PerformanceController, WorkspaceInviteController } from './performance.controller';
 import { WorkspaceOnboardingService } from './workspace-onboarding.service';
 import { AuthModule } from '../auth/auth.module';
-@Module({ imports: [ReportsModule, QualityModule, AuthModule], controllers: [WorkspacesController,WorkspaceLinksAdminController, PerformanceController, DisplayController, WorkspaceInviteController], providers: [WorkspacesService, PerformanceService, WorkspaceOnboardingService] })
+import { RivileSalesService } from './rivile-sales.service';
+@Module({ imports: [ReportsModule, QualityModule, AuthModule], controllers: [WorkspacesController,WorkspaceLinksAdminController, PerformanceController, DisplayController, WorkspaceInviteController], providers: [WorkspacesService, PerformanceService, WorkspaceOnboardingService, RivileSalesService] })
 export class WorkspacesModule {
 }

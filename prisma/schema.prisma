@@ -222,6 +222,37 @@ model WorkspaceKpiGoal {
   @@unique([departmentKey, period, start, targetType, targetId, metric], map: "WorkspaceKpiGoal_scope_key")
 }
 
+model RivileManagerLink {
+  code String @id
+  crmUserId String?
+  departmentKey String?
+  source String
+  updatedAt DateTime @updatedAt
+  @@index([crmUserId, departmentKey])
+}
+
+model SalesTargetProfile {
+  crmUserId String @id
+  marginTarget Decimal
+  paidTarget Int
+  version Int @default(1)
+  updatedAt DateTime @updatedAt
+}
+
+model RivileSalesSnapshot {
+  month String @id
+  documents Json @default("[]")
+  cutoffAt DateTime?
+  throughDate String?
+  needsRefresh Boolean @default(false)
+  requestedAt DateTime?
+  lastAttemptAt DateTime?
+  lastError String?
+  leaseUntil DateTime?
+  runId String?
+  updatedAt DateTime @updatedAt
+}
+
 model WorkspaceCompetitionPeriod {
   id String @id @default(uuid())
   departmentKey String

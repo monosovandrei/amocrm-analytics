@@ -131,7 +131,8 @@ if ! npm run db:deploy || ! systemd-run --scope --quiet --unit="analytics-worksp
   node --expose-gc --max-old-space-size=512 "$RELEASE/scripts/prepare-workspace-release.cjs" --apply || \
   ! systemd-run --scope --quiet --unit="analytics-performance-prepare-$COMMIT-$STAMP" \
   -p MemoryHigh=1152M -p MemoryMax=1280M -p MemorySwapMax=0 -p CPUWeight=20 \
-  node --expose-gc --max-old-space-size=512 "$RELEASE/scripts/prepare-performance-release.cjs" --apply-owner-approved-rollout; then
+  node --expose-gc --max-old-space-size=512 "$RELEASE/scripts/prepare-performance-release.cjs" --apply-owner-approved-rollout || \
+  ! node --max-old-space-size=256 "$RELEASE/scripts/prepare-rivile-release.cjs" --apply-owner-approved; then
   restore_previous_release || true
   exit 1
 fi
@@ -216,6 +217,12 @@ run_report_verification() {
     -p MemoryHigh=1152M -p MemoryMax=1280M -p MemorySwapMax=0 -p CPUWeight=20 \
     node --expose-gc --max-old-space-size=512 "$@"
 }
+if ! run_report_verification rivile-refresh "$RELEASE/scripts/refresh-rivile-sales.cjs" || \
+   ! (umask 077; run_report_verification rivile "$RELEASE/scripts/verify-rivile-sales.cjs" > "$BACKUPS_DIR/rivile-$COMMIT-$STAMP.json"); then
+  echo "Rivile source/goal gate failed" >&2
+  restore_previous_release || true
+  exit 1
+fi
 SOURCE_AUDIT_TO="$(node -e 'process.stdout.write(new Date(Date.now() - 120000).toISOString())')"
 if ! run_report_verification prepare "$RELEASE/scripts/prepare-release-reports.cjs" --workspaces || \
    ! run_report_verification consistency "$RELEASE/scripts/verify-workspace-consistency.cjs" || \
